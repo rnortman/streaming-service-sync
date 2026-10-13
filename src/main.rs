@@ -5,16 +5,11 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-
-/// Export a Pandora account to a local data repository and migrate it to
-/// Spotify.
-#[derive(Debug, Parser)]
-#[command(name = "sss", version, about)]
-struct Cli {}
+use streaming_service_sync::cli::{self, Cli};
 
 fn main() -> ExitCode {
-    match Cli::try_parse() {
-        Ok(Cli {}) => ExitCode::SUCCESS,
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
         Err(e) => {
             // clap writes `error: …` (usage errors) to stderr and help or
             // version text to stdout. A failed write of either is a failure.
@@ -22,7 +17,22 @@ fn main() -> ExitCode {
                 let _ = writeln!(std::io::stderr(), "error: writing output: {io}");
                 return ExitCode::from(1);
             }
-            ExitCode::from(parse_exit_code(&e))
+            return ExitCode::from(parse_exit_code(&e));
+        }
+    };
+    let result = {
+        let mut stdout = std::io::stdout().lock();
+        cli::run(cli, &mut stdout).and_then(|()| {
+            stdout
+                .flush()
+                .map_err(|e| anyhow::Error::new(e).context("writing output"))
+        })
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "error: {e:#}");
+            ExitCode::from(1)
         }
     }
 }
@@ -36,18 +46,19 @@ fn parse_exit_code(e: &clap::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{Cli, parse_exit_code};
-    use clap::{CommandFactory, Parser};
-
-    #[test]
-    fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
-    }
+    use clap::Parser;
 
     #[test]
     fn usage_error_exits_1() {
         let e = Cli::try_parse_from(["sss", "--bogus"]).unwrap_err();
         assert_eq!(parse_exit_code(&e), 1);
         assert!(e.to_string().starts_with("error: "));
+    }
+
+    #[test]
+    fn missing_subcommand_exits_1() {
+        let e = Cli::try_parse_from(["sss"]).unwrap_err();
+        assert_eq!(parse_exit_code(&e), 1);
     }
 
     #[test]

@@ -21,9 +21,25 @@ you are already logged in.
 
 ## Status
 
-Early development. The repository builds a `sss` binary that so far has no
-subcommands; export, matching and push land in later releases. See
-[CHANGELOG.md](CHANGELOG.md).
+Early development. `sss init` works; every other subcommand is in place but
+reports that it is not implemented yet. Export, matching and push land in
+later releases. See [CHANGELOG.md](CHANGELOG.md).
+
+## Usage
+
+```sh
+sss init                     # create the data repository
+sss --repo ~/music-data init # ... somewhere other than the default
+sss --help                   # every subcommand
+```
+
+The data repository defaults to `$XDG_DATA_HOME/streaming-service-sync`
+(usually `~/.local/share/streaming-service-sync`); `--repo DIR` selects
+another. `init` writes `config.toml`, with every setting at its default and
+commented, and a `README.md` describing the layout; it never overwrites
+either. Keep the data repository private. Commands that act on one family
+member's accounts take `--profile NAME` (lowercase letters, digits, `-` and
+`_`).
 
 ## Build from source
 

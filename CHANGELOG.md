@@ -8,9 +8,14 @@ Notable changes to streaming-service-sync. Format follows
 
 ### Added
 
-- Project skeleton: the `sss` command-line tool, which so far only answers
-  `--help` and `--version` (export, matching and Spotify sync come later).
-  Released under the Apache-2.0 license.
+- `sss init` creates the local data repository — the private directory where
+  everything exported, matched and synced will be kept — with a commented
+  `config.toml` and a README describing its layout. It defaults to
+  `~/.local/share/streaming-service-sync`; `--repo DIR` picks another place.
+  Existing files are never overwritten.
+- Project skeleton: the `sss` command-line tool, released under the
+  Apache-2.0 license. The remaining subcommands (`pandora`, `spotify`,
+  `match`, `push`, `status`, `report`) are defined but not implemented yet.
 - Build and CI: `make check` runs the full pre-commit suite; GitHub CI runs
   the Rust checks and a secret scan on every push.
 - Git hooks that block commits and pushes containing secrets or personal
