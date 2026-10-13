@@ -1,0 +1,14 @@
+/target
+# Personal Claude Code settings and context (settings.json and CLAUDE.md are shared)
+.claude/settings.local.json
+CLAUDE.local.md
+# Private scrub rule overlay — a symlink, never content
+.gitleaks.local.toml
+# Personal exports, captures and credentials never belong in this repository.
+# Deliberately wide: a stray export must be ignored before anyone runs `git add .`.
+/data/
+/repo/
+*.har
+*.jsonl
+*.token
+*-session.json

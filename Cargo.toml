@@ -1,0 +1,22 @@
+[package]
+name = "streaming-service-sync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Export a Pandora account to a local data repository and migrate it to Spotify, with LLM-assisted track matching"
+license = "Apache-2.0"
+repository = "https://github.com/rnortman/streaming-service-sync"
+readme = "README.md"
+keywords = ["pandora", "spotify", "migration", "playlist", "export"]
+categories = ["command-line-utilities"]
+include = ["/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
+
+[[bin]]
+name = "sss"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"

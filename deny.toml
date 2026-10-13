@@ -1,0 +1,20 @@
+# cargo-deny license policy, enforced by `make deny` (part of `make check`).
+
+[licenses]
+version = 2
+# The list covers the planned dependency set, not only today's.
+unused-allowed-license = "allow"
+
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
