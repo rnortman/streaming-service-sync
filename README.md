@@ -40,7 +40,7 @@ another. `init` writes `config.toml`, with every setting at its default and
 commented, and a `README.md` describing the layout; it never overwrites
 either. Keep the data repository private. Commands that act on one family
 member's accounts take `--profile NAME` (lowercase letters, digits, `-` and
-`_`).
+`_`); it may be omitted while only one profile exists.
 
 ### Pandora session
 
@@ -52,8 +52,9 @@ with each API request:
 2. Open the browser's developer tools (F12) and select the **Network** tab.
 3. Reload the page, then pick any request whose URL contains `/api/`.
 4. Under **Request Headers**, copy the value of `X-AuthToken`.
-5. Run `sss pandora auth --profile NAME` and paste it at the prompt, or save
-   it as the first line of a file and pass `--from-file FILE`.
+5. Run `sss pandora auth --profile NAME` and paste it at the prompt. The
+   value may paste as two lines; that is fine. Press Enter on an empty line
+   to end the paste. Or save it in a file and pass `--from-file FILE`.
 
 Copy the request header, not a cookie: the browser's `at` cookie looks
 similar but is not the API token, and Pandora refuses it. `sss` checks the
@@ -61,6 +62,9 @@ token with one request before storing it, and stores it, mode 0600, under
 `$XDG_STATE_HOME/streaming-service-sync/NAME/` (usually
 `~/.local/state/…`), never in the data repository. When Pandora later
 rejects the stored token, commands say so; run `sss pandora auth` again.
+A token for a different listener than the profile's stored session (by
+Pandora webname) is refused; sign that listener in under its own
+`--profile`.
 
 ### Pandora export
 
@@ -72,8 +76,9 @@ step's outcome. A run in which every step succeeded is then normalized into
 `stations.json`, `playlists.json`, `collection.json`, `bookmarks.json` and
 `tracks.json` beside it; `sss pandora normalize` re-derives those files
 from the latest complete run without contacting Pandora. `sss status`
-prints each profile's latest run, step by step, so you can compare the
-playlist and collection counts with what the Pandora app shows.
+prints each profile's stored Pandora session (when it was stored, never the
+token) and its latest run, step by step, so you can compare the playlist
+and collection counts with what the Pandora app shows.
 [docs/pandora-web-api.md](docs/pandora-web-api.md) describes the requests.
 
 ## Build from source

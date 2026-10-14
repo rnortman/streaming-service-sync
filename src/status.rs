@@ -1,5 +1,5 @@
-//! `sss status`: per profile, the latest export run's step ledger and the
-//! match counts by status.
+//! `sss status`: per profile, the stored Pandora session, the latest export
+//! run's step ledger and the match counts by status.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -8,27 +8,68 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::config::Config;
 use crate::pandora::export::{self, Step};
+use crate::profiles;
 use crate::repo::{self, ProfilePaths, Repo};
+use crate::secrets::{StateDir, StateRoot};
 
-/// Prints the status of `profile`, or of every profile in `repo` when none
-/// is named.
-pub fn status(repo: &Repo, profile: Option<&str>, out: &mut dyn Write) -> Result<()> {
+/// Prints the status of `profile`, or of every known profile when none is
+/// named.
+pub fn status(
+    repo: &Repo,
+    state_root: &StateRoot,
+    config: &Config,
+    profile: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
     let names = match profile {
         Some(name) => vec![name.to_owned()],
-        None => repo.profiles()?,
+        None => profiles::known(repo, state_root, config)?,
     };
     if names.is_empty() {
-        writeln!(out, "no profiles yet").context("writing output")?;
+        writeln!(
+            out,
+            "no profiles yet; run `sss pandora auth --profile NAME` first"
+        )
+        .context("writing output")?;
     }
     for name in names {
-        profile_status(&name, &repo.profile(&name)?, out)?;
+        profile_status(
+            &name,
+            &state_root.profile(&name)?,
+            &repo.profile(&name)?,
+            out,
+        )?;
     }
     Ok(())
 }
 
-fn profile_status(name: &str, paths: &ProfilePaths, out: &mut dyn Write) -> Result<()> {
-    let mut lines = vec![format!("profile {name}")];
+/// The `pandora session:` line of a profile's block.
+fn session_line(name: &str, state: &StateDir) -> Result<String> {
+    let Some(session) = state.load_pandora_session()? else {
+        return Ok(format!(
+            "  pandora session: none (run `sss pandora auth --profile {name}`)"
+        ));
+    };
+    let webname = session
+        .webname
+        .map(|w| format!(", webname {w}"))
+        .unwrap_or_default();
+    let source = session.source.as_str();
+    Ok(format!(
+        "  pandora session: stored {}{webname}, from {source}",
+        session.stored_at
+    ))
+}
+
+fn profile_status(
+    name: &str,
+    state: &StateDir,
+    paths: &ProfilePaths,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let mut lines = vec![format!("profile {name}"), session_line(name, state)?];
     let mut newest_complete = true;
     match export::run_ids(paths)?.last() {
         None => lines.push("  export: no run yet".to_owned()),
@@ -99,6 +140,8 @@ fn match_counts(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::pandora::export::{MANIFEST_FILE, Manifest, StepResult, StepStatus, Steps};
+    use crate::pandora::test_support::session;
+    use crate::secrets::TokenSource;
 
     fn manifest(id: &str, complete: bool) -> Manifest {
         let mut steps = Steps::default();
@@ -120,16 +163,25 @@ mod tests {
         }
     }
 
-    fn run_status(repo: &Repo, profile: Option<&str>) -> String {
+    fn run_status(repo: &Repo, state_root: &StateRoot, profile: Option<&str>) -> String {
+        let config = Config::load(&repo.config_path()).unwrap();
         let mut out = Vec::new();
-        status(repo, profile, &mut out).unwrap();
+        status(repo, state_root, &config, profile, &mut out).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    /// A repository and a state root, both empty, under `tmp`.
+    fn empty(tmp: &Path) -> (Repo, StateRoot) {
+        let repo = Repo::at(tmp.join("data"));
+        std::fs::create_dir_all(repo.root()).unwrap();
+        std::fs::write(repo.config_path(), "").unwrap();
+        (repo, StateRoot::at(tmp.join("state")))
     }
 
     #[test]
     fn prints_the_latest_ledger_and_match_counts() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = Repo::at(tmp.path());
+        let (repo, state_root) = empty(tmp.path());
         let paths = repo.profile("alice").unwrap();
         for (id, complete) in [("20261013T000000Z", true), ("20261014T000000Z", false)] {
             repo::write_json(
@@ -149,8 +201,13 @@ mod tests {
             )
             .unwrap();
         }
-        let text = run_status(&repo, None);
-        assert!(text.starts_with("profile alice\n"), "{text}");
+        let text = run_status(&repo, &state_root, None);
+        assert!(
+            text.starts_with(
+                "profile alice\n  pandora session: none (run `sss pandora auth --profile alice`)\n"
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("  export run 20261014T000000Z: INCOMPLETE, 9 requests"),
             "{text}"
@@ -173,17 +230,77 @@ mod tests {
     #[test]
     fn profiles_without_runs_and_unfinished_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = Repo::at(tmp.path());
-        assert_eq!(run_status(&repo, None), "no profiles yet\n");
-        assert!(run_status(&repo, Some("bob")).contains("  export: no run yet\n"));
+        let (repo, state_root) = empty(tmp.path());
+        assert_eq!(
+            run_status(&repo, &state_root, None),
+            "no profiles yet; run `sss pandora auth --profile NAME` first\n"
+        );
+        assert!(run_status(&repo, &state_root, Some("bob")).contains("  export: no run yet\n"));
         let paths = repo.profile("bob").unwrap();
         std::fs::create_dir_all(paths.raw_run_dir("20261013T000000Z")).unwrap();
-        let text = run_status(&repo, None);
+        let text = run_status(&repo, &state_root, None);
         assert!(text.starts_with("profile bob\n"), "{text}");
         assert!(
             text.contains("  export run 20261013T000000Z: did not finish (no manifest)\n"),
             "{text}"
         );
         assert!(!text.contains("latest complete run"), "{text}");
+    }
+
+    #[test]
+    fn profiles_known_from_the_state_root_and_config_show_their_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = empty(tmp.path());
+        state_root
+            .profile("alice")
+            .unwrap()
+            .save_pandora_session(&session())
+            .unwrap();
+        std::fs::write(repo.config_path(), "[profiles.bob]\n").unwrap();
+        let mut anonymous = session();
+        anonymous.webname = None;
+        anonymous.source = TokenSource::File;
+        state_root
+            .profile("carol")
+            .unwrap()
+            .save_pandora_session(&anonymous)
+            .unwrap();
+        let text = run_status(&repo, &state_root, None);
+        assert!(
+            text.starts_with(
+                "profile alice\n  pandora session: stored 2026-10-13T00:00:00Z, \
+                 webname listener, from prompt\n  export: no run yet\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "profile bob\n  pandora session: none (run `sss pandora auth --profile bob`)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "profile carol\n  pandora session: stored 2026-10-13T00:00:00Z, from file\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("tok-secret-value"), "{text}");
+        assert!(!repo.profiles_dir().exists(), "status creates nothing");
+    }
+
+    #[test]
+    fn an_unreadable_session_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = empty(tmp.path());
+        let state = state_root.profile("alice").unwrap();
+        std::fs::create_dir_all(state.dir()).unwrap();
+        std::fs::write(state.pandora_session_path(), "not json").unwrap();
+        let config = Config::load(&repo.config_path()).unwrap();
+        let err = status(&repo, &state_root, &config, None, &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pandora-session.json"),
+            "{err:#}"
+        );
     }
 }

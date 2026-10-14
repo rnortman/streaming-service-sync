@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod config;
 pub mod pandora;
+pub mod profiles;
 pub mod repo;
 pub mod secrets;
 pub mod status;

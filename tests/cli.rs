@@ -1,22 +1,49 @@
 //! Exit status and output streams of the built `sss` binary.
+//!
+//! No test runs the binary against the host's state root: every invocation
+//! sets `XDG_STATE_HOME` to a temporary directory.
+
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 
-fn sss() -> Command {
-    Command::cargo_bin("sss").expect("sss binary is built")
+/// The built `sss` with its state root under `state`.
+fn sss(state: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("sss").expect("sss binary is built");
+    cmd.env("XDG_STATE_HOME", state);
+    cmd
+}
+
+/// The built `sss` as a plain process, with its state root under `state`.
+fn sss_process(state: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("sss"));
+    cmd.env("XDG_STATE_HOME", state);
+    cmd
 }
 
 #[test]
 fn usage_error_prints_error_to_stderr_and_exits_1() {
-    let out = sss().arg("--bogus").assert().code(1).get_output().clone();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = sss(tmp.path())
+        .arg("--bogus")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: "));
 }
 
 #[test]
 fn help_and_version_print_to_stdout_and_exit_0() {
+    let tmp = tempfile::tempdir().expect("tempdir");
     for flag in ["--help", "--version"] {
-        let out = sss().arg(flag).assert().code(0).get_output().clone();
+        let out = sss(tmp.path())
+            .arg(flag)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
         assert!(!out.stdout.is_empty(), "{flag}: stdout empty");
         assert!(out.stderr.is_empty(), "{flag}: stderr not empty");
     }
@@ -25,12 +52,13 @@ fn help_and_version_print_to_stdout_and_exit_0() {
 #[cfg(target_os = "linux")]
 #[test]
 fn failed_output_write_prints_error_and_exits_1() {
+    let tmp = tempfile::tempdir().expect("tempdir");
     for flag in ["--help", "--version"] {
         let full = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/full")
             .expect("open /dev/full");
-        let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("sss"))
+        let out = sss_process(tmp.path())
             .arg(flag)
             .stdout(full)
             .output()
@@ -51,7 +79,7 @@ fn failed_command_output_write_prints_error_and_exits_1() {
         .write(true)
         .open("/dev/full")
         .expect("open /dev/full");
-    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("sss"))
+    let out = sss_process(tmp.path())
         .args(["--repo", tmp.path().to_str().expect("utf-8 path"), "init"])
         .stdout(full)
         .output()
@@ -66,7 +94,7 @@ fn init_defaults_to_xdg_data_home_and_is_idempotent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("streaming-service-sync");
     for verb in ["created", "kept"] {
-        let out = sss()
+        let out = sss(tmp.path())
             .env("XDG_DATA_HOME", tmp.path())
             .arg("init")
             .assert()
@@ -85,8 +113,11 @@ fn init_defaults_to_xdg_data_home_and_is_idempotent() {
 fn unimplemented_command_reports_an_error_and_exits_1() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().to_str().expect("utf-8 path");
-    sss().args(["--repo", dir, "init"]).assert().code(0);
-    let out = sss()
+    sss(tmp.path())
+        .args(["--repo", dir, "init"])
+        .assert()
+        .code(0);
+    let out = sss(tmp.path())
         .args(["--repo", dir, "--profile", "alice", "push"])
         .assert()
         .code(1)
@@ -102,7 +133,7 @@ fn unimplemented_command_reports_an_error_and_exits_1() {
 #[test]
 fn command_on_an_uninitialized_repo_exits_1() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = sss()
+    let out = sss(tmp.path())
         .args(["--repo", tmp.path().to_str().expect("utf-8 path"), "status"])
         .assert()
         .code(1)
@@ -117,11 +148,16 @@ fn command_on_an_uninitialized_repo_exits_1() {
 
 /// Runs `sss pandora auth` for profile `alice` against `server`, with the
 /// state directory under `state` and the token on stdin.
-fn pandora_auth(server: &httpmock::MockServer, repo: &str, state: &std::path::Path) -> Command {
-    let mut cmd = sss();
-    cmd.env("SSS_PANDORA_BASE_URL", server.base_url())
-        .env("XDG_STATE_HOME", state)
-        .args(["--repo", repo, "--profile", "alice", "pandora", "auth"]);
+fn pandora_auth(server: &httpmock::MockServer, repo: &str, state: &Path) -> Command {
+    let mut cmd = sss(state);
+    cmd.env("SSS_PANDORA_BASE_URL", server.base_url()).args([
+        "--repo",
+        repo,
+        "--profile",
+        "alice",
+        "pandora",
+        "auth",
+    ]);
     cmd
 }
 
@@ -141,7 +177,10 @@ fn pandora_auth_verifies_and_stores_the_session_privately() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("data");
     let repo = repo.to_str().expect("utf-8 path");
-    sss().args(["--repo", repo, "init"]).assert().code(0);
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
     let out = pandora_auth(&server, repo, tmp.path())
         .write_stdin("tok-secret-value\n")
         .assert()
@@ -169,7 +208,7 @@ fn pandora_auth_verifies_and_stores_the_session_privately() {
     let text = std::fs::read_to_string(&session).expect("read session");
     assert!(text.contains("tok-secret-value") && text.contains("\"source\": \"prompt\""));
     // Nothing secret lands in the data repository.
-    for entry in walk(std::path::Path::new(repo)) {
+    for entry in walk(Path::new(repo)) {
         let bytes = std::fs::read(&entry).expect("read repo file");
         assert!(!String::from_utf8_lossy(&bytes).contains("tok-secret-value"));
     }
@@ -187,7 +226,10 @@ fn pandora_auth_with_a_refused_token_exits_1_and_stores_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("data");
     let repo = repo.to_str().expect("utf-8 path");
-    sss().args(["--repo", repo, "init"]).assert().code(0);
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
     let token = tmp.path().join("token.txt");
     std::fs::write(&token, "tok-secret-value\n").expect("write token file");
     let out = pandora_auth(&server, repo, tmp.path())
@@ -199,14 +241,15 @@ fn pandora_auth_with_a_refused_token_exits_1_and_stores_nothing() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.starts_with("error: ") && stderr.contains("re-run `sss pandora auth`"),
+        stderr.starts_with("Verifying the token with Pandora...\nerror: ")
+            && stderr.contains("re-run `sss pandora auth`"),
         "{stderr}"
     );
     assert!(!tmp.path().join("streaming-service-sync").exists());
 }
 
 /// Every file under `dir`, recursively.
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).expect("read dir") {
         let path = entry.expect("dir entry").path();
@@ -221,12 +264,12 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// An initialized repository with a stored session for profile `alice`,
 /// verified against `server`.
-fn repo_with_session(server: &httpmock::MockServer, tmp: &std::path::Path) -> String {
+fn repo_with_session(server: &httpmock::MockServer, tmp: &Path) -> String {
     use httpmock::prelude::*;
 
     let repo = tmp.join("data");
     let repo = repo.to_str().expect("utf-8 path").to_owned();
-    sss().args(["--repo", &repo, "init"]).assert().code(0);
+    sss(tmp).args(["--repo", &repo, "init"]).assert().code(0);
     let mut verify = server.mock(|when, then| {
         when.method(POST)
             .path("/api/v1/station/getStations")
@@ -272,11 +315,16 @@ fn empty_account(server: &httpmock::MockServer, playlists_status: u16) {
     }
 }
 
-fn pandora_export(server: &httpmock::MockServer, repo: &str, state: &std::path::Path) -> Command {
-    let mut cmd = sss();
-    cmd.env("SSS_PANDORA_BASE_URL", server.base_url())
-        .env("XDG_STATE_HOME", state)
-        .args(["--repo", repo, "--profile", "alice", "pandora", "export"]);
+fn pandora_export(server: &httpmock::MockServer, repo: &str, state: &Path) -> Command {
+    let mut cmd = sss(state);
+    cmd.env("SSS_PANDORA_BASE_URL", server.base_url()).args([
+        "--repo",
+        repo,
+        "--profile",
+        "alice",
+        "pandora",
+        "export",
+    ]);
     cmd
 }
 
@@ -295,7 +343,7 @@ fn pandora_export_writes_a_complete_run() {
     assert!(stdout.contains("bookmarks        ok      0"), "{stdout}");
     assert!(stdout.contains(" complete"), "{stdout}");
     assert!(stdout.contains("normalized run "), "{stdout}");
-    let pandora = std::path::Path::new(&repo).join("profiles/alice/pandora");
+    let pandora = Path::new(&repo).join("profiles/alice/pandora");
     for file in [
         "stations.json",
         "playlists.json",
@@ -305,7 +353,7 @@ fn pandora_export_writes_a_complete_run() {
     ] {
         assert!(pandora.join(file).is_file(), "{file}");
     }
-    let status = sss()
+    let status = sss(tmp.path())
         .args(["--repo", &repo, "status"])
         .assert()
         .code(0)
@@ -318,7 +366,7 @@ fn pandora_export_writes_a_complete_run() {
         status.contains("    bookmarks        ok      0\n"),
         "{status}"
     );
-    sss()
+    sss(tmp.path())
         .args([
             "--repo",
             &repo,
@@ -366,7 +414,7 @@ fn pandora_export_with_a_failed_step_exits_1_and_keeps_the_run() {
             && stderr.contains("incomplete: failed steps playlists, playlist_tracks"),
         "{stderr}"
     );
-    let pandora = std::path::Path::new(&repo).join("profiles/alice/pandora");
+    let pandora = Path::new(&repo).join("profiles/alice/pandora");
     assert!(
         walk(&pandora.join("raw"))
             .iter()
@@ -376,7 +424,7 @@ fn pandora_export_with_a_failed_step_exits_1_and_keeps_the_run() {
         !pandora.join("stations.json").exists(),
         "incomplete runs are not normalized"
     );
-    let out = sss()
+    let out = sss(tmp.path())
         .args([
             "--repo",
             &repo,
@@ -400,9 +448,11 @@ fn pandora_export_without_a_session_says_to_authenticate() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("data");
     let repo = repo.to_str().expect("utf-8 path");
-    sss().args(["--repo", repo, "init"]).assert().code(0);
-    let out = sss()
-        .env("XDG_STATE_HOME", tmp.path())
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let out = sss(tmp.path())
         .args(["--repo", repo, "--profile", "alice", "pandora", "export"])
         .assert()
         .code(1)
@@ -411,5 +461,132 @@ fn pandora_export_without_a_session_says_to_authenticate() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "error: no Pandora session for profile alice; run `sss pandora auth`\n"
+    );
+}
+
+#[test]
+fn pandora_auth_joins_a_two_line_paste_and_reports_progress() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/v1/station/getStations")
+            .header("X-AuthToken", "tok-secret-value");
+        then.status(200)
+            .json_body(serde_json::json!({"stations": [{"creatorWebname": "listener"}]}));
+    });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let out = pandora_auth(&server, repo, tmp.path())
+        .write_stdin("tok-sec\nret-value\n")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    mock.assert_calls(1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("select the Network tab")
+            && stderr.contains("press Enter on an empty line")
+            && stderr.contains("Verifying the token with Pandora"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("Pandora session verified") && !stdout.contains("Verifying"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn the_only_profile_is_the_default_and_status_shows_its_session() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_session(&server, tmp.path());
+
+    let out = sss(tmp.path())
+        .args(["--repo", &repo, "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let status = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        status.starts_with("profile alice\n  pandora session: stored ")
+            && status.contains(", from prompt\n  export: no run yet\n"),
+        "{status}"
+    );
+    assert!(
+        !Path::new(&repo).join("profiles").exists(),
+        "auth creates nothing in the data repository"
+    );
+
+    empty_account(&server, 200);
+    let out = sss(tmp.path())
+        .env("SSS_PANDORA_BASE_URL", server.base_url())
+        .args(["--repo", &repo, "pandora", "export"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&out.stdout).contains(" complete"));
+    assert!(
+        Path::new(&repo)
+            .join("profiles/alice/pandora/stations.json")
+            .is_file()
+    );
+
+    let config = Path::new(&repo).join("config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("\n[profiles.bob]\n");
+    std::fs::write(&config, text).expect("write config");
+    let out = sss(tmp.path())
+        .env("SSS_PANDORA_BASE_URL", server.base_url())
+        .args(["--repo", &repo, "pandora", "export"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: `sss pandora export` needs --profile NAME (profiles: alice, bob)\n"
+    );
+}
+
+#[test]
+fn status_with_no_profiles_says_how_to_add_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "no profiles yet; run `sss pandora auth --profile NAME` first\n"
+    );
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "pandora", "auth"])
+        .write_stdin("")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: `sss pandora auth` needs --profile NAME (no profiles yet)\n"
     );
 }

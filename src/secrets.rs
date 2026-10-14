@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::fs;
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,63 @@ use crate::repo::{self, APP_DIR};
 /// File name of the stored Pandora session inside a profile's state dir.
 pub const PANDORA_SESSION_FILE: &str = "pandora-session.json";
 
+/// Every credential file a profile's state directory can hold; a directory
+/// under the state root holding at least one of them is a profile.
+pub const CREDENTIAL_FILES: &[&str] = &[PANDORA_SESSION_FILE];
+
+/// The state root, `$XDG_STATE_HOME/streaming-service-sync/`, holding one
+/// directory per profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRoot {
+    root: PathBuf,
+}
+
+impl StateRoot {
+    /// The state root under `$XDG_STATE_HOME` (else `$HOME/.local/state`).
+    pub fn locate() -> Result<Self> {
+        let base = repo::xdg_dir("XDG_STATE_HOME", ".local/state", |v| std::env::var_os(v))
+            .context("cannot determine $XDG_STATE_HOME or $HOME")?;
+        Ok(Self::at(base.join(APP_DIR)))
+    }
+
+    /// The state root at `root`.
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The state directory of `profile`. The name is validated.
+    pub fn profile(&self, name: &str) -> Result<StateDir> {
+        StateDir::under(&self.root, name)
+    }
+
+    /// Names of the directories under the root that are valid profile names
+    /// and hold at least one credential file, sorted. A missing root is an
+    /// empty list. An entry whose credential files cannot be examined (for
+    /// example a directory the user may not traverse) is an error.
+    pub fn profiles(&self) -> Result<Vec<String>> {
+        repo::profile_entries(&self.root, |entry| {
+            let dir = entry.path();
+            for file in CREDENTIAL_FILES {
+                match fs::metadata(dir.join(file)) {
+                    Ok(m) if m.is_file() => return Ok(true),
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(false)
+        })
+    }
+}
+
 /// One profile's state directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir {
@@ -23,14 +81,6 @@ pub struct StateDir {
 }
 
 impl StateDir {
-    /// The state directory of `profile` under `$XDG_STATE_HOME` (else
-    /// `$HOME/.local/state`). The profile name is validated.
-    pub fn for_profile(profile: &str) -> Result<Self> {
-        let base = repo::xdg_dir("XDG_STATE_HOME", ".local/state", |v| std::env::var_os(v))
-            .context("cannot determine $XDG_STATE_HOME or $HOME")?;
-        Self::under(&base.join(APP_DIR), profile)
-    }
-
     /// The state directory of `profile` under `root`.
     pub fn under(root: &Path, profile: &str) -> Result<Self> {
         repo::validate_profile_name(profile)?;
@@ -50,6 +100,22 @@ impl StateDir {
     /// The stored Pandora session, `None` when there is none.
     pub fn load_pandora_session(&self) -> Result<Option<PandoraSession>> {
         repo::read_json_opt(&self.pandora_session_path())
+    }
+
+    /// The `webname` string recorded in the stored Pandora session file,
+    /// read from the JSON without requiring the rest of the session to
+    /// parse. `None` when there is no file, it is not JSON, or it records no
+    /// webname; an error only when the file cannot be read.
+    pub fn held_pandora_webname(&self) -> Result<Option<String>> {
+        let path = self.pandora_session_path();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        Ok(serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("webname")?.as_str().map(str::to_owned)))
     }
 
     /// Replaces the stored Pandora session.
@@ -83,6 +149,16 @@ pub enum TokenSource {
     Prompt,
     /// Read from `--from-file`.
     File,
+}
+
+impl TokenSource {
+    /// The source's name, as the session file spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenSource::Prompt => "prompt",
+            TokenSource::File => "file",
+        }
+    }
 }
 
 /// The credentials every Pandora API request presents. `Debug` never shows
@@ -180,6 +256,16 @@ mod tests {
     }
 
     #[test]
+    fn as_str_is_the_session_file_spelling() {
+        for source in [TokenSource::Prompt, TokenSource::File] {
+            assert_eq!(
+                serde_json::to_value(source).unwrap(),
+                serde_json::json!(source.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn debug_never_shows_tokens() {
         let text = format!("{:?}", session());
         assert!(!text.contains("tok-secret-value"), "{text}");
@@ -190,6 +276,49 @@ mod tests {
     #[test]
     fn profile_names_are_validated() {
         assert!(StateDir::under(Path::new("/s"), "../x").is_err());
+        assert!(StateRoot::at("/s").profile("Bad/Name").is_err());
+        assert_eq!(
+            StateRoot::at("/s").profile("alice").unwrap().dir(),
+            Path::new("/s/alice")
+        );
+    }
+
+    #[test]
+    fn root_profiles_are_directories_holding_a_credential_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StateRoot::at(tmp.path().join("missing"));
+        assert!(root.profiles().unwrap().is_empty());
+
+        let root = StateRoot::at(tmp.path());
+        for name in ["carol", "alice"] {
+            root.profile(name)
+                .unwrap()
+                .save_pandora_session(&session())
+                .unwrap();
+        }
+        // No credential file: not a profile.
+        fs::create_dir_all(tmp.path().join("bob")).unwrap();
+        fs::write(tmp.path().join("bob/notes.txt"), "x").unwrap();
+        // The matcher's agent directory is never a profile.
+        fs::create_dir_all(tmp.path().join("ccc/agents")).unwrap();
+        // A credential file under an invalid name is ignored.
+        fs::create_dir_all(tmp.path().join("Dave")).unwrap();
+        fs::write(tmp.path().join("Dave").join(PANDORA_SESSION_FILE), "{}").unwrap();
+        // A plain file at the root is ignored.
+        fs::write(tmp.path().join("erin"), "x").unwrap();
+        assert_eq!(root.profiles().unwrap(), ["alice", "carol"]);
+    }
+
+    #[test]
+    fn an_unexaminable_credential_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("alice");
+        fs::create_dir_all(&dir).unwrap();
+        // A symlink to itself: examining it fails with ELOOP, not NotFound.
+        let file = dir.join(PANDORA_SESSION_FILE);
+        std::os::unix::fs::symlink(&file, &file).unwrap();
+        let err = format!("{:#}", StateRoot::at(tmp.path()).profiles().unwrap_err());
+        assert!(err.contains(&dir.display().to_string()), "{err}");
     }
 
     #[test]

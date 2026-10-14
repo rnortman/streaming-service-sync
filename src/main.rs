@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use streaming_service_sync::cli::{self, Cli};
+use streaming_service_sync::secrets::StateRoot;
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -22,11 +23,13 @@ fn main() -> ExitCode {
     };
     let result = {
         let mut stdout = std::io::stdout().lock();
-        cli::run(cli, &mut stdout).and_then(|()| {
-            stdout
-                .flush()
-                .map_err(|e| anyhow::Error::new(e).context("writing output"))
-        })
+        StateRoot::locate()
+            .and_then(|state_root| cli::run(cli, &state_root, &mut stdout))
+            .and_then(|()| {
+                stdout
+                    .flush()
+                    .map_err(|e| anyhow::Error::new(e).context("writing output"))
+            })
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

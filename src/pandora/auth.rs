@@ -12,8 +12,19 @@ use crate::pandora::client::{Client, Reply, endpoint};
 use crate::repo;
 use crate::secrets::{self, PandoraSession, StateDir, TokenSource};
 
-/// Reads the token: the first line of `from_file` when given, else one line
-/// from `input` after writing a prompt to `prompt`.
+/// The prompt `read_token` writes before reading the token from the input.
+pub const PROMPT: &str = "\
+Log in at https://www.pandora.com in your browser, open the developer
+tools (F12), select the Network tab, reload the page and pick any request
+whose URL contains /api/. Under Request Headers, copy the value of
+X-AuthToken (the header, not the `at` cookie). Paste it below; if it
+arrives on two lines, that is fine. Then press Enter on an empty line.
+X-AuthToken: ";
+
+/// Reads the token: every line of `from_file` when given, else the lines
+/// of `input` up to an empty line or EOF, after writing [`PROMPT`] to
+/// `prompt`. Each line is trimmed and the non-empty ones are joined with no
+/// separator, so a value the browser copied across two lines is whole.
 pub fn read_token(
     from_file: Option<&Path>,
     input: &mut dyn BufRead,
@@ -21,35 +32,47 @@ pub fn read_token(
 ) -> Result<(String, TokenSource)> {
     // TODO(browser-cookie-extraction): a third source, the session of a
     // local Chromium or Chrome profile.
-    let (line, source) = match from_file {
+    let (lines, source) = match from_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             (
-                text.lines().next().unwrap_or_default().to_owned(),
+                text.lines().map(str::to_owned).collect::<Vec<_>>(),
                 TokenSource::File,
             )
         }
         None => {
-            write!(
-                prompt,
-                "Paste the X-AuthToken request header value from pandora.com: "
-            )
-            .and_then(|()| prompt.flush())
-            .context("writing the prompt")?;
-            let mut line = String::new();
-            input.read_line(&mut line).context("reading the token")?;
-            (line, TokenSource::Prompt)
+            write!(prompt, "{PROMPT}")
+                .and_then(|()| prompt.flush())
+                .context("writing the prompt")?;
+            (read_until_empty_line(input)?, TokenSource::Prompt)
         }
     };
-    let token = line.trim();
+    let token: String = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
     if token.is_empty() {
         bail!("no token given");
     }
     if !token.bytes().all(|b| b.is_ascii_graphic()) {
         bail!("the token contains spaces or non-ASCII characters; paste the header value only");
     }
-    Ok((token.to_owned(), source))
+    Ok((token, source))
+}
+
+/// The lines of `input` before the first line that is empty after trimming,
+/// or before EOF.
+fn read_until_empty_line(input: &mut dyn BufRead) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).context("reading the token")? == 0 || line.trim().is_empty() {
+            return Ok(lines);
+        }
+        lines.push(line);
+    }
 }
 
 /// The listener's webname as the station list reports it, when it lists a
@@ -64,7 +87,8 @@ fn webname(stations: &Value) -> Option<String> {
 
 /// Verifies `token` with one `getStations` request through the client
 /// `connect` builds, then stores the session in `state`. Nothing is stored
-/// when Pandora does not accept it.
+/// when Pandora does not accept it, or when the stored session names a
+/// different webname than the one the token reports.
 pub fn verify_and_store(
     state: &StateDir,
     token: String,
@@ -96,6 +120,16 @@ pub fn verify_and_store(
         }
     };
     session.webname = webname(&stations);
+    if let (Some(new), Some(held)) = (session.webname.as_deref(), state.held_pandora_webname()?)
+        && new != held
+    {
+        bail!(
+            "this token is for Pandora webname {new}, but the profile's session at {} is for \
+             webname {held}; pass --profile NAME to sign in another profile, or delete that \
+             file to replace the listener",
+            state.pandora_session_path().display()
+        );
+    }
     session.stored_at = repo::now_rfc3339()?;
     state.save_pandora_session(&session)?;
     let who = session
@@ -117,27 +151,57 @@ mod tests {
     use super::*;
     use crate::pandora::test_support::FAST;
     use httpmock::prelude::*;
+    use std::fs;
 
     fn read(from_file: Option<&Path>, input: &str) -> Result<(String, TokenSource)> {
         read_token(from_file, &mut input.as_bytes(), &mut Vec::new())
     }
 
     #[test]
-    fn prompt_reads_one_trimmed_line() {
+    fn prompt_joins_trimmed_lines() {
         let mut prompt = Vec::new();
         let got = read_token(None, &mut "  abc.DEF=\nsecond\n".as_bytes(), &mut prompt).unwrap();
-        assert_eq!(got, ("abc.DEF=".to_owned(), TokenSource::Prompt));
-        assert!(String::from_utf8(prompt).unwrap().contains("X-AuthToken"));
+        assert_eq!(got, ("abc.DEF=second".to_owned(), TokenSource::Prompt));
+        assert_eq!(String::from_utf8(prompt).unwrap(), PROMPT);
     }
 
     #[test]
-    fn file_source_takes_the_first_line() {
+    fn a_two_line_paste_is_joined_without_its_surrounding_whitespace() {
+        assert_eq!(
+            read(None, " \t tok-sec \r\n\u{a0} ret-value\t\n\n")
+                .unwrap()
+                .0,
+            "tok-secret-value"
+        );
+    }
+
+    #[test]
+    fn an_empty_line_ends_the_paste() {
+        assert_eq!(
+            read(None, "first\nhalf\n   \nignored\n").unwrap().0,
+            "firsthalf"
+        );
+    }
+
+    #[test]
+    fn eof_after_one_line_ends_the_paste() {
+        assert_eq!(read(None, "only-line").unwrap().0, "only-line");
+        assert_eq!(read(None, "only-line\n").unwrap().0, "only-line");
+    }
+
+    #[test]
+    fn file_source_joins_every_line() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("token");
-        std::fs::write(&path, "tok123\r\nignored\n").unwrap();
+        std::fs::write(&path, "tok123\r\n\r\n  more \r\n").unwrap();
         assert_eq!(
             read(Some(&path), "unused").unwrap(),
-            ("tok123".to_owned(), TokenSource::File)
+            ("tok123more".to_owned(), TokenSource::File)
+        );
+        std::fs::write(&path, "\n  \r\n\t\n").unwrap();
+        assert_eq!(
+            read(Some(&path), "").unwrap_err().to_string(),
+            "no token given"
         );
     }
 
@@ -145,12 +209,12 @@ mod tests {
     fn empty_or_malformed_tokens_are_refused() {
         assert_eq!(read(None, "\n").unwrap_err().to_string(), "no token given");
         assert_eq!(read(None, "").unwrap_err().to_string(), "no token given");
-        assert!(
-            read(None, "two words\n")
-                .unwrap_err()
-                .to_string()
-                .contains("spaces")
-        );
+        for bad in ["two words\n", "tok\nen\u{e9}\n"] {
+            assert!(
+                read(None, bad).unwrap_err().to_string().contains("spaces"),
+                "{bad:?}"
+            );
+        }
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing");
         assert!(read(Some(&missing), "").is_err());
@@ -204,6 +268,100 @@ mod tests {
         assert!(!session.stored_at.is_empty());
         assert!(out.contains("webname listener"), "{out}");
         assert!(!out.contains("tok-secret-value"), "{out}");
+    }
+
+    /// A server whose station list names `webname`.
+    fn server_for(webname: &str) -> MockServer {
+        let server = MockServer::start();
+        server.mock(|_, then| {
+            then.status(200)
+                .json_body(json!({"stations": [{"creatorWebname": webname}]}));
+        });
+        server
+    }
+
+    fn stored(state: &StateDir, webname: Option<&str>) -> PandoraSession {
+        let session = PandoraSession {
+            auth_token: "old-token".into(),
+            webname: webname.map(str::to_owned),
+            ..crate::pandora::test_support::session()
+        };
+        state.save_pandora_session(&session).unwrap();
+        session
+    }
+
+    #[test]
+    fn re_auth_for_the_same_webname_replaces_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        stored(&state, Some("listener"));
+        let session = run(&server_for("listener"), &state).0.unwrap();
+        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+    }
+
+    #[test]
+    fn a_token_for_another_webname_is_not_stored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        let held = stored(&state, Some("listener"));
+        let err = run(&server_for("other"), &state).0.unwrap_err().to_string();
+        assert!(
+            err.contains("webname other")
+                && err.contains("webname listener")
+                && err.contains("--profile NAME")
+                && err.contains(&state.pandora_session_path().display().to_string()),
+            "{err}"
+        );
+        assert_eq!(state.load_pandora_session().unwrap(), Some(held));
+    }
+
+    #[test]
+    fn a_session_without_a_webname_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        stored(&state, None);
+        let session = run(&server_for("other"), &state).0.unwrap();
+        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+    }
+
+    #[test]
+    fn an_unparseable_session_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        stored(&state, None);
+        fs::write(state.pandora_session_path(), "{not json").unwrap();
+        let session = run(&server_for("other"), &state).0.unwrap();
+        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+    }
+
+    #[test]
+    fn a_session_of_another_shape_still_guards_its_webname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        stored(&state, None);
+        let other_shape = r#"{"webname": "listener", "extra": 1}"#;
+        fs::write(state.pandora_session_path(), other_shape).unwrap();
+        let err = run(&server_for("other"), &state).0.unwrap_err().to_string();
+        assert!(err.contains("webname listener"), "{err}");
+        assert_eq!(
+            fs::read_to_string(state.pandora_session_path()).unwrap(),
+            other_shape
+        );
+    }
+
+    #[test]
+    fn an_unreadable_session_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        fs::create_dir_all(state.pandora_session_path()).unwrap();
+        let err = format!("{:#}", run(&server_for("other"), &state).0.unwrap_err());
+        assert!(
+            err.contains(&format!(
+                "reading {}",
+                state.pandora_session_path().display()
+            )),
+            "{err}"
+        );
     }
 
     #[test]

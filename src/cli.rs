@@ -9,8 +9,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::config::{self, Config};
 use crate::pandora::client::Client;
 use crate::pandora::{auth, export, model};
+use crate::profiles;
 use crate::repo::{self, Repo};
-use crate::secrets::StateDir;
+use crate::secrets::StateRoot;
 use crate::status;
 
 /// Export a Pandora account to a local data repository and migrate it to
@@ -22,7 +23,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub repo: Option<PathBuf>,
 
-    /// Profile (one family member's Pandora login and Spotify account)
+    /// Profile (one family member's Pandora login and Spotify account);
+    /// defaults to the only profile when there is one
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -54,7 +56,8 @@ pub enum Command {
 pub enum PandoraCommand {
     /// Verify and store the X-AuthToken value of the browser's session
     Auth {
-        /// Read the token from the first line of a file instead of prompting
+        /// Read the token from a file instead of prompting: every line,
+        /// trimmed, joined
         #[arg(long, value_name = "FILE")]
         from_file: Option<PathBuf>,
     },
@@ -181,41 +184,50 @@ impl Command {
         }
     }
 
-    /// Whether the command acts on one profile and so needs `--profile`.
-    /// `status` covers every profile when none is named.
+    /// Whether the command acts on one profile and so needs `--profile` or a
+    /// single known profile. `status` covers every profile when none is
+    /// named.
     fn needs_profile(&self) -> bool {
         !matches!(self, Command::Init | Command::Status)
     }
 }
 
-/// Runs the parsed command line, writing normal output to `out`.
-pub fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
+/// Runs the parsed command line against the profiles' state directories
+/// under `state_root`, writing normal output to `out`.
+pub fn run(cli: Cli, state_root: &StateRoot, out: &mut dyn Write) -> Result<()> {
     let repo = Repo::locate(cli.repo.as_deref())?;
     if let Command::Init = cli.command {
         return init(&repo, out);
     }
-    let _config = Config::load(&repo.config_path())?;
-    let _profile = match &cli.profile {
-        Some(name) => Some(repo.profile(name)?),
-        None if cli.command.needs_profile() => {
-            bail!("`sss {}` needs --profile NAME", cli.command.name())
+    let config = Config::load(&repo.config_path())?;
+    let profile = match &cli.profile {
+        Some(name) => {
+            repo::validate_profile_name(name)?;
+            Some(name.clone())
         }
+        None if cli.command.needs_profile() => Some(only_profile(
+            &cli.command,
+            &profiles::known(&repo, state_root, &config)?,
+        )?),
         None => None,
     };
-    match (&cli.command, cli.profile.as_deref()) {
+    match (&cli.command, profile.as_deref()) {
         (Command::Pandora(PandoraCommand::Auth { from_file }), Some(name)) => {
-            let state = StateDir::for_profile(name)?;
+            let state = state_root.profile(name)?;
+            let mut stderr = std::io::stderr();
             let (token, source) = auth::read_token(
                 from_file.as_deref(),
                 &mut std::io::stdin().lock(),
-                &mut std::io::stderr(),
+                &mut stderr,
             )?;
+            writeln!(stderr, "Verifying the token with Pandora...").context("writing to stderr")?;
             auth::verify_and_store(&state, token, source, Client::from_env, out)?;
             Ok(())
         }
         (Command::Pandora(PandoraCommand::Export), Some(name)) => {
             let paths = repo.profile(name)?;
-            let session = StateDir::for_profile(name)?
+            let session = state_root
+                .profile(name)?
                 .load_pandora_session()?
                 .with_context(|| {
                     format!("no Pandora session for profile {name}; run `sss pandora auth`")
@@ -238,8 +250,25 @@ pub fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             model::normalize(&repo.profile(name)?, out)?;
             Ok(())
         }
-        (Command::Status, profile) => status::status(&repo, profile, out),
+        (Command::Status, profile) => status::status(&repo, state_root, &config, profile, out),
         _ => bail!("`sss {}` is not implemented yet", cli.command.name()),
+    }
+}
+
+/// The profile a command run without `--profile` acts on: the only known
+/// one. None or several known is an error naming the command.
+fn only_profile(command: &Command, known: &[String]) -> Result<String> {
+    match known {
+        [only] => Ok(only.clone()),
+        [] => bail!(
+            "`sss {}` needs --profile NAME (no profiles yet)",
+            command.name()
+        ),
+        several => bail!(
+            "`sss {}` needs --profile NAME (profiles: {})",
+            command.name(),
+            several.join(", ")
+        ),
     }
 }
 
@@ -404,18 +433,71 @@ mod tests {
     #[test]
     fn profile_scoped_commands_need_a_profile() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = Repo::at(tmp.path());
+        let data = tmp.path().join("data");
+        let repo = Repo::at(&data);
         init(&repo, &mut Vec::new()).unwrap();
+        let state_root = StateRoot::at(tmp.path().join("state"));
         let run_args = |args: &[&str]| {
-            let mut full = vec!["--repo", tmp.path().to_str().unwrap()];
+            let mut full = vec!["--repo", data.to_str().unwrap()];
             full.extend_from_slice(args);
-            format!("{:#}", run(parse(&full), &mut Vec::new()).unwrap_err())
+            format!(
+                "{:#}",
+                run(parse(&full), &state_root, &mut Vec::new()).unwrap_err()
+            )
         };
-        assert_eq!(run_args(&["push"]), "`sss push` needs --profile NAME");
+        assert_eq!(
+            run_args(&["push"]),
+            "`sss push` needs --profile NAME (no profiles yet)"
+        );
+        assert_eq!(
+            run_args(&["pandora", "auth"]),
+            "`sss pandora auth` needs --profile NAME (no profiles yet)"
+        );
         assert!(run_args(&["push", "--profile", "Bad/Name"]).contains("invalid profile name"));
         assert_eq!(
             run_args(&["push", "--profile", "alice"]),
             "`sss push` is not implemented yet"
+        );
+
+        // One profile, known only from a session in the state root: the
+        // default. A profile directory with no session does not count.
+        state_root
+            .profile("alice")
+            .unwrap()
+            .save_pandora_session(&crate::pandora::test_support::session())
+            .unwrap();
+        std::fs::create_dir_all(state_root.root().join("ccc/agents")).unwrap();
+        assert_eq!(run_args(&["push"]), "`sss push` is not implemented yet");
+        let err = run_args(&["pandora", "normalize"]);
+        assert!(
+            err.contains("no complete export run") && !err.contains("--profile"),
+            "{err}"
+        );
+
+        // A second profile, known only from config.toml: both are named.
+        std::fs::write(repo.config_path(), "[profiles.bob]\n").unwrap();
+        assert_eq!(
+            run_args(&["push"]),
+            "`sss push` needs --profile NAME (profiles: alice, bob)"
+        );
+        assert_eq!(
+            run_args(&["push", "--profile", "bob"]),
+            "`sss push` is not implemented yet"
+        );
+    }
+
+    #[test]
+    fn a_profile_known_only_from_config_is_the_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::at(tmp.path().join("data"));
+        init(&repo, &mut Vec::new()).unwrap();
+        std::fs::write(repo.config_path(), "[profiles.bob]\n").unwrap();
+        let cli = parse(&["--repo", repo.root().to_str().unwrap(), "pandora", "export"]);
+        let state_root = StateRoot::at(tmp.path().join("state"));
+        let err = format!("{:#}", run(cli, &state_root, &mut Vec::new()).unwrap_err());
+        assert_eq!(
+            err,
+            "no Pandora session for profile bob; run `sss pandora auth`"
         );
     }
 
@@ -423,7 +505,8 @@ mod tests {
     fn commands_other_than_init_need_an_initialized_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let cli = parse(&["--repo", tmp.path().to_str().unwrap(), "status"]);
-        let err = format!("{:#}", run(cli, &mut Vec::new()).unwrap_err());
+        let state_root = StateRoot::at(tmp.path().join("state"));
+        let err = format!("{:#}", run(cli, &state_root, &mut Vec::new()).unwrap_err());
         assert!(err.contains("sss init"), "{err}");
     }
 }

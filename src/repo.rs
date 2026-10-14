@@ -76,27 +76,37 @@ impl Repo {
     /// Names of the profiles that have a directory under `profiles/`,
     /// sorted. Entries whose names are not valid profile names are ignored.
     pub fn profiles(&self) -> Result<Vec<String>> {
-        let dir = self.profiles_dir();
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-        };
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str()
-                && validate_profile_name(name).is_ok()
-            {
-                names.push(name.to_owned());
-            }
-        }
-        names.sort();
-        Ok(names)
+        profile_entries(&self.profiles_dir(), |entry| {
+            Ok(entry.file_type()?.is_dir())
+        })
     }
+}
+
+/// Names of the entries of `dir` that are valid profile names and that
+/// `keep` accepts, sorted. A missing `dir` is an empty list.
+pub fn profile_entries(
+    dir: &Path,
+    keep: impl Fn(&fs::DirEntry) -> io::Result<bool>,
+) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_profile_name(&name).is_ok()
+            && keep(&entry).with_context(|| format!("reading {}", entry.path().display()))?
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// An XDG base directory: `$var` when it is set to an absolute path, else

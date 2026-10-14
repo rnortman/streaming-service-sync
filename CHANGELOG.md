@@ -22,14 +22,23 @@ Notable changes to streaming-service-sync. Format follows
   checked against Pandora before it is kept and is stored outside the data
   repository, readable only by you. No Pandora password is ever asked for.
   If Pandora is down or rate-limiting, the command says so and asks you to
-  try again later rather than blaming the token.
+  try again later rather than blaming the token. A token belonging to a
+  different Pandora listener than the one already signed in under that
+  profile is refused, so one family member's session cannot silently
+  overwrite another's. The prompt explains where in the browser to find the
+  token, and a token that pastes as two lines is joined back together (end
+  the paste with an empty line).
 - `sss init` creates the local data repository — the private directory where
   everything exported, matched and synced will be kept — with a commented
   `config.toml` and a README describing its layout. It defaults to
   `~/.local/share/streaming-service-sync`; `--repo DIR` picks another place.
   Existing files are never overwritten.
-- `sss status` shows, per profile, how the latest export run went step by
-  step, so its counts can be compared with what the Pandora app shows.
+- `sss status` shows, per profile, whether a Pandora session is stored and
+  how the latest export run went step by step, so its counts can be
+  compared with what the Pandora app shows. A profile is listed as soon as
+  `sss pandora auth` has stored its session.
+- `--profile` may be left out while only one profile exists; that profile
+  is then used.
 - `sss pandora normalize` rebuilds `stations.json`, `playlists.json`,
   `collection.json`, `bookmarks.json` and a deduplicated `tracks.json` from
   the latest complete run, without contacting Pandora. Tracks include the
