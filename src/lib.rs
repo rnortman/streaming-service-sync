@@ -4,6 +4,8 @@
 
 pub mod cli;
 pub mod config;
+pub mod error;
+pub mod input;
 pub mod pandora;
 pub mod profiles;
 pub mod repo;

@@ -599,7 +599,11 @@ impl Builder {
                 }
                 "AL" | "AR" => {}
                 _ => {
-                    eprintln!("{}", unknown_collection_item_warning(&id));
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{}",
+                        unknown_collection_item_warning(&id)
+                    );
                     continue;
                 }
             }
@@ -806,14 +810,45 @@ pub fn write(paths: &ProfilePaths, data: &Normalized) -> Result<()> {
     repo::write_json(&paths.tracks(), &data.tracks)
 }
 
-/// `sss pandora normalize`: re-derives the normalized files from the latest
-/// complete run and prints what they hold.
-pub fn normalize(paths: &ProfilePaths, out: &mut dyn Write) -> Result<Normalized> {
-    let Some(manifest) = export::latest_complete_run(paths)? else {
-        bail!("no complete export run to normalize; run `sss pandora export`");
-    };
-    let data = normalize_run(&paths.raw_run_dir(&manifest.run_id))?;
-    write(paths, &data)?;
+/// What one normalization holds, counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub run_id: String,
+    pub stations: usize,
+    pub thumbs_up: usize,
+    pub thumbs_down: usize,
+    pub playlists: usize,
+    pub collection_tracks: usize,
+    pub collection_albums: usize,
+    pub collection_artists: usize,
+    pub bookmarks: usize,
+    /// Distinct tracks.
+    pub tracks: usize,
+}
+
+impl Summary {
+    /// The `normalized run …` line.
+    pub fn write_text(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "normalized run {}: {} stations, {} thumbs up, {} thumbs down, {} playlists, \
+             collection {} tracks / {} albums / {} artists, {} bookmarks, {} distinct tracks",
+            self.run_id,
+            self.stations,
+            self.thumbs_up,
+            self.thumbs_down,
+            self.playlists,
+            self.collection_tracks,
+            self.collection_albums,
+            self.collection_artists,
+            self.bookmarks,
+            self.tracks,
+        )
+    }
+}
+
+/// The counts of `data`, normalized from run `run_id`.
+pub fn summary(data: &Normalized, run_id: &str) -> Summary {
     let thumbs = |positive: bool| {
         data.stations
             .iter()
@@ -822,23 +857,29 @@ pub fn normalize(paths: &ProfilePaths, out: &mut dyn Write) -> Result<Normalized
             .count()
     };
     let c = &data.collection;
-    writeln!(
-        out,
-        "normalized run {}: {} stations, {} thumbs up, {} thumbs down, {} playlists, \
-         collection {} tracks / {} albums / {} artists, {} bookmarks, {} distinct tracks",
-        manifest.run_id,
-        data.stations.len(),
-        thumbs(true),
-        thumbs(false),
-        data.playlists.len(),
-        c.tracks.len(),
-        c.albums.len(),
-        c.artists.len(),
-        data.bookmarks.tracks.len() + data.bookmarks.albums.len(),
-        data.tracks.len(),
-    )
-    .context("writing output")?;
-    Ok(data)
+    Summary {
+        run_id: run_id.to_owned(),
+        stations: data.stations.len(),
+        thumbs_up: thumbs(true),
+        thumbs_down: thumbs(false),
+        playlists: data.playlists.len(),
+        collection_tracks: c.tracks.len(),
+        collection_albums: c.albums.len(),
+        collection_artists: c.artists.len(),
+        bookmarks: data.bookmarks.tracks.len() + data.bookmarks.albums.len(),
+        tracks: data.tracks.len(),
+    }
+}
+
+/// `sss pandora normalize`: re-derives the normalized files from the latest
+/// complete run and returns what they hold.
+pub fn normalize(paths: &ProfilePaths) -> Result<Summary> {
+    let Some(manifest) = export::latest_complete_run(paths)? else {
+        bail!("no complete export run to normalize; run `sss pandora export`");
+    };
+    let data = normalize_run(&paths.raw_run_dir(&manifest.run_id))?;
+    write(paths, &data)?;
+    Ok(summary(&data, &manifest.run_id))
 }
 
 #[cfg(test)]
@@ -1245,16 +1286,11 @@ mod tests {
             &stations("unfinished"),
         );
 
-        let mut out = Vec::new();
-        let data = normalize(&paths, &mut out).unwrap();
-        assert_eq!(data.stations[0].station_id, "newest");
-        let out = String::from_utf8(out).unwrap();
-        assert!(
-            out.starts_with("normalized run 20261013T000000Z-10: 1 stations"),
-            "{out}"
-        );
+        let summary = normalize(&paths).unwrap();
+        assert_eq!(summary.run_id, "20261013T000000Z-10");
+        assert_eq!(summary.stations, 1);
         let on_disk: Vec<Station> = repo::read_json(&paths.stations()).unwrap();
-        assert_eq!(on_disk, data.stations);
+        assert_eq!(on_disk[0].station_id, "newest");
         for file in [
             paths.playlists(),
             paths.collection(),
@@ -1265,7 +1301,7 @@ mod tests {
         }
         // Re-running writes identical bytes.
         let before = fs::read(paths.stations()).unwrap();
-        normalize(&paths, &mut Vec::new()).unwrap();
+        normalize(&paths).unwrap();
         assert_eq!(fs::read(paths.stations()).unwrap(), before);
     }
 
@@ -1273,7 +1309,7 @@ mod tests {
     fn normalize_without_a_complete_run_says_to_export() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Repo::at(tmp.path()).profile("alice").unwrap();
-        let err = normalize(&paths, &mut Vec::new()).unwrap_err().to_string();
+        let err = normalize(&paths).unwrap_err().to_string();
         assert_eq!(
             err,
             "no complete export run to normalize; run `sss pandora export`"
@@ -1291,6 +1327,38 @@ mod tests {
             json!({"total": 1, "feedback": [down]}),
         )]);
         assert!(!data.stations[0].feedback[0].positive);
+    }
+
+    #[test]
+    fn summary_counts_the_normalized_data_and_prints_the_normalize_line() {
+        let data = normalize_exchanges(&[
+            (
+                "v1/station/getStationFeedback",
+                feedback_req("11", true, 0),
+                200,
+                json!({"total": 2, "feedback": [fb("f1", "TR:1", None), fb("f2", "TR:2", None)]}),
+            ),
+            (
+                "v1/station/getStationFeedback",
+                feedback_req("11", false, 0),
+                200,
+                json!({"total": 1, "feedback": [fb("f3", "TR:3", None)]}),
+            ),
+        ]);
+        let summary = summary(&data, "20261013T000000Z");
+        assert_eq!(
+            (summary.stations, summary.thumbs_up, summary.thumbs_down),
+            (1, 2, 1)
+        );
+        assert_eq!(summary.tracks, 3);
+        let mut text = Vec::new();
+        summary.write_text(&mut text).unwrap();
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "normalized run 20261013T000000Z: 1 stations, 2 thumbs up, 1 thumbs down, \
+             0 playlists, collection 0 tracks / 0 albums / 0 artists, 0 bookmarks, \
+             3 distinct tracks\n"
+        );
     }
 
     #[test]

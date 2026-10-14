@@ -8,9 +8,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+
+use crate::error::Kind;
+use crate::fail;
 
 /// Directory name under `$XDG_DATA_HOME` for the default repository.
 pub const APP_DIR: &str = "streaming-service-sync";
@@ -36,9 +39,13 @@ impl Repo {
     pub fn locate(explicit: Option<&Path>) -> Result<Self> {
         let root = match explicit {
             Some(p) => p.to_path_buf(),
-            None => xdg_dir("XDG_DATA_HOME", ".local/share", |v| std::env::var_os(v))
-                .context("cannot determine $XDG_DATA_HOME or $HOME; pass --repo DIR")?
-                .join(APP_DIR),
+            None => match xdg_dir("XDG_DATA_HOME", ".local/share", |v| std::env::var_os(v)) {
+                Some(dir) => dir.join(APP_DIR),
+                None => fail!(
+                    Kind::Config,
+                    "cannot determine $XDG_DATA_HOME or $HOME; pass --repo DIR"
+                ),
+            },
         };
         Ok(Self { root })
     }
@@ -133,7 +140,8 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
             .next()
             .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     if !ok {
-        bail!(
+        fail!(
+            Kind::Config,
             "invalid profile name {name:?}: use lowercase letters, digits, '-' and '_', \
              starting with a letter or digit"
         );
@@ -338,7 +346,11 @@ pub fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
             .with_context(|| format!("reading {}", path.display()))?;
         let (body, torn) = split_torn_tail(&text);
         if !torn.is_empty() {
-            eprintln!("{}", torn_tail_warning(path, torn, "removing"));
+            let _ = writeln!(
+                io::stderr(),
+                "{}",
+                torn_tail_warning(path, torn, "removing")
+            );
             file.set_len(body.len() as u64)
                 .with_context(|| format!("repairing {}", path.display()))?;
         }
@@ -403,7 +415,11 @@ pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     };
     let (body, torn) = split_torn_tail(&bytes);
     if !torn.is_empty() {
-        eprintln!("{}", torn_tail_warning(path, torn, "skipping"));
+        let _ = writeln!(
+            io::stderr(),
+            "{}",
+            torn_tail_warning(path, torn, "skipping")
+        );
     }
     let text = std::str::from_utf8(body).with_context(|| format!("reading {}", path.display()))?;
     let mut records = Vec::new();

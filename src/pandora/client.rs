@@ -5,7 +5,7 @@
 //! success, a failed step, or a rejected session.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::error::{Kind, WithKind};
 use crate::repo;
 use crate::secrets::PandoraSession;
 
@@ -173,7 +174,7 @@ fn transport_warning(path: &str, attempt: u32, error: &anyhow::Error) -> String 
 }
 
 fn print_warning(line: &str) {
-    eprintln!("{line}");
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// A paced Pandora API client for one session.
@@ -246,9 +247,9 @@ impl Client {
                     continue;
                 }
                 Err(e) => {
-                    return Err(
-                        e.context(format!("POST {path}: no response after {MAX_TRIES} tries"))
-                    );
+                    return Err(e).with_kind(Kind::Unavailable, || {
+                        format!("POST {path}: no response after {MAX_TRIES} tries")
+                    });
                 }
             };
             self.requests += 1;
@@ -521,6 +522,11 @@ mod tests {
             "{err:#}"
         );
         assert!(err.downcast_ref::<SessionRejected>().is_none());
+        assert_eq!(crate::error::kind(&err), Kind::Unavailable);
+        assert!(
+            err.chain().nth(1).is_some(),
+            "the transport error stays in the chain"
+        );
         assert_eq!(client.requests(), 0);
         let warnings = WARNINGS.with(|w| w.take());
         assert_eq!(warnings.len(), MAX_TRIES as usize - 1, "{warnings:?}");

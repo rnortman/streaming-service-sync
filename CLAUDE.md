@@ -16,6 +16,11 @@ make rust-check   — the same without the license audit and scrub kit check (wh
 ## Principles
 
 - **Every command prints `error: …` and exits 1 on failure.**
+- **Every command is subprocess-safe.** stdout is the result (one JSON
+  document with `--json`), stderr is for people; input comes from
+  arguments, files or stdin read up to an empty line or EOF — never from
+  the terminal device; nothing opens a browser, pager or editor, and
+  nothing asks a question.
 - **Raw first, parse second.** Every Pandora response is stored verbatim
   before anything parses it; a parser gap must never lose data.
 - **No secrets in the data repository or in logs.** Pandora sessions and

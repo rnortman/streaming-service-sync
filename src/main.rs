@@ -21,17 +21,26 @@ fn main() -> ExitCode {
             return ExitCode::from(parse_exit_code(&e));
         }
     };
-    let result = {
-        let mut stdout = std::io::stdout().lock();
-        StateRoot::locate()
-            .and_then(|state_root| cli::run(cli, &state_root, &mut stdout))
-            .and_then(|()| {
-                stdout
-                    .flush()
-                    .map_err(|e| anyhow::Error::new(e).context("writing output"))
-            })
+    let mut stdout = std::io::stdout().lock();
+    let result = match StateRoot::locate() {
+        Ok(state_root) => cli::run(
+            cli,
+            &state_root,
+            &mut std::io::stdin().lock(),
+            &mut stdout,
+            &mut std::io::stderr(),
+        ),
+        Err(e) => {
+            // A write failure here leaves stdout broken; `e` is still the
+            // error to report.
+            let _ = cli::report_failure(&cli, &e, &mut stdout);
+            Err(e)
+        }
     };
-    match result {
+    let flushed = stdout
+        .flush()
+        .map_err(|e| anyhow::Error::new(e).context("writing output"));
+    match result.and(flushed) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "error: {e:#}");

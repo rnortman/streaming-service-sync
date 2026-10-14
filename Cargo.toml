@@ -26,6 +26,10 @@ time = { version = "0.3.55", features = ["formatting", "parsing"] }
 toml = "1.1.8"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
+[lints.clippy]
+# `eprintln!` panics when stderr is closed; warnings are written best-effort.
+print_stderr = "warn"
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 httpmock = "0.8.3"

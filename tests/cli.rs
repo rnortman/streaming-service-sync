@@ -248,6 +248,47 @@ fn pandora_auth_with_a_refused_token_exits_1_and_stores_nothing() {
     assert!(!tmp.path().join("streaming-service-sync").exists());
 }
 
+#[test]
+fn pandora_auth_json_for_another_webname_warns_on_stderr_and_names_it() {
+    use httpmock::prelude::*;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    for webname in ["listener", "other"] {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/station/getStations");
+            then.status(200)
+                .json_body(serde_json::json!({"stations": [{"creatorWebname": webname}]}));
+        });
+        let out = pandora_auth(&server, repo, tmp.path())
+            .arg("--json")
+            .write_stdin("tok-secret-value\n")
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout is one JSON document");
+        assert_eq!(doc["webname"], webname);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let warning = "warning: profile alice held a session for Pandora webname listener; \
+                       it now holds webname other\n";
+        if webname == "listener" {
+            assert_eq!(doc["replaced_webname"], serde_json::Value::Null);
+            assert!(!stderr.contains("warning"), "{stderr}");
+        } else {
+            assert_eq!(doc["replaced_webname"], "listener");
+            assert!(stderr.ends_with(warning), "{stderr}");
+        }
+    }
+}
+
 /// Every file under `dir`, recursively.
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -537,6 +578,11 @@ fn the_only_profile_is_the_default_and_status_shows_its_session() {
         .clone();
     assert!(String::from_utf8_lossy(&out.stdout).contains(" complete"));
     assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .starts_with("profile alice (the only one; pass --profile NAME to choose)\n"),
+        "the inferred profile is named on stderr"
+    );
+    assert!(
         Path::new(&repo)
             .join("profiles/alice/pandora/stations.json")
             .is_file()
@@ -589,4 +635,264 @@ fn status_with_no_profiles_says_how_to_add_one() {
         String::from_utf8_lossy(&out.stderr),
         "error: `sss pandora auth` needs --profile NAME (no profiles yet)\n"
     );
+}
+
+/// The single JSON document on `stdout`.
+fn json_document(stdout: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout);
+    assert!(text.ends_with("}\n"), "one document and a newline: {text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+#[test]
+fn init_json_reports_created_then_kept_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    for (present, absent) in [("created", "kept"), ("kept", "created")] {
+        let out = sss(tmp.path())
+            .args(["--repo", repo, "init", "--json"])
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let doc = json_document(&out.stdout);
+        assert_eq!(doc["ok"], true);
+        assert_eq!(doc["command"], "init");
+        assert_eq!(doc["repo"], repo);
+        assert_eq!(doc[present].as_array().map(Vec::len), Some(2), "{doc}");
+        assert_eq!(doc[absent], serde_json::json!([]), "{doc}");
+        assert!(out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn pandora_auth_json_reports_the_session_without_the_token() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/v1/station/getStations")
+            .header("X-AuthToken", "tok-secret-value");
+        then.status(200)
+            .json_body(serde_json::json!({"stations": [{"creatorWebname": "listener"}]}));
+    });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let out = pandora_auth(&server, repo, tmp.path())
+        .arg("--json")
+        .write_stdin("tok-secret-value\n")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "pandora auth");
+    assert_eq!(doc["profile"], "alice");
+    assert_eq!(doc["webname"], "listener");
+    assert_eq!(doc["source"], "prompt");
+    assert_eq!(doc["replaced_webname"], serde_json::Value::Null);
+    assert!(
+        doc["session_path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("alice/pandora-session.json")),
+        "{doc}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("tok-secret-value") && !stderr.contains("tok-secret-value"));
+    assert!(
+        stderr.contains("select the Network tab")
+            && stderr.contains("Verifying the token with Pandora"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn pandora_export_json_is_one_document_with_progress_on_stderr() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_session(&server, tmp.path());
+    empty_account(&server, 200);
+    let out = pandora_export(&server, &repo, tmp.path())
+        .arg("--json")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let at = |key: &str| {
+        text.find(&format!("\n  \"{key}\": "))
+            .unwrap_or_else(|| panic!("top-level {key}: {text}"))
+    };
+    let order = [
+        "ok",
+        "command",
+        "profile",
+        "run_id",
+        "run_dir",
+        "manifest",
+        "normalized",
+    ]
+    .map(at);
+    assert!(order.is_sorted(), "top-level key order: {text}");
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "pandora export");
+    assert_eq!(doc["profile"], "alice");
+    assert_eq!(doc["manifest"]["complete"], true);
+    assert_eq!(doc["manifest"]["requests"], 5);
+    assert_eq!(doc["manifest"]["steps"]["bookmarks"]["status"], "ok");
+    assert_eq!(doc["normalized"]["run_id"], doc["run_id"]);
+    assert_eq!(doc["normalized"]["stations"], 0);
+    assert_eq!(doc["normalized"]["tracks"], 0);
+    assert!(
+        Path::new(doc["run_dir"].as_str().expect("run_dir"))
+            .join("manifest.json")
+            .is_file(),
+        "{doc}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bookmarks        ok      0") && stderr.contains("run "),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("tok-secret-value"));
+}
+
+#[test]
+fn pandora_export_json_with_a_failed_step_is_kind_incomplete() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_session(&server, tmp.path());
+    empty_account(&server, 404);
+    let out = pandora_export(&server, &repo, tmp.path())
+        .arg("--json")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], false);
+    assert_eq!(doc["command"], "pandora export");
+    assert_eq!(doc["kind"], "incomplete");
+    assert_eq!(
+        doc["details"]["failed_steps"],
+        serde_json::json!(["playlists", "playlist_tracks"])
+    );
+    assert_eq!(doc["details"]["manifest"]["complete"], false);
+    assert_eq!(
+        doc["details"]["run_id"],
+        doc["details"]["manifest"]["run_id"]
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let error = doc["error"].as_str().expect("error text");
+    assert!(
+        stderr.ends_with(&format!("error: {error}\n")),
+        "the same text on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pandora_export_json_with_a_rejected_session_is_kind_auth() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_session(&server, tmp.path());
+    server.mock(|when, then| {
+        when.method(POST).path("/api/v1/station/getStations");
+        then.status(401)
+            .json_body(serde_json::json!({"errorCode": 1001}));
+    });
+    let out = pandora_export(&server, &repo, tmp.path())
+        .arg("--json")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], false);
+    assert_eq!(doc["kind"], "auth");
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("re-run `sss pandora auth`")),
+        "{doc}"
+    );
+    let run_id = doc["details"]["run_id"].as_str().expect("details.run_id");
+    let run_dir = Path::new(doc["details"]["run_dir"].as_str().expect("details.run_dir"));
+    assert!(run_dir.ends_with(run_id), "{doc}");
+    assert!(run_dir.join("manifest.json").is_file());
+    assert!(doc["details"].get("manifest").is_none(), "{doc}");
+}
+
+#[test]
+fn status_json_parses() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_session(&server, tmp.path());
+    let out = sss(tmp.path())
+        .args(["--repo", &repo, "--json", "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "status");
+    let profile = &doc["profiles"][0];
+    assert_eq!(profile["name"], "alice");
+    assert_eq!(profile["pandora_session"]["source"], "prompt");
+    assert_eq!(profile["export"]["latest_run"], serde_json::Value::Null);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("tok-secret-value"));
+}
+
+#[test]
+fn usage_error_under_json_leaves_stdout_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = sss(tmp.path())
+        .args(["--bogus", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: "));
+}
+
+#[test]
+fn json_without_a_state_root_is_kind_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = sss(tmp.path())
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .args([
+            "status",
+            "--json",
+            "--repo",
+            tmp.path().to_str().expect("utf-8 path"),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], false);
+    assert_eq!(doc["command"], "status");
+    assert_eq!(doc["kind"], "config");
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("$XDG_STATE_HOME")),
+        "{doc}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: "));
 }

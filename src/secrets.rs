@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::error::Kind;
+use crate::fail;
 use crate::repo::{self, APP_DIR};
 
 /// File name of the stored Pandora session inside a profile's state dir.
@@ -31,8 +33,10 @@ pub struct StateRoot {
 impl StateRoot {
     /// The state root under `$XDG_STATE_HOME` (else `$HOME/.local/state`).
     pub fn locate() -> Result<Self> {
-        let base = repo::xdg_dir("XDG_STATE_HOME", ".local/state", |v| std::env::var_os(v))
-            .context("cannot determine $XDG_STATE_HOME or $HOME")?;
+        let Some(base) = repo::xdg_dir("XDG_STATE_HOME", ".local/state", |v| std::env::var_os(v))
+        else {
+            fail!(Kind::Config, "cannot determine $XDG_STATE_HOME or $HOME");
+        };
         Ok(Self::at(base.join(APP_DIR)))
     }
 

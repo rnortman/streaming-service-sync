@@ -22,12 +22,19 @@ Notable changes to streaming-service-sync. Format follows
   checked against Pandora before it is kept and is stored outside the data
   repository, readable only by you. No Pandora password is ever asked for.
   If Pandora is down or rate-limiting, the command says so and asks you to
-  try again later rather than blaming the token. A token belonging to a
-  different Pandora listener than the one already signed in under that
-  profile is refused, so one family member's session cannot silently
-  overwrite another's. The prompt explains where in the browser to find the
-  token, and a token that pastes as two lines is joined back together (end
-  the paste with an empty line).
+  try again later rather than blaming the token. The prompt explains where
+  in the browser to find the token, and a token that pastes as two lines is
+  joined back together (end the paste with an empty line). The token can
+  also be piped in on stdin or read with `--from-file`.
+- **`--json` on every command.** With `--json`, a command prints exactly
+  one JSON document on stdout — its result, or on failure an error object
+  whose `kind` (`auth`, `unavailable`, `incomplete`, `input`, `config`,
+  `not_implemented`, `other`) tells a script or an LLM what to do next.
+  Progress and prompts go to stderr, so every command, signing in
+  included, can be driven by another program with the token piped on
+  stdin. `docs/json-output.md` describes every document.
+- When `--profile` is left out and the only profile is used, `sss` says
+  which one on stderr.
 - `sss init` creates the local data repository — the private directory where
   everything exported, matched and synced will be kept — with a commented
   `config.toml` and a README describing its layout. It defaults to
@@ -52,6 +59,13 @@ Notable changes to streaming-service-sync. Format follows
   the Rust checks and a secret scan on every push.
 - Git hooks that block commits and pushes containing secrets or personal
   data.
+
+### Changed
+
+- `sss pandora auth` with a token for a different Pandora listener than
+  the one already signed in under that profile now replaces the stored
+  session and names the previous listener in a warning, instead of
+  refusing the token.
 
 ### Removed
 

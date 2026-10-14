@@ -3,11 +3,15 @@
 //! directory with a freshly generated CSRF value.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::error::Kind;
+use crate::fail;
+use crate::input::{join_pasted, pasted_text, read_pasted};
 use crate::pandora::client::{Client, Reply, endpoint};
 use crate::repo;
 use crate::secrets::{self, PandoraSession, StateDir, TokenSource};
@@ -24,7 +28,8 @@ X-AuthToken: ";
 /// Reads the token: every line of `from_file` when given, else the lines
 /// of `input` up to an empty line or EOF, after writing [`PROMPT`] to
 /// `prompt`. Each line is trimmed and the non-empty ones are joined with no
-/// separator, so a value the browser copied across two lines is whole.
+/// separator ([`join_pasted`]), so a value the browser copied across
+/// two lines is whole.
 pub fn read_token(
     from_file: Option<&Path>,
     input: &mut dyn BufRead,
@@ -32,46 +37,68 @@ pub fn read_token(
 ) -> Result<(String, TokenSource)> {
     // TODO(browser-cookie-extraction): a third source, the session of a
     // local Chromium or Chrome profile.
-    let (lines, source) = match from_file {
+    let (token, source) = match from_file {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            (
-                text.lines().map(str::to_owned).collect::<Vec<_>>(),
-                TokenSource::File,
-            )
+            let text = pasted_text(std::fs::read_to_string(path), || {
+                format!("reading {}", path.display())
+            })?;
+            (join_pasted(text.lines()), TokenSource::File)
         }
         None => {
-            write!(prompt, "{PROMPT}")
-                .and_then(|()| prompt.flush())
-                .context("writing the prompt")?;
-            (read_until_empty_line(input)?, TokenSource::Prompt)
+            // The prompt is for people: a failed write of it does not stop
+            // the read.
+            let _ = write!(prompt, "{PROMPT}").and_then(|()| prompt.flush());
+            (read_pasted(input)?, TokenSource::Prompt)
         }
     };
-    let token: String = lines
-        .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
     if token.is_empty() {
-        bail!("no token given");
+        fail!(Kind::Input, "no token given");
     }
     if !token.bytes().all(|b| b.is_ascii_graphic()) {
-        bail!("the token contains spaces or non-ASCII characters; paste the header value only");
+        fail!(
+            Kind::Input,
+            "the token contains spaces or non-ASCII characters; paste the header value only"
+        );
     }
     Ok((token, source))
 }
 
-/// The lines of `input` before the first line that is empty after trimming,
-/// or before EOF.
-fn read_until_empty_line(input: &mut dyn BufRead) -> Result<Vec<String>> {
-    let mut lines = Vec::new();
-    loop {
-        let mut line = String::new();
-        if input.read_line(&mut line).context("reading the token")? == 0 || line.trim().is_empty() {
-            return Ok(lines);
-        }
-        lines.push(line);
+/// What `sss pandora auth` reports: the stored session, never its token or
+/// CSRF value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthReport {
+    pub profile: String,
+    pub webname: Option<String>,
+    pub source: TokenSource,
+    pub stored_at: String,
+    pub session_path: PathBuf,
+    /// The webname of the session this one replaced, when it differs.
+    pub replaced_webname: Option<String>,
+}
+
+impl AuthReport {
+    /// The warning naming the replaced listener, when there is one.
+    pub fn replaced_warning(&self) -> Option<String> {
+        let held = self.replaced_webname.as_deref()?;
+        Some(format!(
+            "warning: profile {} held a session for Pandora webname {held}; it now holds \
+             webname {}",
+            self.profile,
+            self.webname.as_deref().unwrap_or_default()
+        ))
+    }
+
+    pub fn write_text(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let who = self
+            .webname
+            .as_deref()
+            .map(|w| format!(" (webname {w})"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "Pandora session verified{who}; stored in {}",
+            self.session_path.display()
+        )
     }
 }
 
@@ -86,16 +113,16 @@ fn webname(stations: &Value) -> Option<String> {
 }
 
 /// Verifies `token` with one `getStations` request through the client
-/// `connect` builds, then stores the session in `state`. Nothing is stored
-/// when Pandora does not accept it, or when the stored session names a
-/// different webname than the one the token reports.
+/// `connect` builds, then stores the session of `profile` in `state`.
+/// Nothing is stored when Pandora does not accept the token. A stored
+/// session for a different webname is replaced, and the report names it.
 pub fn verify_and_store(
+    profile: &str,
     state: &StateDir,
     token: String,
     source: TokenSource,
     connect: impl FnOnce(&PandoraSession) -> Client,
-    out: &mut dyn Write,
-) -> Result<PandoraSession> {
+) -> Result<AuthReport> {
     let mut session = PandoraSession {
         auth_token: token,
         csrf_token: secrets::new_csrf_token()?,
@@ -111,39 +138,31 @@ pub fn verify_and_store(
         .context("verifying the token")?;
     let stations = match reply {
         Reply::Ok(body) => body,
-        Reply::Failed(why) => bail!(
+        Reply::Failed(why) => fail!(
+            Kind::Auth,
             "Pandora did not accept the token ({why}); copy the X-AuthToken header of a \
              request to pandora.com/api/, not the `at` cookie"
         ),
-        Reply::Unavailable(why) => {
-            bail!("Pandora is not answering ({why}); try `sss pandora auth` again later")
-        }
+        Reply::Unavailable(why) => fail!(
+            Kind::Unavailable,
+            "Pandora is not answering ({why}); try `sss pandora auth` again later"
+        ),
     };
     session.webname = webname(&stations);
-    if let (Some(new), Some(held)) = (session.webname.as_deref(), state.held_pandora_webname()?)
-        && new != held
-    {
-        bail!(
-            "this token is for Pandora webname {new}, but the profile's session at {} is for \
-             webname {held}; pass --profile NAME to sign in another profile, or delete that \
-             file to replace the listener",
-            state.pandora_session_path().display()
-        );
-    }
+    let replaced_webname = match (session.webname.as_deref(), state.held_pandora_webname()?) {
+        (Some(new), Some(held)) if new != held => Some(held),
+        _ => None,
+    };
     session.stored_at = repo::now_rfc3339()?;
     state.save_pandora_session(&session)?;
-    let who = session
-        .webname
-        .as_deref()
-        .map(|w| format!(" (webname {w})"))
-        .unwrap_or_default();
-    writeln!(
-        out,
-        "Pandora session verified{who}; stored in {}",
-        state.pandora_session_path().display()
-    )
-    .context("writing output")?;
-    Ok(session)
+    Ok(AuthReport {
+        profile: profile.to_owned(),
+        webname: session.webname,
+        source: session.source,
+        stored_at: session.stored_at,
+        session_path: state.pandora_session_path(),
+        replaced_webname,
+    })
 }
 
 #[cfg(test)]
@@ -208,6 +227,14 @@ mod tests {
     #[test]
     fn empty_or_malformed_tokens_are_refused() {
         assert_eq!(read(None, "\n").unwrap_err().to_string(), "no token given");
+        assert_eq!(
+            crate::error::kind(&read(None, "").unwrap_err()),
+            Kind::Input
+        );
+        assert_eq!(
+            crate::error::kind(&read(None, "two words").unwrap_err()),
+            Kind::Input
+        );
         assert_eq!(read(None, "").unwrap_err().to_string(), "no token given");
         for bad in ["two words\n", "tok\nen\u{e9}\n"] {
             assert!(
@@ -217,7 +244,36 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing");
-        assert!(read(Some(&missing), "").is_err());
+        assert_eq!(
+            crate::error::kind(&read(Some(&missing), "").unwrap_err()),
+            Kind::Other
+        );
+
+        // Bytes that are not UTF-8, pasted or in the file.
+        let err = read_token(None, &mut &b"tok\xe9n\n"[..], &mut Vec::new()).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Input);
+        let latin1 = tmp.path().join("latin1");
+        std::fs::write(&latin1, b"tok\xe9n\n").unwrap();
+        let err = read(Some(&latin1), "").unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Input);
+        assert!(
+            format!("{err:#}").starts_with(&format!(
+                "reading {}: not valid UTF-8 text",
+                latin1.display()
+            )),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_be_written_does_not_stop_the_read() {
+        let got = read_token(
+            None,
+            &mut "tok-secret-value\n".as_bytes(),
+            &mut crate::pandora::test_support::ClosedPipe,
+        )
+        .unwrap();
+        assert_eq!(got.0, "tok-secret-value");
     }
 
     #[test]
@@ -230,16 +286,20 @@ mod tests {
         assert_eq!(webname(&json!({})), None);
     }
 
-    fn run(server: &MockServer, state: &StateDir) -> (Result<PandoraSession>, String) {
-        let mut out = Vec::new();
-        let result = verify_and_store(
+    fn run(server: &MockServer, state: &StateDir) -> Result<AuthReport> {
+        verify_and_store(
+            "alice",
             state,
             "tok-secret-value".into(),
             TokenSource::Prompt,
             |s| Client::new(&server.base_url(), s, FAST),
-            &mut out,
-        );
-        (result, String::from_utf8(out).unwrap())
+        )
+    }
+
+    fn text(report: &AuthReport) -> String {
+        let mut out = Vec::new();
+        report.write_text(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
@@ -257,17 +317,37 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
-        let (result, out) = run(&server, &state);
-        let session = result.unwrap();
+        let report = run(&server, &state).unwrap();
         mock.assert_calls(1);
-        assert_eq!(state.load_pandora_session().unwrap(), Some(session.clone()));
+        let session = state.load_pandora_session().unwrap().unwrap();
         assert_eq!(session.auth_token, "tok-secret-value");
         assert_eq!(session.csrf_token.len(), 16);
         assert_eq!(session.webname.as_deref(), Some("listener"));
         assert_eq!(session.source, TokenSource::Prompt);
         assert!(!session.stored_at.is_empty());
-        assert!(out.contains("webname listener"), "{out}");
-        assert!(!out.contains("tok-secret-value"), "{out}");
+        assert_eq!(
+            report,
+            AuthReport {
+                profile: "alice".into(),
+                webname: Some("listener".into()),
+                source: TokenSource::Prompt,
+                stored_at: session.stored_at.clone(),
+                session_path: state.pandora_session_path(),
+                replaced_webname: None,
+            }
+        );
+        let out = text(&report);
+        assert_eq!(
+            out,
+            format!(
+                "Pandora session verified (webname listener); stored in {}\n",
+                state.pandora_session_path().display()
+            )
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        for secret in ["tok-secret-value", &session.csrf_token] {
+            assert!(!json.contains(secret), "{json}");
+        }
     }
 
     /// A server whose station list names `webname`.
@@ -280,14 +360,19 @@ mod tests {
         server
     }
 
-    fn stored(state: &StateDir, webname: Option<&str>) -> PandoraSession {
+    fn stored(state: &StateDir, webname: Option<&str>) {
         let session = PandoraSession {
             auth_token: "old-token".into(),
             webname: webname.map(str::to_owned),
             ..crate::pandora::test_support::session()
         };
         state.save_pandora_session(&session).unwrap();
-        session
+    }
+
+    /// The stored session's webname and token.
+    fn held(state: &StateDir) -> (Option<String>, String) {
+        let s = state.load_pandora_session().unwrap().unwrap();
+        (s.webname, s.auth_token)
     }
 
     #[test]
@@ -295,24 +380,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
         stored(&state, Some("listener"));
-        let session = run(&server_for("listener"), &state).0.unwrap();
-        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+        let report = run(&server_for("listener"), &state).unwrap();
+        assert_eq!(report.replaced_webname, None);
+        assert_eq!(report.replaced_warning(), None);
+        assert_eq!(
+            held(&state),
+            (Some("listener".into()), "tok-secret-value".into())
+        );
     }
 
     #[test]
-    fn a_token_for_another_webname_is_not_stored() {
+    fn a_token_for_another_webname_replaces_the_session_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
-        let held = stored(&state, Some("listener"));
-        let err = run(&server_for("other"), &state).0.unwrap_err().to_string();
-        assert!(
-            err.contains("webname other")
-                && err.contains("webname listener")
-                && err.contains("--profile NAME")
-                && err.contains(&state.pandora_session_path().display().to_string()),
-            "{err}"
+        stored(&state, Some("listener"));
+        let report = run(&server_for("other"), &state).unwrap();
+        assert_eq!(report.replaced_webname.as_deref(), Some("listener"));
+        assert_eq!(
+            report.replaced_warning().as_deref(),
+            Some(
+                "warning: profile alice held a session for Pandora webname listener; it now \
+                 holds webname other"
+            )
         );
-        assert_eq!(state.load_pandora_session().unwrap(), Some(held));
+        assert_eq!(
+            held(&state),
+            (Some("other".into()), "tok-secret-value".into())
+        );
     }
 
     #[test]
@@ -320,8 +414,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
         stored(&state, None);
-        let session = run(&server_for("other"), &state).0.unwrap();
-        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+        let report = run(&server_for("other"), &state).unwrap();
+        assert_eq!(report.replaced_webname, None);
+        assert_eq!(
+            held(&state),
+            (Some("other".into()), "tok-secret-value".into())
+        );
     }
 
     #[test]
@@ -330,22 +428,26 @@ mod tests {
         let state = StateDir::under(tmp.path(), "alice").unwrap();
         stored(&state, None);
         fs::write(state.pandora_session_path(), "{not json").unwrap();
-        let session = run(&server_for("other"), &state).0.unwrap();
-        assert_eq!(state.load_pandora_session().unwrap(), Some(session));
+        let report = run(&server_for("other"), &state).unwrap();
+        assert_eq!(report.replaced_webname, None);
+        assert_eq!(
+            held(&state),
+            (Some("other".into()), "tok-secret-value".into())
+        );
     }
 
     #[test]
-    fn a_session_of_another_shape_still_guards_its_webname() {
+    fn a_session_of_another_shape_still_names_its_webname() {
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
         stored(&state, None);
         let other_shape = r#"{"webname": "listener", "extra": 1}"#;
         fs::write(state.pandora_session_path(), other_shape).unwrap();
-        let err = run(&server_for("other"), &state).0.unwrap_err().to_string();
-        assert!(err.contains("webname listener"), "{err}");
+        let report = run(&server_for("other"), &state).unwrap();
+        assert_eq!(report.replaced_webname.as_deref(), Some("listener"));
         assert_eq!(
-            fs::read_to_string(state.pandora_session_path()).unwrap(),
-            other_shape
+            held(&state),
+            (Some("other".into()), "tok-secret-value".into())
         );
     }
 
@@ -354,7 +456,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
         fs::create_dir_all(state.pandora_session_path()).unwrap();
-        let err = format!("{:#}", run(&server_for("other"), &state).0.unwrap_err());
+        let err = format!("{:#}", run(&server_for("other"), &state).unwrap_err());
         assert!(
             err.contains(&format!(
                 "reading {}",
@@ -372,10 +474,12 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
-        let err = run(&server, &state).0.unwrap_err().to_string();
+        let err = run(&server, &state).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Auth);
+        let text = err.to_string();
         assert!(
-            err.contains("HTTP 502") && err.contains("`at` cookie"),
-            "{err}"
+            text.contains("HTTP 502") && text.contains("`at` cookie"),
+            "{text}"
         );
         assert_eq!(state.load_pandora_session().unwrap(), None);
     }
@@ -388,14 +492,16 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
-        let err = run(&server, &state).0.unwrap_err().to_string();
+        let err = run(&server, &state).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Unavailable);
+        let text = err.to_string();
         assert!(
-            err.contains("not answering")
-                && err.contains("HTTP 503")
-                && err.contains("again later"),
-            "{err}"
+            text.contains("not answering")
+                && text.contains("HTTP 503")
+                && text.contains("again later"),
+            "{text}"
         );
-        assert!(!err.contains("`at` cookie"), "{err}");
+        assert!(!text.contains("`at` cookie"), "{text}");
         assert_eq!(state.load_pandora_session().unwrap(), None);
     }
 
@@ -407,7 +513,9 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let state = StateDir::under(tmp.path(), "alice").unwrap();
-        let err = format!("{:#}", run(&server, &state).0.unwrap_err());
+        let err = run(&server, &state).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Auth);
+        let err = format!("{err:#}");
         assert!(err.contains("re-run `sss pandora auth`"), "{err}");
         assert_eq!(state.load_pandora_session().unwrap(), None);
     }

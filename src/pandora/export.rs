@@ -4,6 +4,7 @@
 //! run ends, and the run is `complete` only when every step is `ok`.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::pandora::client::{Client, Reply, endpoint};
+use crate::pandora::model::Summary;
 use crate::repo::{self, ProfilePaths};
 
 /// The ledger file of a raw run.
@@ -328,7 +330,7 @@ impl Run<'_> {
     }
 
     /// Closes `step` and prints its ledger line.
-    fn finish(&mut self, step: Step, out: &mut dyn Write) -> Result<()> {
+    fn finish(&mut self, step: Step, out: &mut dyn Write) {
         self.finished[step as usize] = true;
         let extra = self.more_failures[step as usize];
         let result = self.steps.get_mut(step);
@@ -342,7 +344,7 @@ impl Run<'_> {
 
     fn capture(&mut self, out: &mut dyn Write) -> Result<()> {
         let stations = self.stations()?;
-        self.finish(Step::Stations, out)?;
+        self.finish(Step::Stations, out);
 
         for station in &stations {
             let body = json!({"stationId": station.id, "isCurrentStation": false});
@@ -354,26 +356,26 @@ impl Run<'_> {
             }
         }
         self.depends_on(Step::StationDetails, Step::Stations);
-        self.finish(Step::StationDetails, out)?;
+        self.finish(Step::StationDetails, out);
 
         for (step, positive) in [(Step::FeedbackUp, true), (Step::FeedbackDown, false)] {
             for station in stations.iter().filter(|s| !s.shuffle) {
                 self.feedback(step, &station.id, positive)?;
             }
             self.depends_on(step, Step::Stations);
-            self.finish(step, out)?;
+            self.finish(step, out);
         }
 
         let playlists = self.playlists()?;
-        self.finish(Step::Playlists, out)?;
+        self.finish(Step::Playlists, out);
         for id in &playlists {
             self.playlist_tracks(id)?;
         }
         self.depends_on(Step::PlaylistTracks, Step::Playlists);
-        self.finish(Step::PlaylistTracks, out)?;
+        self.finish(Step::PlaylistTracks, out);
 
         self.collection()?;
-        self.finish(Step::Collection, out)?;
+        self.finish(Step::Collection, out);
 
         for kind in ["track", "album"] {
             let body = json!({"type": kind});
@@ -385,7 +387,8 @@ impl Run<'_> {
                 self.count(Step::Bookmarks, n);
             }
         }
-        self.finish(Step::Bookmarks, out)
+        self.finish(Step::Bookmarks, out);
+        Ok(())
     }
 
     /// `v1/station/getStations`, paged by `startIndex`.
@@ -624,21 +627,126 @@ pub fn step_line(step: Step, result: &StepResult) -> String {
     line.trim_end().to_owned()
 }
 
-fn write_step_line(out: &mut dyn Write, step: Step, result: &StepResult) -> Result<()> {
-    writeln!(out, "{}", step_line(step, result))
-        .and_then(|()| out.flush())
-        .context("writing output")
+/// Progress is for people: a failed write of it does not stop the run.
+fn write_step_line(out: &mut dyn Write, step: Step, result: &StepResult) {
+    let _ = writeln!(out, "{}", step_line(step, result)).and_then(|()| out.flush());
+}
+
+/// A run that stopped before its end: the session was rejected, Pandora
+/// stopped answering, or a write failed. Its manifest is written; `source`
+/// is why it stopped. It reads as `source` does: its text is that of
+/// `source`'s outermost error and its [`std::error::Error::source`] is the
+/// next one, so a chain holding it prints exactly as `source` would.
+#[derive(Debug)]
+pub struct ExportStopped {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub source: anyhow::Error,
+}
+
+impl fmt::Display for ExportStopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for ExportStopped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// A run that ended with failed steps; its raw responses are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportIncomplete(pub Captured);
+
+impl ExportIncomplete {
+    /// The names of the failed steps, in run order.
+    pub fn failed_steps(&self) -> Vec<&'static str> {
+        self.0
+            .manifest
+            .steps
+            .failed()
+            .iter()
+            .map(|s| s.name())
+            .collect()
+    }
+}
+
+impl fmt::Display for ExportIncomplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "run {} is incomplete: failed steps {}; its raw responses are kept",
+            self.0.manifest.run_id,
+            self.failed_steps().join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ExportIncomplete {}
+
+/// What `sss pandora export` reports for a complete run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportReport {
+    pub profile: String,
+    pub run_id: String,
+    #[serde(flatten)]
+    pub captured: Captured,
+    pub normalized: Summary,
+}
+
+impl ExportReport {
+    pub fn write_text(&self, out: &mut dyn Write) -> io::Result<()> {
+        writeln!(out, "run {} complete", self.run_id)?;
+        self.normalized.write_text(out)
+    }
+}
+
+/// A completed capture: its directory and manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Captured {
+    pub run_dir: PathBuf,
+    pub manifest: Manifest,
 }
 
 /// Runs one capture into a new raw run of `paths` and writes its manifest,
-/// printing each step's ledger line to `out` as the step ends. Returns the
-/// manifest. An error (the session rejected, Pandora unreachable, a write
-/// failing) stops the run; the manifest is still written, with every step
-/// that had not ended marked failed, and the error is returned.
-pub fn export(paths: &ProfilePaths, client: &mut Client, out: &mut dyn Write) -> Result<Manifest> {
+/// writing the run directory and each step's ledger line to `progress` as
+/// the step ends; a failed write to `progress` is ignored. An error before
+/// the run directory exists is returned as it is. Any later error (the
+/// session rejected, Pandora unreachable, a write failing) stops the run:
+/// the manifest is still written, with every step that had not ended marked
+/// failed, and the error is returned as an [`ExportStopped`] naming the run.
+pub fn export(
+    paths: &ProfilePaths,
+    client: &mut Client,
+    progress: &mut dyn Write,
+) -> Result<Captured> {
     let started = repo::now_rfc3339()?;
     let (run_id, dir) = create_run_dir(paths, &run_id_now())?;
-    writeln!(out, "run {run_id}: {}", dir.display()).context("writing output")?;
+    match capture_run(run_id.clone(), dir.clone(), started, client, progress) {
+        Ok(manifest) => Ok(Captured {
+            run_dir: dir,
+            manifest,
+        }),
+        Err(source) => Err(anyhow::Error::new(ExportStopped {
+            run_id,
+            run_dir: dir,
+            source,
+        })),
+    }
+}
+
+/// The capture into the existing run directory `dir`.
+fn capture_run(
+    run_id: String,
+    dir: PathBuf,
+    started: String,
+    client: &mut Client,
+    progress: &mut dyn Write,
+) -> Result<Manifest> {
+    // Progress is for people: a failed write of it does not stop the run.
+    let _ = writeln!(progress, "run {run_id}: {}", dir.display());
     let requests_before = client.requests();
     let mut run = Run {
         client,
@@ -648,7 +756,7 @@ pub fn export(paths: &ProfilePaths, client: &mut Client, out: &mut dyn Write) ->
         more_failures: [0; Step::ALL.len()],
         finished: [false; Step::ALL.len()],
     };
-    let outcome = run.capture(out);
+    let outcome = run.capture(progress);
     if let Err(e) = &outcome {
         for step in Step::ALL {
             if !run.finished[step as usize] {
@@ -788,7 +896,7 @@ mod tests {
         let mut client = Client::new(&server.base_url(), &session(), FAST);
         let mut out = Vec::new();
         let result = export(&fx.paths, &mut client, &mut out);
-        (result, String::from_utf8(out).unwrap())
+        (result.map(|c| c.manifest), String::from_utf8(out).unwrap())
     }
 
     /// The single run directory and its files, sorted.
@@ -1024,6 +1132,23 @@ mod tests {
     }
 
     #[test]
+    fn progress_that_cannot_be_written_does_not_stop_the_run() {
+        let server = MockServer::start();
+        no_stations(&server);
+        empty_premium(&server);
+        let fx = fixture();
+        let mut client = Client::new(&server.base_url(), &session(), FAST);
+        let captured = export(
+            &fx.paths,
+            &mut client,
+            &mut crate::pandora::test_support::ClosedPipe,
+        )
+        .unwrap();
+        assert!(captured.manifest.complete, "{:?}", captured.manifest);
+        assert_eq!(manifest_on_disk(&fx), captured.manifest);
+    }
+
+    #[test]
     fn a_rejected_premium_request_fails_its_step_and_the_run_goes_on() {
         let server = MockServer::start();
         no_stations(&server);
@@ -1140,7 +1265,16 @@ mod tests {
         let fx = fixture();
         let (result, _) = run(&server, &fx);
         let err = result.unwrap_err();
-        assert!(err.downcast_ref::<SessionRejected>().is_some(), "{err:#}");
+        let stopped = err.downcast_ref::<ExportStopped>().expect("ExportStopped");
+        assert!(
+            stopped.source.downcast_ref::<SessionRejected>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(crate::error::kind(&err), crate::error::Kind::Auth);
+        assert!(
+            format!("{err:#}").starts_with("Pandora rejected the session"),
+            "{err:#}"
+        );
         later.assert_calls(0);
         let manifest = manifest_on_disk(&fx);
         assert!(!manifest.complete);
@@ -1279,5 +1413,35 @@ mod tests {
     fn a_run_without_a_manifest_reads_as_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(read_manifest(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreachable_pandora_stops_the_run_naming_it() {
+        let fx = fixture();
+        let mut client = Client::new("http://127.0.0.1:1", &session(), FAST);
+        let err = export(&fx.paths, &mut client, &mut Vec::new()).unwrap_err();
+        assert_eq!(crate::error::kind(&err), crate::error::Kind::Unavailable);
+        let stopped = err.downcast_ref::<ExportStopped>().expect("ExportStopped");
+        let (dir, _) = run_files(&fx);
+        assert_eq!(stopped.run_dir, dir);
+        assert_eq!(dir.file_name().unwrap().to_str(), Some(&*stopped.run_id));
+        let manifest = read_manifest(&stopped.run_dir).unwrap().unwrap();
+        assert!(!manifest.complete);
+        assert_eq!(manifest.steps.failed(), Step::ALL);
+        assert!(
+            format!("{err:#}").contains("no response after 5 tries"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_failure_before_the_run_directory_exists_is_not_a_stopped_run() {
+        let fx = fixture();
+        fs::create_dir_all(fx.paths.pandora_dir()).unwrap();
+        fs::write(fx.paths.raw_dir(), "a file where raw/ belongs").unwrap();
+        let mut client = Client::new("http://127.0.0.1:1", &session(), FAST);
+        let err = export(&fx.paths, &mut client, &mut Vec::new()).unwrap_err();
+        assert!(err.downcast_ref::<ExportStopped>().is_none(), "{err:#}");
+        assert_eq!(crate::error::kind(&err), crate::error::Kind::Other);
     }
 }

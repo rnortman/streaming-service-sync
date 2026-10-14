@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::error::{Kind, WithKind};
+use crate::fail;
 use crate::repo::validate_profile_name;
 
 /// The text `sss init` writes as `config.toml`. Every value in it equals
@@ -119,17 +121,22 @@ impl Config {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound && path.is_symlink() => {
-                bail!("{} is a symlink to a missing file", path.display())
+                fail!(
+                    Kind::Config,
+                    "{} is a symlink to a missing file",
+                    path.display()
+                )
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                bail!(
+                fail!(
+                    Kind::Config,
                     "{} does not exist; run `sss init` to create the data repository",
                     path.display()
                 )
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+        Self::parse(&text).with_kind(Kind::Config, || format!("in {}", path.display()))
     }
 
     fn validate(&self) -> Result<()> {
@@ -268,10 +275,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[matcher]\nbatch_size = 0\n").unwrap();
-        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        let err = Config::load(&path).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Config);
+        let text = format!("{err:#}");
         assert!(
-            err.contains("config.toml") && err.contains("batch_size"),
-            "{err}"
+            text.starts_with(&format!("in {}: ", path.display())) && text.contains("batch_size"),
+            "{text}"
         );
     }
 }

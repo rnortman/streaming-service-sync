@@ -18,6 +18,19 @@ pub(crate) mod test_support {
         first_backoff: Duration::from_millis(1),
     };
 
+    /// A writer whose reader has gone: every write fails with `BrokenPipe`.
+    pub struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
     /// A session with fake credentials.
     pub fn session() -> PandoraSession {
         PandoraSession {

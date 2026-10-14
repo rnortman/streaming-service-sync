@@ -2,87 +2,179 @@
 //! run's step ledger and the match counts by status.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::pandora::export::{self, Step};
+use crate::pandora::export::{self, Manifest, Step};
 use crate::profiles;
 use crate::repo::{self, ProfilePaths, Repo};
-use crate::secrets::{StateDir, StateRoot};
+use crate::secrets::{StateDir, StateRoot, TokenSource};
 
-/// Prints the status of `profile`, or of every known profile when none is
-/// named.
+/// What `sss status` reports: one entry per profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatusReport {
+    pub profiles: Vec<ProfileStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProfileStatus {
+    pub name: String,
+    pub pandora_session: Option<SessionStatus>,
+    pub export: ExportStatus,
+    pub matches: MatchCounts,
+}
+
+/// A stored Pandora session, without its token values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionStatus {
+    pub stored_at: String,
+    pub webname: Option<String>,
+    pub source: TokenSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportStatus {
+    /// The newest run.
+    pub latest_run: Option<RunStatus>,
+    /// The newest run whose manifest says `complete`.
+    pub latest_complete_run: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunStatus {
+    pub run_id: String,
+    /// `None` for a run that did not finish.
+    pub manifest: Option<Manifest>,
+}
+
+/// Per entity, the count of each match status over the latest entry per
+/// `pandora_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MatchCounts {
+    pub tracks: BTreeMap<String, usize>,
+    pub artists: BTreeMap<String, usize>,
+    pub albums: BTreeMap<String, usize>,
+}
+
+/// The status of `profile`, or of every known profile when none is named.
 pub fn status(
     repo: &Repo,
     state_root: &StateRoot,
     config: &Config,
     profile: Option<&str>,
-    out: &mut dyn Write,
-) -> Result<()> {
+) -> Result<StatusReport> {
     let names = match profile {
         Some(name) => vec![name.to_owned()],
         None => profiles::known(repo, state_root, config)?,
     };
-    if names.is_empty() {
-        writeln!(
-            out,
-            "no profiles yet; run `sss pandora auth --profile NAME` first"
-        )
-        .context("writing output")?;
-    }
-    for name in names {
-        profile_status(
-            &name,
-            &state_root.profile(&name)?,
-            &repo.profile(&name)?,
-            out,
-        )?;
-    }
-    Ok(())
+    let profiles = names
+        .into_iter()
+        .map(|name| {
+            let state = state_root.profile(&name)?;
+            let paths = repo.profile(&name)?;
+            profile_status(name, &state, &paths)
+        })
+        .collect::<Result<_>>()?;
+    Ok(StatusReport { profiles })
 }
 
-/// The `pandora session:` line of a profile's block.
-fn session_line(name: &str, state: &StateDir) -> Result<String> {
-    let Some(session) = state.load_pandora_session()? else {
-        return Ok(format!(
-            "  pandora session: none (run `sss pandora auth --profile {name}`)"
-        ));
+fn profile_status(name: String, state: &StateDir, paths: &ProfilePaths) -> Result<ProfileStatus> {
+    let pandora_session = state.load_pandora_session()?.map(|s| SessionStatus {
+        stored_at: s.stored_at,
+        webname: s.webname,
+        source: s.source,
+    });
+    let latest_run = match export::run_ids(paths)?.pop() {
+        None => None,
+        Some(run_id) => Some(RunStatus {
+            manifest: export::read_manifest(&paths.raw_run_dir(&run_id))?,
+            run_id,
+        }),
     };
-    let webname = session
-        .webname
-        .map(|w| format!(", webname {w}"))
-        .unwrap_or_default();
-    let source = session.source.as_str();
-    Ok(format!(
-        "  pandora session: stored {}{webname}, from {source}",
-        session.stored_at
-    ))
+    let latest_complete_run = match &latest_run {
+        Some(RunStatus {
+            run_id,
+            manifest: Some(m),
+        }) if m.complete => Some(run_id.clone()),
+        _ => export::latest_complete_run(paths)?.map(|m| m.run_id),
+    };
+    Ok(ProfileStatus {
+        name,
+        pandora_session,
+        export: ExportStatus {
+            latest_run,
+            latest_complete_run,
+        },
+        matches: MatchCounts {
+            tracks: match_counts(&paths.track_matches())?,
+            artists: match_counts(&paths.artist_matches())?,
+            albums: match_counts(&paths.album_matches())?,
+        },
+    })
 }
 
-fn profile_status(
-    name: &str,
-    state: &StateDir,
-    paths: &ProfilePaths,
-    out: &mut dyn Write,
-) -> Result<()> {
-    let mut lines = vec![format!("profile {name}"), session_line(name, state)?];
-    let mut newest_complete = true;
-    match export::run_ids(paths)?.last() {
-        None => lines.push("  export: no run yet".to_owned()),
-        Some(id) => match export::read_manifest(&paths.raw_run_dir(id))? {
-            None => {
-                newest_complete = false;
-                lines.push(format!("  export run {id}: did not finish (no manifest)"));
+impl StatusReport {
+    pub fn write_text(&self, out: &mut dyn Write) -> io::Result<()> {
+        if self.profiles.is_empty() {
+            writeln!(
+                out,
+                "no profiles yet; run `sss pandora auth --profile NAME` first"
+            )?;
+        }
+        for profile in &self.profiles {
+            for line in profile.lines() {
+                writeln!(out, "{line}")?;
             }
-            Some(m) => {
+        }
+        Ok(())
+    }
+}
+
+impl ProfileStatus {
+    /// The profile's block of text lines.
+    fn lines(&self) -> Vec<String> {
+        let name = &self.name;
+        let mut lines = vec![format!("profile {name}")];
+        lines.push(match &self.pandora_session {
+            None => format!("  pandora session: none (run `sss pandora auth --profile {name}`)"),
+            Some(s) => {
+                let webname = s
+                    .webname
+                    .as_ref()
+                    .map(|w| format!(", webname {w}"))
+                    .unwrap_or_default();
+                format!(
+                    "  pandora session: stored {}{webname}, from {}",
+                    s.stored_at,
+                    s.source.as_str()
+                )
+            }
+        });
+        let mut newest_complete = true;
+        match &self.export.latest_run {
+            None => lines.push("  export: no run yet".to_owned()),
+            Some(RunStatus {
+                run_id,
+                manifest: None,
+            }) => {
+                newest_complete = false;
+                lines.push(format!(
+                    "  export run {run_id}: did not finish (no manifest)"
+                ));
+            }
+            Some(RunStatus {
+                run_id,
+                manifest: Some(m),
+            }) => {
                 newest_complete = m.complete;
                 let verdict = if m.complete { "complete" } else { "INCOMPLETE" };
                 lines.push(format!(
-                    "  export run {id}: {verdict}, {} requests, finished {}",
+                    "  export run {run_id}: {verdict}, {} requests, finished {}",
                     m.requests, m.finished
                 ));
                 for step in Step::ALL {
@@ -92,35 +184,38 @@ fn profile_status(
                     ));
                 }
             }
-        },
+        }
+        if !newest_complete && let Some(id) = &self.export.latest_complete_run {
+            lines.push(format!("  latest complete run: {id}"));
+        }
+        for (kind, counts) in [
+            ("tracks", &self.matches.tracks),
+            ("artists", &self.matches.artists),
+            ("albums", &self.matches.albums),
+        ] {
+            let counts = if counts.is_empty() {
+                "none".to_owned()
+            } else {
+                counts
+                    .iter()
+                    .map(|(s, n)| format!("{s} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            lines.push(format!("  matches {kind:<8} {counts}"));
+        }
+        lines
     }
-    if !newest_complete && let Some(m) = export::latest_complete_run(paths)? {
-        lines.push(format!("  latest complete run: {}", m.run_id));
-    }
-    for (kind, path) in [
-        ("tracks", paths.track_matches()),
-        ("artists", paths.artist_matches()),
-        ("albums", paths.album_matches()),
-    ] {
-        lines.push(format!("  matches {kind:<8} {}", match_counts(&path)?));
-    }
-    for line in lines {
-        writeln!(out, "{line}").context("writing output")?;
-    }
-    Ok(())
 }
 
-/// `none` or `<status> <n>, …` over the latest entry per `pandora_id`.
-fn match_counts(path: &Path) -> Result<String> {
+/// The count of each `status` over the latest entry per `pandora_id`.
+fn match_counts(path: &Path) -> Result<BTreeMap<String, usize>> {
     let latest = repo::read_jsonl_latest::<Value, String, _>(path, |v| {
         v.get("pandora_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned()
     })?;
-    if latest.is_empty() {
-        return Ok("none".to_owned());
-    }
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for entry in latest.values() {
         let status = entry
@@ -129,11 +224,7 @@ fn match_counts(path: &Path) -> Result<String> {
             .unwrap_or("unknown");
         *counts.entry(status.to_owned()).or_default() += 1;
     }
-    Ok(counts
-        .iter()
-        .map(|(s, n)| format!("{s} {n}"))
-        .collect::<Vec<_>>()
-        .join(", "))
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -141,7 +232,6 @@ mod tests {
     use super::*;
     use crate::pandora::export::{MANIFEST_FILE, Manifest, StepResult, StepStatus, Steps};
     use crate::pandora::test_support::session;
-    use crate::secrets::TokenSource;
 
     fn manifest(id: &str, complete: bool) -> Manifest {
         let mut steps = Steps::default();
@@ -163,10 +253,16 @@ mod tests {
         }
     }
 
-    fn run_status(repo: &Repo, state_root: &StateRoot, profile: Option<&str>) -> String {
+    fn report(repo: &Repo, state_root: &StateRoot, profile: Option<&str>) -> StatusReport {
         let config = Config::load(&repo.config_path()).unwrap();
+        status(repo, state_root, &config, profile).unwrap()
+    }
+
+    fn run_status(repo: &Repo, state_root: &StateRoot, profile: Option<&str>) -> String {
         let mut out = Vec::new();
-        status(repo, state_root, &config, profile, &mut out).unwrap();
+        report(repo, state_root, profile)
+            .write_text(&mut out)
+            .unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -225,6 +321,70 @@ mod tests {
         );
         assert!(text.contains("  matches tracks   matched 2\n"), "{text}");
         assert!(text.contains("  matches albums   none\n"), "{text}");
+    }
+
+    #[test]
+    fn the_report_carries_the_ledger_counts_and_no_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = empty(tmp.path());
+        let paths = repo.profile("alice").unwrap();
+        for (id, complete) in [("20261013T000000Z", true), ("20261014T000000Z", false)] {
+            repo::write_json(
+                &paths.raw_run_dir(id).join(MANIFEST_FILE),
+                &manifest(id, complete),
+            )
+            .unwrap();
+        }
+        repo::append_jsonl(
+            &paths.track_matches(),
+            &serde_json::json!({"pandora_id": "TR:1", "status": "matched"}),
+        )
+        .unwrap();
+        let json = serde_json::to_value(report(&repo, &state_root, None)).unwrap();
+        let profile = &json["profiles"][0];
+        assert_eq!(profile["name"], "alice");
+        assert_eq!(profile["pandora_session"], Value::Null);
+        assert_eq!(
+            profile["export"]["latest_run"]["manifest"],
+            serde_json::to_value(manifest("20261014T000000Z", false)).unwrap()
+        );
+        assert_eq!(profile["export"]["latest_complete_run"], "20261013T000000Z");
+        assert_eq!(
+            profile["matches"],
+            serde_json::json!({"tracks": {"matched": 1}, "artists": {}, "albums": {}})
+        );
+
+        state_root
+            .profile("alice")
+            .unwrap()
+            .save_pandora_session(&session())
+            .unwrap();
+        let signed_in = report(&repo, &state_root, None);
+        assert_eq!(
+            signed_in.profiles[0].pandora_session,
+            Some(SessionStatus {
+                stored_at: "2026-10-13T00:00:00Z".into(),
+                webname: Some("listener".into()),
+                source: TokenSource::Prompt,
+            })
+        );
+        let text = serde_json::to_string(&signed_in).unwrap();
+        let stored = session();
+        for secret in [&stored.auth_token, &stored.csrf_token] {
+            assert!(!text.contains(secret), "{secret}: {text}");
+        }
+
+        // A complete newest run is the latest complete one.
+        repo::write_json(
+            &paths.raw_run_dir("20261015T000000Z").join(MANIFEST_FILE),
+            &manifest("20261015T000000Z", true),
+        )
+        .unwrap();
+        let export = &report(&repo, &state_root, None).profiles[0].export;
+        assert_eq!(
+            export.latest_complete_run.as_deref(),
+            Some("20261015T000000Z")
+        );
     }
 
     #[test]
@@ -297,7 +457,7 @@ mod tests {
         std::fs::create_dir_all(state.dir()).unwrap();
         std::fs::write(state.pandora_session_path(), "not json").unwrap();
         let config = Config::load(&repo.config_path()).unwrap();
-        let err = status(&repo, &state_root, &config, None, &mut Vec::new()).unwrap_err();
+        let err = status(&repo, &state_root, &config, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("pandora-session.json"),
             "{err:#}"

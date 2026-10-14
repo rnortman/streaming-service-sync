@@ -22,9 +22,12 @@ you are already logged in.
 ## Status
 
 Early development. `sss init`, `sss pandora auth`, `sss pandora export`,
-`sss pandora normalize` and `sss status` work; every other subcommand is in
-place but reports that it is not implemented yet. Matching and push land in
-later releases. See [CHANGELOG.md](CHANGELOG.md).
+`sss pandora normalize` and `sss status` work, and each also takes `--json`
+for one machine-readable document on stdout (see
+[Driving `sss` from a script or an LLM](#driving-sss-from-a-script-or-an-llm));
+every other subcommand is in place but reports that it is not implemented
+yet. Matching and push land in later releases. See
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Usage
 
@@ -63,8 +66,10 @@ token with one request before storing it, and stores it, mode 0600, under
 `~/.local/state/…`), never in the data repository. When Pandora later
 rejects the stored token, commands say so; run `sss pandora auth` again.
 A token for a different listener than the profile's stored session (by
-Pandora webname) is refused; sign that listener in under its own
-`--profile`.
+Pandora webname) replaces that session, and `sss` names the previous
+webname in a warning on stderr; a second listener belongs under a second
+`--profile`. To sign in from a script or an LLM rather than at a prompt,
+see [Driving `sss` from a script or an LLM](#driving-sss-from-a-script-or-an-llm).
 
 ### Pandora export
 
@@ -78,8 +83,74 @@ step's outcome. A run in which every step succeeded is then normalized into
 from the latest complete run without contacting Pandora. `sss status`
 prints each profile's stored Pandora session (when it was stored, never the
 token) and its latest run, step by step, so you can compare the playlist
-and collection counts with what the Pandora app shows.
+and collection counts with what the Pandora app shows; `sss status --json`
+gives the same as one JSON document.
 [docs/pandora-web-api.md](docs/pandora-web-api.md) describes the requests.
+
+### Driving `sss` from a script or an LLM
+
+Every command can be run by another program — a shell script, or an LLM
+through its shell tool — with nothing typed at a terminal:
+
+- **Input** comes from arguments, files, or stdin. A value read from
+  stdin (the Pandora token) is its lines up to an empty line or the end of
+  the input, each trimmed and joined, so piping it works:
+
+  ```sh
+  echo "$TOKEN" | sss pandora auth --profile alice --json
+  ```
+
+  A token piped in by a program is visible to that program, and so to an
+  LLM's transcript; secrets are never accepted as command-line arguments,
+  which would also put them in shell history.
+- **Nothing interactive.** `sss` never reads the terminal device, opens a
+  browser, pager or editor, or asks a question; behaviour never depends on
+  whether a stream is a terminal.
+- **Output.** stdout carries the result and nothing else; prompts,
+  progress, warnings and the `error: …` line go to stderr. The exit status
+  is 0 on success and 1 on failure.
+- **`--json`** (anywhere on the command line) makes stdout exactly one JSON
+  document. On success:
+
+  ```json
+  {
+    "ok": true,
+    "command": "init",
+    "repo": "/srv/music-data",
+    "created": ["/srv/music-data/config.toml", "/srv/music-data/README.md"],
+    "kept": []
+  }
+  ```
+
+  On failure, with the same text on stderr:
+
+  ```json
+  {
+    "ok": false,
+    "command": "pandora export",
+    "kind": "auth",
+    "error": "no Pandora session for profile alice; run `sss pandora auth`"
+  }
+  ```
+
+  A usage error (an unknown flag) prints no document: stdout is empty and
+  the exit status is 1. `kind` says what to do about a failure:
+
+  | `kind` | Meaning |
+  |---|---|
+  | `auth` | no stored session, or Pandora refused it or the token given: sign in again |
+  | `unavailable` | Pandora did not answer after every retry: try again later |
+  | `incomplete` | an export run ended with failed steps; the run is kept |
+  | `input` | what was piped or pasted is unusable |
+  | `config` | the data repository, `config.toml`, the profile or the environment needs fixing |
+  | `not_implemented` | the command is not built yet |
+  | `other` | anything else, such as a file that cannot be written |
+
+  [docs/json-output.md](docs/json-output.md) lists every field of every
+  command's document.
+- **The profile `sss` picks** when `--profile` is left out (the only one)
+  is named on stderr, for example
+  `profile alice (the only one; pass --profile NAME to choose)`.
 
 ## Build from source
 
