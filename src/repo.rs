@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -145,9 +146,14 @@ impl ProfilePaths {
         self.dir.join("pandora")
     }
 
+    /// Directory holding every capture run.
+    pub fn raw_dir(&self) -> PathBuf {
+        self.pandora_dir().join("raw")
+    }
+
     /// Directory of one capture run's raw responses and manifest.
     pub fn raw_run_dir(&self, run_id: &str) -> PathBuf {
-        self.pandora_dir().join("raw").join(run_id)
+        self.raw_dir().join(run_id)
     }
 
     pub fn stations(&self) -> PathBuf {
@@ -205,8 +211,17 @@ impl ProfilePaths {
 /// Replaces `path` with `contents` atomically: a reader sees the old file or
 /// the new one, never a mix. Parent directories are created.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    stage_beside(path, contents)?
-        .persist(path)
+    replace_with(stage_beside(path, contents, None)?, path)
+}
+
+/// [`write_atomic`] for a file only its owner may read: the staged file is
+/// mode 0600 before anything is written to it.
+pub fn write_atomic_private(path: &Path, contents: &[u8]) -> Result<()> {
+    replace_with(stage_beside(path, contents, Some(0o600))?, path)
+}
+
+fn replace_with(tmp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
@@ -215,7 +230,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 /// Creates `path` with `contents` atomically unless it already exists.
 /// Returns whether the file was written.
 pub fn write_new_atomic(path: &Path, contents: &[u8]) -> Result<bool> {
-    match stage_beside(path, contents)?.persist_noclobber(path) {
+    match stage_beside(path, contents, None)?.persist_noclobber(path) {
         Ok(_) => Ok(true),
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e.error).with_context(|| format!("creating {}", path.display())),
@@ -223,15 +238,23 @@ pub fn write_new_atomic(path: &Path, contents: &[u8]) -> Result<bool> {
 }
 
 /// Writes `contents` to a synced temporary file in `path`'s directory,
-/// creating the directory, ready to be renamed onto `path`.
-fn stage_beside(path: &Path, contents: &[u8]) -> Result<tempfile::NamedTempFile> {
+/// creating the directory, ready to be renamed onto `path`. With `mode`, the
+/// file gets that mode before `contents` is written.
+fn stage_beside(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+) -> Result<tempfile::NamedTempFile> {
     let dir = parent_dir(path);
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
-    tmp.write_all(contents)
-        .and_then(|()| tmp.as_file().sync_all())
-        .with_context(|| format!("writing {}", path.display()))?;
+    mode.map_or(Ok(()), |m| {
+        tmp.as_file().set_permissions(fs::Permissions::from_mode(m))
+    })
+    .and_then(|()| tmp.write_all(contents))
+    .and_then(|()| tmp.as_file().sync_all())
+    .with_context(|| format!("writing {}", path.display()))?;
     Ok(tmp)
 }
 
@@ -240,6 +263,13 @@ fn parent_dir(path: &Path) -> &Path {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     }
+}
+
+/// The current time, RFC 3339 UTC (`2026-10-13T12:34:56.789Z`).
+pub fn now_rfc3339() -> Result<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("formatting the current time")
 }
 
 /// The repository's JSON form of `value`: two-space indented, one trailing
@@ -260,6 +290,18 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// [`read_json`], `None` when `path` does not exist.
+pub fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))
+        .map(Some)
 }
 
 /// Appends `value` to the JSONL file at `path` as one line. A torn tail (see
@@ -553,6 +595,34 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "{\n  \"pandora_id\": \"TR:1\",\n  \"status\": \"matched\"\n}\n"
         );
+    }
+
+    #[test]
+    fn optional_json_is_none_only_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("e.json");
+        assert_eq!(read_json_opt::<Entry>(&path).unwrap(), None);
+        write_json(&path, &entry("TR:1", "matched")).unwrap();
+        assert_eq!(
+            read_json_opt(&path).unwrap(),
+            Some(entry("TR:1", "matched"))
+        );
+        fs::write(&path, "{").unwrap();
+        let err = read_json_opt::<Entry>(&path).unwrap_err();
+        assert!(format!("{err:#}").starts_with("parsing "), "{err:#}");
+    }
+
+    #[test]
+    fn private_atomic_write_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("d").join("secret");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_private(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

@@ -7,7 +7,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{self, Config};
+use crate::pandora::client::Client;
+use crate::pandora::{auth, export, model};
 use crate::repo::{self, Repo};
+use crate::secrets::StateDir;
+use crate::status;
 
 /// Export a Pandora account to a local data repository and migrate it to
 /// Spotify.
@@ -48,21 +52,16 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum PandoraCommand {
-    /// Store the browser session's auth token and CSRF cookie
+    /// Verify and store the X-AuthToken value of the browser's session
     Auth {
-        /// Read the token pair from a file instead of prompting
+        /// Read the token from the first line of a file instead of prompting
         #[arg(long, value_name = "FILE")]
         from_file: Option<PathBuf>,
     },
-    /// Capture everything from Pandora into a new raw run, then normalize
+    /// Capture everything from Pandora into a new raw run; normalize it if complete
     Export,
     /// Re-derive the normalized files from the latest complete raw run
     Normalize,
-    /// File an exported bundle as a raw run
-    Import {
-        /// The bundle file
-        bundle: PathBuf,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,7 +161,6 @@ impl Command {
             Command::Pandora(PandoraCommand::Auth { .. }) => "pandora auth",
             Command::Pandora(PandoraCommand::Export) => "pandora export",
             Command::Pandora(PandoraCommand::Normalize) => "pandora normalize",
-            Command::Pandora(PandoraCommand::Import { .. }) => "pandora import",
             Command::Spotify(SpotifyCommand::Auth) => "spotify auth",
             Command::Match(MatchArgs { command: None, .. }) => "match",
             Command::Match(MatchArgs {
@@ -204,7 +202,45 @@ pub fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
         None => None,
     };
-    bail!("`sss {}` is not implemented yet", cli.command.name())
+    match (&cli.command, cli.profile.as_deref()) {
+        (Command::Pandora(PandoraCommand::Auth { from_file }), Some(name)) => {
+            let state = StateDir::for_profile(name)?;
+            let (token, source) = auth::read_token(
+                from_file.as_deref(),
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            )?;
+            auth::verify_and_store(&state, token, source, Client::from_env, out)?;
+            Ok(())
+        }
+        (Command::Pandora(PandoraCommand::Export), Some(name)) => {
+            let paths = repo.profile(name)?;
+            let session = StateDir::for_profile(name)?
+                .load_pandora_session()?
+                .with_context(|| {
+                    format!("no Pandora session for profile {name}; run `sss pandora auth`")
+                })?;
+            let manifest = export::export(&paths, &mut Client::from_env(&session), out)?;
+            let failed = manifest.steps.failed();
+            if !failed.is_empty() {
+                let names: Vec<_> = failed.iter().map(|s| s.name()).collect();
+                bail!(
+                    "run {} is incomplete: failed steps {}; its raw responses are kept",
+                    manifest.run_id,
+                    names.join(", ")
+                );
+            }
+            writeln!(out, "run {} complete", manifest.run_id).context("writing output")?;
+            model::normalize(&paths, out)?;
+            Ok(())
+        }
+        (Command::Pandora(PandoraCommand::Normalize), Some(name)) => {
+            model::normalize(&repo.profile(name)?, out)?;
+            Ok(())
+        }
+        (Command::Status, profile) => status::status(&repo, profile, out),
+        _ => bail!("`sss {}` is not implemented yet", cli.command.name()),
+    }
 }
 
 /// Creates the data repository at `repo`: the directory, `config.toml` and
@@ -255,7 +291,6 @@ mod tests {
             (&["pandora", "auth", "--from-file", "f"], "pandora auth"),
             (&["pandora", "export"], "pandora export"),
             (&["pandora", "normalize"], "pandora normalize"),
-            (&["pandora", "import", "b.json"], "pandora import"),
             (&["spotify", "auth"], "spotify auth"),
             (&["match"], "match"),
             (&["match", "--no-llm", "--only", "artists"], "match"),
@@ -320,7 +355,7 @@ mod tests {
             &["push", "--only", "everything"],
             &["match", "set", "TR:1"],
             &["pandora"],
-            &["pandora", "import"],
+            &["pandora", "import", "b.json"],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("sss").chain(args.iter().copied())).is_err(),
@@ -382,7 +417,6 @@ mod tests {
             run_args(&["push", "--profile", "alice"]),
             "`sss push` is not implemented yet"
         );
-        assert_eq!(run_args(&["status"]), "`sss status` is not implemented yet");
     }
 
     #[test]
