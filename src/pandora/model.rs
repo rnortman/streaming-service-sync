@@ -113,7 +113,7 @@ pub struct Playlist {
     pub description: Option<String>,
     pub created: Option<String>,
     /// Pandora's `linkedType` (`StationThumbs`, `Personalized`, …); absent
-    /// for a playlist the member made.
+    /// for a playlist the member made, which Pandora sends as `"None"`.
     pub linked_type: Option<String>,
     /// Track ids in playlist order.
     pub items: Vec<String>,
@@ -298,7 +298,6 @@ impl Catalog {
     }
 
     /// A catalog annotation of type `TR`.
-    // TODO(pandora-annotation-fields): field names not yet seen live.
     fn annotation(&mut self, id: &str, a: &Value) {
         let d = self.entry(id);
         let t = &mut d.track;
@@ -354,8 +353,9 @@ fn annotations(body: &Value) -> Vec<(&str, &Value)> {
         .collect()
 }
 
-/// `TR` for `TR:123`.
-fn id_type(id: &str) -> Option<&str> {
+/// `TR` for `TR:123`: two uppercase letters, a colon and a non-empty
+/// rest.
+pub(crate) fn id_type(id: &str) -> Option<&str> {
     let (kind, rest) = id.split_once(':')?;
     (kind.len() == 2 && kind.bytes().all(|b| b.is_ascii_uppercase()) && !rest.is_empty())
         .then_some(kind)
@@ -681,7 +681,7 @@ impl Builder {
                     name: text(meta, "name"),
                     description: text(meta, "description"),
                     created: time_text(meta, "timeCreated"),
-                    linked_type: text(meta, "linkedType"),
+                    linked_type: text(meta, "linkedType").filter(|kind| kind != "None"),
                     items: self.playlist_items.remove(id).unwrap_or_default(),
                 }
             })
@@ -808,6 +808,24 @@ pub fn write(paths: &ProfilePaths, data: &Normalized) -> Result<()> {
     repo::write_json(&paths.collection(), &data.collection)?;
     repo::write_json(&paths.bookmarks(), &data.bookmarks)?;
     repo::write_json(&paths.tracks(), &data.tracks)
+}
+
+/// Reads the normalized files [`write`] wrote; none yet is an error naming
+/// `sss pandora export`.
+pub fn read(paths: &ProfilePaths) -> Result<Normalized> {
+    let Some(stations) = repo::read_json_opt(&paths.stations())? else {
+        bail!(
+            "no normalized export in {}; run `sss pandora export`",
+            paths.pandora_dir().display()
+        );
+    };
+    Ok(Normalized {
+        stations,
+        playlists: repo::read_json(&paths.playlists())?,
+        collection: repo::read_json(&paths.collection())?,
+        bookmarks: repo::read_json(&paths.bookmarks())?,
+        tracks: repo::read_json(&paths.tracks())?,
+    })
 }
 
 /// What one normalization holds, counted.
@@ -1050,9 +1068,10 @@ mod tests {
                 "v6/collections/getSortedPlaylists",
                 json!({}),
                 200,
-                json!({"items": [{"pandoraId": "PL:1"}],
+                json!({"items": [{"pandoraId": "PL:1"}, {"pandoraId": "PL:2"}],
                        "annotations": {"PL:1": {"name": "Station thumbs", "linkedType": "StationThumbs",
-                                                "timeCreated": 1_600_000_000_000_i64}}}),
+                                                "timeCreated": 1_600_000_000_000_i64},
+                                       "PL:2": {"name": "Road trip", "linkedType": "None"}}}),
             ),
             (
                 "v7/playlists/getTracks",
@@ -1061,7 +1080,8 @@ mod tests {
                 json!({"version": 3, "tracks": [{"trackPandoraId": "TR:1"}],
                        "annotations": {"TR:1": {
                            "name": "Other Title", "artistName": "Tee Grizzley", "albumName": "First Day Out",
-                           "isrc": "USAT21600001", "explicitness": "NONE", "duration": 250,
+                           "isrc": "USAT21600001", "explicitness": "CLEAN", "duration": 250,
+                           "durationMillis": 250_000,
                            "artistId": "AR:1", "albumId": "AL:1"}}}),
             ),
         ]);
@@ -1077,6 +1097,13 @@ mod tests {
         assert_eq!(p.items, ["TR:1"]);
         assert_eq!(p.linked_type.as_deref(), Some("StationThumbs"));
         assert_eq!(p.created.as_deref(), Some("2020-09-13T12:26:40Z"));
+        let made = &data.playlists[1];
+        assert_eq!(made.linked_type, None, "\"None\" is a member-made playlist");
+        assert!(
+            serde_json::to_string(made)
+                .unwrap()
+                .contains("\"linked_type\":null")
+        );
     }
 
     #[test]
@@ -1303,6 +1330,23 @@ mod tests {
         let before = fs::read(paths.stations()).unwrap();
         normalize(&paths).unwrap();
         assert_eq!(fs::read(paths.stations()).unwrap(), before);
+    }
+
+    #[test]
+    fn read_returns_what_write_wrote_and_without_an_export_says_to_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Repo::at(tmp.path()).profile("alice").unwrap();
+        let err = read(&paths).unwrap_err().to_string();
+        assert!(err.contains("run `sss pandora export`"), "{err}");
+
+        let data = normalize_exchanges(&[(
+            "v1/station/getStationFeedback",
+            feedback_req("11", true, 0),
+            200,
+            json!({"total": 1, "feedback": [fb("f1", "TR:1", None)]}),
+        )]);
+        write(&paths, &data).unwrap();
+        assert_eq!(read(&paths).unwrap(), data);
     }
 
     #[test]

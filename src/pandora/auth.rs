@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::error::Kind;
 use crate::fail;
-use crate::input::{join_pasted, pasted_text, read_pasted};
+use crate::input::read_value;
 use crate::pandora::client::{Client, Reply, endpoint};
 use crate::repo;
 use crate::secrets::{self, PandoraSession, StateDir, TokenSource};
@@ -25,11 +25,8 @@ X-AuthToken (the header, not the `at` cookie). Paste it below; if it
 arrives on two lines, that is fine. Then press Enter on an empty line.
 X-AuthToken: ";
 
-/// Reads the token: every line of `from_file` when given, else the lines
-/// of `input` up to an empty line or EOF, after writing [`PROMPT`] to
-/// `prompt`. Each line is trimmed and the non-empty ones are joined with no
-/// separator ([`join_pasted`]), so a value the browser copied across
-/// two lines is whole.
+/// Reads the token by [`read_value`] with [`PROMPT`]: a value the browser
+/// copied across two lines is whole. It must be printable ASCII.
 pub fn read_token(
     from_file: Option<&Path>,
     input: &mut dyn BufRead,
@@ -37,23 +34,11 @@ pub fn read_token(
 ) -> Result<(String, TokenSource)> {
     // TODO(browser-cookie-extraction): a third source, the session of a
     // local Chromium or Chrome profile.
-    let (token, source) = match from_file {
-        Some(path) => {
-            let text = pasted_text(std::fs::read_to_string(path), || {
-                format!("reading {}", path.display())
-            })?;
-            (join_pasted(text.lines()), TokenSource::File)
-        }
-        None => {
-            // The prompt is for people: a failed write of it does not stop
-            // the read.
-            let _ = write!(prompt, "{PROMPT}").and_then(|()| prompt.flush());
-            (read_pasted(input)?, TokenSource::Prompt)
-        }
+    let token = read_value(from_file, input, prompt, PROMPT, "token")?;
+    let source = match from_file {
+        Some(_) => TokenSource::File,
+        None => TokenSource::Prompt,
     };
-    if token.is_empty() {
-        fail!(Kind::Input, "no token given");
-    }
     if !token.bytes().all(|b| b.is_ascii_graphic()) {
         fail!(
             Kind::Input,

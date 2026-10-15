@@ -5,9 +5,15 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod http;
 pub mod input;
+pub mod lazy;
+pub mod matching;
 pub mod pandora;
 pub mod profiles;
+pub mod push;
 pub mod repo;
+pub mod report;
 pub mod secrets;
+pub mod spotify;
 pub mod status;

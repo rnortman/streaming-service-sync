@@ -1,5 +1,5 @@
-//! `sss status`: per profile, the stored Pandora session, the latest export
-//! run's step ledger and the match counts by status.
+//! `sss status`: per profile, the stored Pandora session and Spotify token,
+//! the latest export run's step ledger and the match counts by status.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -25,6 +25,7 @@ pub struct StatusReport {
 pub struct ProfileStatus {
     pub name: String,
     pub pandora_session: Option<SessionStatus>,
+    pub spotify_token: Option<TokenStatus>,
     pub export: ExportStatus,
     pub matches: MatchCounts,
 }
@@ -35,6 +36,14 @@ pub struct SessionStatus {
     pub stored_at: String,
     pub webname: Option<String>,
     pub source: TokenSource,
+}
+
+/// A stored Spotify token, without its token values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TokenStatus {
+    pub stored_at: String,
+    pub expires_at: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -89,6 +98,11 @@ fn profile_status(name: String, state: &StateDir, paths: &ProfilePaths) -> Resul
         webname: s.webname,
         source: s.source,
     });
+    let spotify_token = state.load_spotify_token()?.map(|s| TokenStatus {
+        stored_at: s.stored_at,
+        expires_at: s.token.expires_at,
+        scopes: s.token.scopes,
+    });
     let latest_run = match export::run_ids(paths)?.pop() {
         None => None,
         Some(run_id) => Some(RunStatus {
@@ -106,6 +120,7 @@ fn profile_status(name: String, state: &StateDir, paths: &ProfilePaths) -> Resul
     Ok(ProfileStatus {
         name,
         pandora_session,
+        spotify_token,
         export: ExportStatus {
             latest_run,
             latest_complete_run,
@@ -154,6 +169,13 @@ impl ProfileStatus {
                     s.source.as_str()
                 )
             }
+        });
+        lines.push(match &self.spotify_token {
+            None => format!("  spotify token: none (run `sss spotify auth --profile {name}`)"),
+            Some(t) => format!(
+                "  spotify token: stored {}, expires {}",
+                t.stored_at, t.expires_at
+            ),
         });
         let mut newest_complete = true;
         match &self.export.latest_run {
@@ -300,7 +322,8 @@ mod tests {
         let text = run_status(&repo, &state_root, None);
         assert!(
             text.starts_with(
-                "profile alice\n  pandora session: none (run `sss pandora auth --profile alice`)\n"
+                "profile alice\n  pandora session: none (run `sss pandora auth --profile alice`)\n  \
+                 spotify token: none (run `sss spotify auth --profile alice`)\n"
             ),
             "{text}"
         );
@@ -344,6 +367,7 @@ mod tests {
         let profile = &json["profiles"][0];
         assert_eq!(profile["name"], "alice");
         assert_eq!(profile["pandora_session"], Value::Null);
+        assert_eq!(profile["spotify_token"], Value::Null);
         assert_eq!(
             profile["export"]["latest_run"]["manifest"],
             serde_json::to_value(manifest("20261014T000000Z", false)).unwrap()
@@ -429,7 +453,8 @@ mod tests {
         assert!(
             text.starts_with(
                 "profile alice\n  pandora session: stored 2026-10-13T00:00:00Z, \
-                 webname listener, from prompt\n  export: no run yet\n"
+                 webname listener, from prompt\n  spotify token: none (run `sss spotify auth \
+                 --profile alice`)\n  export: no run yet\n"
             ),
             "{text}"
         );
@@ -447,6 +472,44 @@ mod tests {
         );
         assert!(!text.contains("tok-secret-value"), "{text}");
         assert!(!repo.profiles_dir().exists(), "status creates nothing");
+    }
+
+    #[test]
+    fn a_stored_spotify_token_is_shown_without_its_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = empty(tmp.path());
+        let token = crate::spotify::auth::Token {
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: "2026-10-15T01:00:00Z".into(),
+            scopes: vec!["user-library-read".into()],
+        };
+        let stored = state_root
+            .profile("dave")
+            .unwrap()
+            .save_spotify_token(&token)
+            .unwrap();
+        let signed_in = report(&repo, &state_root, None);
+        assert_eq!(
+            signed_in.profiles[0].spotify_token,
+            Some(TokenStatus {
+                stored_at: stored.stored_at.clone(),
+                expires_at: "2026-10-15T01:00:00Z".into(),
+                scopes: vec!["user-library-read".into()],
+            })
+        );
+        let text = run_status(&repo, &state_root, None);
+        assert!(
+            text.contains(&format!(
+                "  spotify token: stored {}, expires 2026-10-15T01:00:00Z\n",
+                stored.stored_at
+            )),
+            "{text}"
+        );
+        let json = serde_json::to_string(&signed_in).unwrap();
+        for out in [&text, &json] {
+            assert!(!out.contains("secret"), "{out}");
+        }
     }
 
     #[test]

@@ -8,6 +8,48 @@ Notable changes to streaming-service-sync. Format follows
 
 ### Added
 
+- **Push to Spotify.** `sss push --profile NAME` copies a family member's
+  Pandora listening into their Spotify account. It follows the matched
+  artists, makes a private playlist for each station and each Pandora
+  playlist, and saves the collection and bookmarks to the library. Two
+  `[push]` settings in `config.toml` add more: saving thumbs-up as liked
+  songs, and keeping a reference playlist of thumbs-down tracks. Start
+  with `--dry-run`, which prints the plan and contacts nothing; `--only`
+  runs one part. Everything sent is recorded in
+  `profiles/NAME/spotify/state.json`, so a second push adds only what is
+  new or missing and an interrupted push carries on where it stopped. A
+  playlist deleted in the Spotify app is not noticed (Spotify only
+  unfollows it); remove its entry from `state.json` to have it made again.
+- **Matching to Spotify.** `sss match --profile NAME` finds the Spotify
+  counterpart of every track, artist and album the push would send. A
+  track is matched automatically when Spotify knows its ISRC (the
+  standard recording code), or when title, artist and length agree
+  closely with exactly one release. What the search cannot decide goes,
+  in batches, to an LLM (a `music-matcher` agent run through the `ccc`
+  tool, allowed no tool but file listing) that picks the same recording
+  or none; `--no-llm` skips that step. Results go to
+  `profiles/NAME/matches/`, as they are made, so runs can be stopped and
+  resumed, and are bounded with `--limit N` and `--only`. A failed LLM
+  batch is retried on the next run without searching Spotify again.
+  `sss match review` lists what needs a person, with search links;
+  `sss match set` and `sss match reject` settle an item by hand, and no
+  later run overrides them. `[push] linked_playlists` (default off) also
+  includes the playlists Pandora made.
+- **Spotify sign-in.** `sss spotify auth --profile NAME` prints an address
+  to open in the browser where the family member is logged in to Spotify;
+  after they approve, `sss spotify auth --callback --profile NAME` takes
+  the address the browser landed on (pasted, or with `--from-file`) and
+  stores the token outside the data repository, readable only by you. No
+  Spotify password or app secret is ever asked for. `sss status` shows
+  whether each profile has a token and when it expires.
+  `docs/spotify-app-setup.md` walks through registering the Spotify app
+  the sign-in needs.
+- **Report.** `sss report --profile NAME` writes `profiles/NAME/report.md`,
+  a page for the family member: what was exported, how much is matched,
+  every item that needs a person (with search links and the commands to
+  settle it), the thumbs-down by station with how to hide them in
+  Spotify, what has no Spotify counterpart, and what push made, with
+  links. It contacts no service.
 - **Pandora export.** `sss pandora export --profile NAME` captures a family
   member's stations (with their seeds and thumbs up and down), playlists
   and their tracks, on-demand collection and bookmarks. Every Pandora
@@ -28,8 +70,8 @@ Notable changes to streaming-service-sync. Format follows
   also be piped in on stdin or read with `--from-file`.
 - **`--json` on every command.** With `--json`, a command prints exactly
   one JSON document on stdout — its result, or on failure an error object
-  whose `kind` (`auth`, `unavailable`, `incomplete`, `input`, `config`,
-  `not_implemented`, `other`) tells a script or an LLM what to do next.
+  whose `kind` (`auth`, `unavailable`, `quota`, `incomplete`, `input`,
+  `config`, `other`) tells a script or an LLM what to do next.
   Progress and prompts go to stderr, so every command, signing in
   included, can be driven by another program with the token piped on
   stdin. `docs/json-output.md` describes every document.
@@ -53,8 +95,7 @@ Notable changes to streaming-service-sync. Format follows
   flag when Pandora provides them. Collection items of an unrecognised kind
   are skipped with a warning; the saved raw responses still hold them.
 - Project skeleton: the `sss` command-line tool, released under the
-  Apache-2.0 license. The remaining subcommands (`spotify`, `match`,
-  `push`, `report`) are defined but not implemented yet.
+  Apache-2.0 license.
 - Build and CI: `make check` runs the full pre-commit suite; GitHub CI runs
   the Rust checks and a secret scan on every push.
 - Git hooks that block commits and pushes containing secrets or personal
@@ -62,6 +103,13 @@ Notable changes to streaming-service-sync. Format follows
 
 ### Changed
 
+- A match file whose last line was cut off (by a crash mid-write or a hand
+  edit) is no longer repaired silently: every command that reads or adds to
+  it stops with an error naming the file, the line and its full text, so
+  the line can be checked and removed by hand.
+- Playlists you made yourself on Pandora are now recorded with no
+  `linked_type` (Pandora reports them as `"None"`); run
+  `sss pandora normalize` once per profile to update existing exports.
 - `sss pandora auth` with a token for a different Pandora listener than
   the one already signed in under that profile now replaces the stored
   session and names the previous listener in a warning, instead of

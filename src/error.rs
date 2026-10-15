@@ -18,6 +18,9 @@ pub enum Kind {
     Auth,
     /// The service did not answer, after every retry.
     Unavailable,
+    /// The service's rate or quota limit was reached; what was done so far
+    /// is recorded and a later re-run continues.
+    Quota,
     /// An export run ended with failed steps.
     Incomplete,
     /// What was pasted or piped is unusable.
@@ -25,8 +28,6 @@ pub enum Kind {
     /// The data repository, its configuration or the environment is not
     /// usable as it stands.
     Config,
-    /// The command is not built yet.
-    NotImplemented,
     /// Anything else: I/O, parsing, a failed write.
     Other,
 }
@@ -192,9 +193,18 @@ mod tests {
     #[test]
     fn kinds_serialize_in_snake_case() {
         assert_eq!(
-            serde_json::to_string(&Kind::NotImplemented).unwrap(),
-            "\"not_implemented\""
+            serde_json::to_string(&Kind::Unavailable).unwrap(),
+            "\"unavailable\""
         );
         assert_eq!(serde_json::to_string(&Kind::Auth).unwrap(), "\"auth\"");
+        assert_eq!(serde_json::to_string(&Kind::Quota).unwrap(), "\"quota\"");
+    }
+
+    #[test]
+    fn a_quota_failure_is_found_through_contexts() {
+        let err: anyhow::Error = anyhow::Error::new(Failure::new(Kind::Quota, "limit reached"))
+            .context("searching")
+            .context("matching");
+        assert_eq!(kind(&err), Kind::Quota);
     }
 }

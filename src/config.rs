@@ -35,6 +35,7 @@ playlist_prefix = ""
 liked_songs = false
 thumbs_down_playlist = false
 public_playlists = false
+linked_playlists = false  # also push Pandora-made playlists (Personalized, SharedListening, Curated, …)
 
 # One table per profile, for overrides only.
 # [profiles.alice]
@@ -97,6 +98,9 @@ pub struct PushConfig {
     pub liked_songs: bool,
     pub thumbs_down_playlist: bool,
     pub public_playlists: bool,
+    /// Push playlists Pandora made (any `linked_type` but `StationThumbs`
+    /// and `MyThumbsUp`) as well as the member's own.
+    pub linked_playlists: bool,
 }
 
 /// One `[profiles.<name>]` table: per-profile overrides.

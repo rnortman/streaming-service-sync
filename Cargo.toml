@@ -9,7 +9,7 @@ repository = "https://github.com/rnortman/streaming-service-sync"
 readme = "README.md"
 keywords = ["pandora", "spotify", "migration", "playlist", "export"]
 categories = ["command-line-utilities"]
-include = ["/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
+include = ["/agents", "/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
 
 [[bin]]
 name = "sss"
@@ -17,14 +17,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.10"
+strsim = "0.11"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 toml = "1.1.8"
+unicode-normalization = "0.1"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+url = "2"
 
 [lints.clippy]
 # `eprintln!` panics when stderr is closed; warnings are written best-effort.

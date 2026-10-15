@@ -10,13 +10,19 @@ use serde::Serialize;
 use crate::config::{self, Config};
 use crate::error::{self, ExportRun, Kind};
 use crate::fail;
+use crate::matching::llm;
+use crate::matching::run::{self as matching, MatchReport, MatchSetReport, ReviewReport};
 use crate::pandora::auth::{self, AuthReport};
 use crate::pandora::client::Client;
 use crate::pandora::export::{self, ExportIncomplete, ExportReport, Manifest};
 use crate::pandora::model::{self, Summary};
 use crate::profiles;
+use crate::push::{self, PushReport};
 use crate::repo::{self, Repo};
-use crate::secrets::StateRoot;
+use crate::report::{self, ReportFile};
+use crate::secrets::{StateDir, StateRoot};
+use crate::spotify;
+use crate::spotify::ids::IdKind;
 use crate::status::{self, StatusReport};
 
 /// Export a Pandora account to a local data repository and migrate it to
@@ -79,9 +85,17 @@ pub enum PandoraCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SpotifyCommand {
-    /// Authorize the profile's Spotify account (PKCE; paste the redirected
-    /// address back)
-    Auth,
+    /// Authorize the profile's Spotify account: print the address to open,
+    /// then, with --callback, take back the address the browser landed on
+    Auth {
+        /// Finish the sign-in: read the redirected address (pasted, up to an
+        /// empty line) and store the token
+        #[arg(long)]
+        callback: bool,
+        /// With --callback, read the address from a file instead
+        #[arg(long, value_name = "FILE", requires = "callback")]
+        from_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -95,6 +109,10 @@ pub struct MatchArgs {
     #[arg(long, value_enum)]
     pub only: Option<MatchKind>,
 
+    /// Decide at most N items this run, then stop
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
     #[command(subcommand)]
     pub command: Option<MatchCommand>,
 }
@@ -106,10 +124,24 @@ pub enum MatchKind {
     Albums,
 }
 
+impl From<MatchKind> for IdKind {
+    fn from(kind: MatchKind) -> Self {
+        match kind {
+            MatchKind::Tracks => IdKind::Track,
+            MatchKind::Artists => IdKind::Artist,
+            MatchKind::Albums => IdKind::Album,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MatchCommand {
     /// List unmatched and low-confidence items with their top candidates
-    Review,
+    Review {
+        /// Review only this kind of entity
+        #[arg(long, value_enum)]
+        only: Option<MatchKind>,
+    },
     /// Record a manual match
     Set {
         /// Pandora id (TR:…, AR:…, AL:…)
@@ -137,10 +169,25 @@ pub struct PushArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PushPart {
+    Artists,
     Stations,
     Playlists,
     Collection,
     Liked,
+    ThumbsDown,
+}
+
+impl From<PushPart> for push::Part {
+    fn from(part: PushPart) -> Self {
+        match part {
+            PushPart::Artists => push::Part::Artists,
+            PushPart::Stations => push::Part::Stations,
+            PushPart::Playlists => push::Part::Playlists,
+            PushPart::Collection => push::Part::Collection,
+            PushPart::Liked => push::Part::Liked,
+            PushPart::ThumbsDown => push::Part::ThumbsDown,
+        }
+    }
 }
 
 /// The README `sss init` writes into the data repository.
@@ -175,10 +222,10 @@ impl Command {
             Command::Pandora(PandoraCommand::Auth { .. }) => "pandora auth",
             Command::Pandora(PandoraCommand::Export) => "pandora export",
             Command::Pandora(PandoraCommand::Normalize) => "pandora normalize",
-            Command::Spotify(SpotifyCommand::Auth) => "spotify auth",
+            Command::Spotify(SpotifyCommand::Auth { .. }) => "spotify auth",
             Command::Match(MatchArgs { command: None, .. }) => "match",
             Command::Match(MatchArgs {
-                command: Some(MatchCommand::Review),
+                command: Some(MatchCommand::Review { .. }),
                 ..
             }) => "match review",
             Command::Match(MatchArgs {
@@ -211,6 +258,13 @@ pub enum Output {
     PandoraAuth(AuthReport),
     PandoraExport(Box<ExportReport>),
     PandoraNormalize(Summary),
+    SpotifyAuthStart(spotify::auth::AuthStartReport),
+    SpotifyAuth(spotify::auth::AuthReport),
+    Match(MatchReport),
+    MatchReview(ReviewReport),
+    MatchSet(MatchSetReport),
+    Push(PushReport),
+    Report(ReportFile),
     Status(StatusReport),
 }
 
@@ -221,6 +275,13 @@ impl Output {
             Output::PandoraAuth(r) => r.write_text(out),
             Output::PandoraExport(r) => r.write_text(out),
             Output::PandoraNormalize(r) => r.write_text(out),
+            Output::SpotifyAuthStart(r) => r.write_text(out),
+            Output::SpotifyAuth(r) => r.write_text(out),
+            Output::Match(r) => r.write_text(out),
+            Output::MatchReview(r) => r.write_text(out),
+            Output::MatchSet(r) => r.write_text(out),
+            Output::Push(r) => r.write_text(out),
+            Output::Report(r) => r.write_text(out),
             Output::Status(r) => r.write_text(out),
         }
     }
@@ -413,15 +474,174 @@ fn dispatch(
         (Command::Pandora(PandoraCommand::Normalize), Some(name)) => Ok(Output::PandoraNormalize(
             model::normalize(&repo.profile(name)?)?,
         )),
+        (
+            Command::Spotify(SpotifyCommand::Auth {
+                callback: false, ..
+            }),
+            Some(name),
+        ) => {
+            let report = spotify::auth::start(
+                name,
+                config.client_id(name),
+                &repo.config_path(),
+                config.push.public_playlists,
+                &state_root.profile(name)?,
+                &spotify::auth::auth_base_from_env(),
+            )?;
+            let _ = writeln!(err, "{}", report.instructions());
+            Ok(Output::SpotifyAuthStart(report))
+        }
+        (
+            Command::Spotify(SpotifyCommand::Auth {
+                callback: true,
+                from_file,
+            }),
+            Some(name),
+        ) => Ok(Output::SpotifyAuth(spotify::auth::complete(
+            name,
+            &state_root.profile(name)?,
+            from_file.as_deref(),
+            input,
+            err,
+            &spotify::auth::auth_base_from_env(),
+        )?)),
+        (
+            Command::Match(MatchArgs {
+                command: None,
+                no_llm,
+                only,
+                limit,
+            }),
+            Some(name),
+        ) => {
+            let paths = repo.profile(name)?;
+            let items = matching::select(&model::read(&paths)?, &config.push);
+            let state = state_root.profile(name)?;
+            let connect = || spotify_client(name, &config, &repo, state);
+            let options = matching::Options {
+                only: only.map(IdKind::from),
+                limit: *limit,
+                batch_size: usize::try_from(config.matcher.batch_size).unwrap_or(usize::MAX),
+            };
+            let connect_matcher: Option<matching::ConnectMatcher<'_>> = if *no_llm {
+                None
+            } else {
+                let paths = &paths;
+                let matcher = &config.matcher;
+                Some(Box::new(move || {
+                    let ccc =
+                        llm::Ccc::prepare(llm::ccc_program(), state_root.root(), matcher, paths)?;
+                    Ok(Box::new(ccc) as Box<dyn llm::Matcher>)
+                }))
+            };
+            Ok(Output::Match(matching::run(
+                name,
+                &paths,
+                &items,
+                options,
+                connect,
+                connect_matcher,
+                err,
+            )?))
+        }
+        (
+            Command::Match(MatchArgs {
+                command: Some(MatchCommand::Review { only }),
+                ..
+            }),
+            Some(name),
+        ) => {
+            let paths = repo.profile(name)?;
+            let items = matching::select(&model::read(&paths)?, &config.push);
+            Ok(Output::MatchReview(matching::review(
+                &crate::matching::model::read_all_latest(&paths)?,
+                &items,
+                only.map(IdKind::from),
+            )))
+        }
+        (
+            Command::Match(MatchArgs {
+                command:
+                    Some(MatchCommand::Set {
+                        pandora_id,
+                        spotify,
+                    }),
+                ..
+            }),
+            Some(name),
+        ) => Ok(Output::MatchSet(matching::set(
+            &repo.profile(name)?,
+            pandora_id,
+            spotify,
+        )?)),
+        (
+            Command::Match(MatchArgs {
+                command: Some(MatchCommand::Reject { pandora_id }),
+                ..
+            }),
+            Some(name),
+        ) => Ok(Output::MatchSet(matching::reject(
+            &repo.profile(name)?,
+            pandora_id,
+        )?)),
+        (Command::Push(PushArgs { dry_run, only }), Some(name)) => {
+            let paths = repo.profile(name)?;
+            let export = model::read(&paths)?;
+            let state = state_root.profile(name)?;
+            let (config, repo) = (&config, &repo);
+            let connect = move || spotify_client(name, config, repo, state);
+            let options = push::Options {
+                only: only.map(push::Part::from),
+                dry_run: *dry_run,
+            };
+            let report = push::push(
+                name,
+                &paths,
+                &export,
+                &config.push,
+                options,
+                Box::new(connect),
+                &mut *err,
+            )?;
+            if cli.json {
+                // The text carries these; under --json they go to the person
+                // on stderr as well as into the document's `pending` entries.
+                for instruction in report.pending_instructions() {
+                    let _ = writeln!(err, "{instruction}");
+                }
+            }
+            Ok(Output::Push(report))
+        }
+        (Command::Report, Some(name)) => Ok(Output::Report(report::report(
+            name,
+            &repo.profile(name)?,
+            &config.push,
+        )?)),
         (Command::Status, profile) => Ok(Output::Status(status::status(
             &repo, state_root, &config, profile,
         )?)),
-        _ => fail!(
-            Kind::NotImplemented,
-            "`sss {}` is not implemented yet",
+        // `init` returned above, and every other command has a profile by
+        // now: `--profile`, or the only one.
+        (Command::Init, _) | (_, None) => fail!(
+            Kind::Config,
+            "`sss {}` needs --profile NAME",
             cli.command.name()
         ),
     }
+}
+
+/// The Spotify client of profile `name`: its client id from the
+/// configuration (kind `config` when there is none), the configured market
+/// and the environment's base URLs.
+fn spotify_client(
+    name: &str,
+    config: &Config,
+    repo: &Repo,
+    state: StateDir,
+) -> Result<spotify::client::Spotify> {
+    let client_id =
+        spotify::auth::require_client_id(name, config.client_id(name), &repo.config_path())?;
+    spotify::client::Spotify::from_env(state, client_id, &config.spotify.market)
 }
 
 /// The profile a command run without `--profile` acts on: the only known
@@ -518,13 +738,22 @@ mod tests {
         (&["pandora", "export"], "pandora export"),
         (&["pandora", "normalize"], "pandora normalize"),
         (&["spotify", "auth"], "spotify auth"),
+        (&["spotify", "auth", "--callback"], "spotify auth"),
+        (
+            &["spotify", "auth", "--callback", "--from-file", "f"],
+            "spotify auth",
+        ),
         (&["match"], "match"),
         (&["match", "--no-llm", "--only", "artists"], "match"),
+        (&["match", "--no-llm", "--limit", "5"], "match"),
         (&["match", "review"], "match review"),
+        (&["match", "review", "--only", "tracks"], "match review"),
         (&["match", "set", "TR:1", "spotify:track:x"], "match set"),
         (&["match", "reject", "TR:1"], "match reject"),
         (&["push"], "push"),
         (&["push", "--dry-run", "--only", "liked"], "push"),
+        (&["push", "--only", "artists"], "push"),
+        (&["push", "--only", "thumbs-down"], "push"),
         (&["status"], "status"),
         (&["report"], "report"),
     ];
@@ -560,6 +789,20 @@ mod tests {
         };
         assert!(m.no_llm && m.command.is_none());
         assert_eq!(m.only, Some(MatchKind::Albums));
+        assert_eq!(m.limit, None);
+
+        let Command::Match(m) = parse(&["match", "--limit", "25", "--no-llm"]).command else {
+            panic!("not match")
+        };
+        assert_eq!(m.limit, Some(25));
+        let Command::Match(MatchArgs {
+            command: Some(MatchCommand::Review { only }),
+            ..
+        }) = parse(&["match", "review", "--only", "artists"]).command
+        else {
+            panic!("not match review")
+        };
+        assert_eq!(only, Some(MatchKind::Artists));
 
         let Command::Match(MatchArgs {
             command:
@@ -581,8 +824,11 @@ mod tests {
         for args in [
             &[][..],
             &["match", "--no-llm", "review"],
+            &["match", "--limit", "x"],
+            &["match", "--limit", "5", "review"],
             &["push", "--only", "everything"],
             &["match", "set", "TR:1"],
+            &["spotify", "auth", "--from-file", "f"],
             &["pandora"],
             &["pandora", "import", "b.json"],
         ] {
@@ -721,8 +967,19 @@ mod tests {
         assert!(ran.error().contains("invalid profile name"));
         assert_eq!(ran.kind(), Kind::Config);
         let ran = run_args(&["push", "--profile", "alice"]);
-        assert_eq!(ran.error(), "`sss push` is not implemented yet");
-        assert_eq!(ran.kind(), Kind::NotImplemented);
+        assert!(
+            ran.error().contains("run `sss pandora export`"),
+            "{}",
+            ran.error()
+        );
+        assert_eq!(ran.kind(), Kind::Other);
+        let ran = run_args(&["report", "--profile", "alice"]);
+        assert!(
+            ran.error().contains("run `sss pandora export`"),
+            "{}",
+            ran.error()
+        );
+        assert_eq!(ran.kind(), Kind::Other);
         assert_eq!(ran.err, "", "an explicit profile is not announced");
 
         // One profile, known only from a session in the state root: the
@@ -734,8 +991,12 @@ mod tests {
             .save_pandora_session(&crate::pandora::test_support::session())
             .unwrap();
         std::fs::create_dir_all(state_root.root().join("ccc/agents")).unwrap();
-        let ran = run_args(&["push"]);
-        assert_eq!(ran.error(), "`sss push` is not implemented yet");
+        let ran = run_args(&["report"]);
+        assert!(
+            ran.error().contains("profiles/alice/pandora"),
+            "{}",
+            ran.error()
+        );
         assert_eq!(
             ran.err,
             "profile alice (the only one; pass --profile NAME to choose)\n"
@@ -752,9 +1013,10 @@ mod tests {
             run_args(&["push"]).error(),
             "`sss push` needs --profile NAME (profiles: alice, bob)"
         );
-        assert_eq!(
-            run_args(&["push", "--profile", "bob"]).error(),
-            "`sss push` is not implemented yet"
+        assert!(
+            run_args(&["report", "--profile", "bob"])
+                .error()
+                .contains("profiles/bob/pandora")
         );
     }
 
@@ -806,7 +1068,22 @@ mod tests {
             ("pandora auth --from-file f", Some(Kind::Other)),
             ("pandora export", Some(Kind::Auth)),
             ("pandora normalize", Some(Kind::Other)),
+            ("spotify auth", Some(Kind::Config)),
+            ("spotify auth --callback", Some(Kind::Auth)),
+            ("spotify auth --callback --from-file f", Some(Kind::Auth)),
+            ("match", Some(Kind::Other)),
+            ("match --no-llm --only artists", Some(Kind::Other)),
+            ("match --no-llm --limit 5", Some(Kind::Other)),
+            ("match review", Some(Kind::Other)),
+            ("match review --only tracks", Some(Kind::Other)),
+            ("match set TR:1 spotify:track:x", Some(Kind::Input)),
+            ("match reject TR:1", None),
+            ("push", Some(Kind::Other)),
+            ("push --dry-run --only liked", Some(Kind::Other)),
+            ("push --only artists", Some(Kind::Other)),
+            ("push --only thumbs-down", Some(Kind::Other)),
             ("status", None),
+            ("report", Some(Kind::Other)),
         ];
         for (args, name) in DOCUMENTED {
             let mut full = with_repo(&repo, args);
@@ -819,7 +1096,8 @@ mod tests {
             let want = expected
                 .iter()
                 .find(|(line, _)| *line == joined)
-                .map_or(Some(Kind::NotImplemented), |(_, kind)| *kind);
+                .unwrap_or_else(|| panic!("no expected outcome for {joined:?}"))
+                .1;
             match want {
                 None => assert!(ran.result.is_ok(), "{args:?}: {}", ran.error()),
                 Some(kind) => {
@@ -956,6 +1234,75 @@ mod tests {
             ran.out,
             "no profiles yet; run `sss pandora auth --profile NAME` first\n"
         );
+    }
+
+    #[test]
+    fn spotify_auth_writes_the_address_to_stdout_and_the_steps_to_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = setup(tmp.path());
+        std::fs::write(
+            repo.config_path(),
+            "[spotify]\nclient_id = \"test-client-id\"\n",
+        )
+        .unwrap();
+        let ran = exec(
+            &with_repo(&repo, &["spotify", "auth", "--profile", "alice"]),
+            &state_root,
+            "",
+        );
+        ran.result.as_ref().unwrap();
+        let state = state_root.profile("alice").unwrap();
+        let pending = state.load_spotify_pending().unwrap().unwrap();
+        assert_eq!(pending.client_id, "test-client-id");
+        assert!(
+            ran.out.contains("/authorize?client_id=test-client-id&"),
+            "{}",
+            ran.out
+        );
+        assert_eq!(ran.out.lines().count(), 1, "{}", ran.out);
+        assert!(
+            ran.err
+                .contains("sss spotify auth --callback --profile alice"),
+            "{}",
+            ran.err
+        );
+
+        // The second step reads the address by the paste rule; a wrong state
+        // is refused and keeps the pending sign-in.
+        let ran = exec(
+            &with_repo(
+                &repo,
+                &[
+                    "spotify",
+                    "auth",
+                    "--callback",
+                    "--profile",
+                    "alice",
+                    "--json",
+                ],
+            ),
+            &state_root,
+            "https://127.0.0.1/callback?code=c&state=wrong\n\n",
+        );
+        assert_eq!(ran.kind(), Kind::Input);
+        assert_eq!(ran.document()["command"], "spotify auth");
+        assert_eq!(ran.err, spotify::auth::CALLBACK_PROMPT);
+        assert!(state.spotify_pending_path().exists());
+
+        // Without a client id: kind config naming the key, nothing written.
+        std::fs::write(repo.config_path(), "").unwrap();
+        let ran = exec(
+            &with_repo(&repo, &["spotify", "auth", "--profile", "bob"]),
+            &state_root,
+            "",
+        );
+        assert_eq!(ran.kind(), Kind::Config);
+        assert!(
+            ran.error().contains("`[spotify] client_id`"),
+            "{}",
+            ran.error()
+        );
+        assert!(!state_root.root().join("bob").exists());
     }
 
     #[test]

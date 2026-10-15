@@ -110,7 +110,7 @@ fn init_defaults_to_xdg_data_home_and_is_idempotent() {
 }
 
 #[test]
-fn unimplemented_command_reports_an_error_and_exits_1() {
+fn a_failing_command_reports_an_error_and_exits_1() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().to_str().expect("utf-8 path");
     sss(tmp.path())
@@ -118,15 +118,17 @@ fn unimplemented_command_reports_an_error_and_exits_1() {
         .assert()
         .code(0);
     let out = sss(tmp.path())
-        .args(["--repo", dir, "--profile", "alice", "push"])
+        .args(["--repo", dir, "--profile", "alice", "report"])
         .assert()
         .code(1)
         .get_output()
         .clone();
     assert!(out.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        "error: `sss push` is not implemented yet\n"
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("error: no normalized export in ")
+            && stderr.ends_with("; run `sss pandora export`\n"),
+        "{stderr}"
     );
 }
 
@@ -560,7 +562,10 @@ fn the_only_profile_is_the_default_and_status_shows_its_session() {
     let status = String::from_utf8_lossy(&out.stdout);
     assert!(
         status.starts_with("profile alice\n  pandora session: stored ")
-            && status.contains(", from prompt\n  export: no run yet\n"),
+            && status.contains(
+                ", from prompt\n  spotify token: none (run `sss spotify auth --profile alice`)\n  \
+                 export: no run yet\n"
+            ),
         "{status}"
     );
     assert!(
@@ -603,6 +608,198 @@ fn the_only_profile_is_the_default_and_status_shows_its_session() {
         String::from_utf8_lossy(&out.stderr),
         "error: `sss pandora export` needs --profile NAME (profiles: alice, bob)\n"
     );
+}
+
+#[test]
+fn spotify_sign_in_in_two_steps_stores_the_token_privately() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+
+    let out = sss(tmp.path())
+        .env("SSS_SPOTIFY_AUTH_BASE_URL", server.base_url())
+        .args(["--repo", repo, "--profile", "dave", "spotify", "auth"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let address = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        address.starts_with(&format!("{}/authorize?", server.base_url())),
+        "{address}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--callback --profile dave"),
+        "instructions on stderr"
+    );
+    let state_dir = tmp.path().join("streaming-service-sync/dave");
+    let pending = state_dir.join("spotify-auth-pending.json");
+    assert!(pending.is_file());
+    let state = url_param(&address, "state");
+
+    let token = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/api/token")
+            .form_urlencoded_tuple("grant_type", "authorization_code")
+            .form_urlencoded_tuple("code", "c0de");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-secret", "token_type": "Bearer", "expires_in": 3600,
+            "refresh_token": "refresh-secret", "scope": "user-library-read"}));
+    });
+    let out = sss(tmp.path())
+        .env("SSS_SPOTIFY_AUTH_BASE_URL", server.base_url())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "dave",
+            "spotify",
+            "auth",
+            "--callback",
+            "--json",
+        ])
+        .write_stdin(format!(
+            "https://127.0.0.1/callback?code=c0de&state={state}\n\n"
+        ))
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    token.assert();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "spotify auth");
+    assert_eq!(doc["scopes"], serde_json::json!(["user-library-read"]));
+    let token_file = state_dir.join("spotify-token.json");
+    assert_eq!(
+        std::fs::metadata(&token_file)
+            .expect("token file")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!pending.exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("secret"));
+
+    // A Spotify-only profile is the default and status shows its token.
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "status", "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    let profile = &doc["profiles"][0];
+    assert_eq!(profile["name"], "dave");
+    assert_eq!(
+        profile["spotify_token"]["scopes"],
+        serde_json::json!(["user-library-read"])
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("secret"));
+}
+
+#[test]
+fn spotify_auth_reads_the_callback_from_a_file_and_only_with_callback() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+    let state_dir = tmp.path().join("streaming-service-sync/dave");
+    let pending = state_dir.join("spotify-auth-pending.json");
+    let address_file = tmp.path().join("address.txt");
+
+    // `--from-file` without `--callback` is refused and starts nothing.
+    let out = sss(tmp.path())
+        .env("SSS_SPOTIFY_AUTH_BASE_URL", server.base_url())
+        .args(["--repo", repo, "--profile", "dave", "spotify", "auth"])
+        .arg("--from-file")
+        .arg(&address_file)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("error: "),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!pending.exists());
+
+    let out = sss(tmp.path())
+        .env("SSS_SPOTIFY_AUTH_BASE_URL", server.base_url())
+        .args(["--repo", repo, "--profile", "dave", "spotify", "auth"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let address = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let state = url_param(&address, "state");
+    std::fs::write(
+        &address_file,
+        format!("https://127.0.0.1/callback?code=c0de&state={state}\n"),
+    )
+    .expect("write address");
+    let token = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/api/token")
+            .form_urlencoded_tuple("grant_type", "authorization_code")
+            .form_urlencoded_tuple("code", "c0de");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "access-secret", "token_type": "Bearer", "expires_in": 3600,
+            "refresh_token": "refresh-secret", "scope": "user-library-read"}));
+    });
+    sss(tmp.path())
+        .env("SSS_SPOTIFY_AUTH_BASE_URL", server.base_url())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "dave",
+            "spotify",
+            "auth",
+            "--callback",
+            "--from-file",
+        ])
+        .arg(&address_file)
+        .write_stdin("")
+        .assert()
+        .code(0);
+    token.assert();
+    assert!(state_dir.join("spotify-token.json").is_file());
+    assert!(!pending.exists());
+}
+
+/// The value of query parameter `name` in `address`.
+fn url_param(address: &str, name: &str) -> String {
+    let query = address.split_once('?').expect("a query").1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} in {address}"))
+        .to_owned()
 }
 
 #[test]
@@ -895,4 +1092,572 @@ fn json_without_a_state_root_is_kind_config() {
         "{doc}"
     );
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: "));
+}
+
+/// A search result body with one track per `(uri, name, isrc)`.
+fn search_body(tracks: &[(&str, &str, Option<&str>)]) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = tracks
+        .iter()
+        .map(|(uri, name, isrc)| {
+            let mut t = serde_json::json!({
+                "uri": uri, "name": name, "artists": [{"name": "The Band"}],
+                "album": {"name": "Record", "album_type": "album", "release_date": "2004"},
+                "duration_ms": 200_000, "explicit": false});
+            if let Some(code) = isrc {
+                t["external_ids"] = serde_json::json!({ "isrc": code });
+            }
+            t
+        })
+        .collect();
+    serde_json::json!({"tracks": {"items": items}})
+}
+
+#[test]
+fn match_decides_by_isrc_text_and_the_llm_and_honours_the_limit() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+
+    // A normalized export: three thumbs-up on one station.
+    let pandora = Path::new(repo).join("profiles/alice/pandora");
+    std::fs::create_dir_all(&pandora).expect("pandora dir");
+    let thumb = |id: &str| {
+        serde_json::json!({"feedback_id": id, "track_pandora_id": id, "positive": true,
+                           "created": null, "station_id": "1"})
+    };
+    let track = |id: &str, title: &str, isrc: Option<&str>| {
+        serde_json::json!({"pandora_id": id, "music_id": null, "title": title,
+            "artist": "The Band", "album": null, "duration_s": 200, "track_num": null,
+            "disc_num": null, "explicit_hint": false, "isrc": isrc,
+            "artist_pandora_id": null, "album_pandora_id": null})
+    };
+    let files = [
+        (
+            "stations.json",
+            serde_json::json!([{"station_id": "1", "pandora_id": "ST:1", "name": "Station",
+                "created": null, "last_played": null, "is_thumbprint": false,
+                "is_shuffle": false, "genres": [], "positive_feedback_count": null,
+                "negative_feedback_count": null, "seeds": [],
+                "feedback": [thumb("TR:1"), thumb("TR:2"), thumb("TR:3")]}]),
+        ),
+        ("playlists.json", serde_json::json!([])),
+        (
+            "collection.json",
+            serde_json::json!({"tracks": [], "albums": [], "artists": []}),
+        ),
+        (
+            "bookmarks.json",
+            serde_json::json!({"tracks": [], "albums": []}),
+        ),
+        (
+            "tracks.json",
+            serde_json::json!({
+                "TR:1": track("TR:1", "First", Some("USAAA0400001")),
+                "TR:2": track("TR:2", "Second", None),
+                "TR:3": track("TR:3", "Third", None),
+            }),
+        ),
+    ];
+    for (name, value) in files {
+        std::fs::write(pandora.join(name), value.to_string()).expect("write export");
+    }
+    let state_dir = tmp.path().join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z", "scopes": ["user-library-read"]}})
+        .to_string(),
+    )
+    .expect("write token");
+
+    let isrc = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/search")
+            .query_param("q", "isrc:USAAA0400001")
+            .query_param("type", "track")
+            .header("authorization", "Bearer access-secret");
+        then.status(200).json_body(search_body(&[(
+            "spotify:track:first",
+            "First",
+            Some("USAAA0400001"),
+        )]));
+    });
+    let second = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/search")
+            .query_param("q", "track:\"second\" artist:\"the band\"");
+        then.status(200)
+            .json_body(search_body(&[("spotify:track:second", "Second", None)]));
+    });
+    let third_body = search_body(&[
+        ("spotify:track:t1", "Third (Live)", None),
+        ("spotify:track:t2", "Third Reprise", None),
+    ]);
+    let third = ["track:\"third\" artist:\"the band\"", "third the band"].map(|q| {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/search")
+                .query_param("q", q);
+            then.status(200).json_body(third_body.clone());
+        })
+    });
+    let match_cmd = |extra: &[&str]| {
+        let mut cmd = sss(tmp.path());
+        cmd.env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "match",
+                "--no-llm",
+                "--json",
+            ])
+            .args(extra);
+        cmd
+    };
+
+    let out = match_cmd(&["--limit", "1"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["command"], "match");
+    assert_eq!(doc["stopped"], "limit");
+    assert_eq!(doc["kinds"]["tracks"]["processed"], 1);
+    assert_eq!(doc["kinds"]["tracks"]["by_method"]["isrc"], 1);
+    isrc.assert_calls(1);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("track TR:1 \"First\" by The Band: matched (isrc)"),
+        "progress on stderr"
+    );
+
+    let out = match_cmd(&[]).assert().code(0).get_output().clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["stopped"], serde_json::Value::Null);
+    assert_eq!(doc["kinds"]["tracks"]["processed"], 2);
+    assert_eq!(doc["kinds"]["tracks"]["by_status"]["matched"], 1);
+    assert_eq!(doc["kinds"]["tracks"]["by_status"]["ambiguous"], 1);
+    assert_eq!(doc["kinds"]["tracks"]["by_method"]["exact"], 1);
+    isrc.assert_calls(1);
+    second.assert_calls(1);
+    for mock in &third {
+        mock.assert_calls(1);
+    }
+
+    let entries =
+        std::fs::read_to_string(Path::new(repo).join("profiles/alice/matches/tracks.jsonl"))
+            .expect("match file");
+    assert_eq!(entries.lines().count(), 3);
+    assert!(!entries.contains("secret"));
+
+    // The ambiguous track is up for review, with a search link.
+    let out = sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "match",
+            "review",
+            "--json",
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["items"][0]["pandora_id"], "TR:3");
+    assert_eq!(
+        doc["items"][0]["search_url"],
+        "https://open.spotify.com/search/Third%20The%20Band"
+    );
+
+    // Without --no-llm the ambiguous track goes to the matcher through
+    // the fake ccc. One whose `which` cannot resolve the agent refuses the
+    // run before any batch.
+    let fake = tmp.path().join("fake-ccc");
+    std::fs::create_dir_all(&fake).expect("fake dir");
+    let llm_cmd = |script: &Path| {
+        let mut cmd = sss(tmp.path());
+        cmd.env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+            .env("SSS_CCC", script)
+            .args(["--repo", repo, "--profile", "alice", "match", "--json"]);
+        cmd
+    };
+    let unresolved = write_fake_ccc(&fake, "unresolved", 2);
+    let out = llm_cmd(&unresolved).assert().code(1).get_output().clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kind"], "config", "{doc}");
+    assert!(doc["error"].as_str().unwrap().contains("exit 2"), "{doc}");
+    assert_eq!(std::fs::read_to_string(fake.join("count")).ok(), None);
+    for log in ["argv", "env"] {
+        std::fs::remove_file(fake.join(log)).expect("clear the log");
+    }
+
+    // A malformed first reply is sent back with the complaint; the second
+    // is taken.
+    let reply = |result: &str| serde_json::json!({"session": "sess-1", "result": result});
+    std::fs::write(
+        fake.join("out1"),
+        reply("Here you go: {\"decisions\": []}").to_string(),
+    )
+    .expect("reply 1");
+    std::fs::write(
+        fake.join("out2"),
+        reply(
+            "```json\n{\"decisions\":[{\"item\":\"TR:3\",\"choice\":\"spotify:track:t2\",\
+             \"confidence\":\"medium\",\"reason\":\"the same song\"}]}\n```",
+        )
+        .to_string(),
+    )
+    .expect("reply 2");
+    let good = write_fake_ccc(&fake, "good", 0);
+    let out = llm_cmd(&good).assert().code(0).get_output().clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kinds"]["tracks"]["processed"], 1, "{doc}");
+    assert_eq!(doc["kinds"]["tracks"]["by_method"]["llm"], 1);
+    assert_eq!(doc["kinds"]["tracks"]["llm_batches"], 1);
+    let argv = std::fs::read_to_string(fake.join("argv")).expect("argv log");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(argv[0], "which music-matcher");
+    assert!(
+        argv[1].starts_with("run music-matcher --json --cwd "),
+        "{argv:?}"
+    );
+    assert_eq!(
+        argv[2],
+        "resume sess-1 --json no decision for TR:3. Reply with only the JSON object, nothing else."
+    );
+    let agents_config = tmp.path().join("streaming-service-sync/ccc/agents.toml");
+    let env = std::fs::read_to_string(fake.join("env")).expect("env log");
+    assert!(env.lines().all(|l| Path::new(l) == agents_config), "{env}");
+    let entries =
+        std::fs::read_to_string(Path::new(repo).join("profiles/alice/matches/tracks.jsonl"))
+            .expect("match file");
+    let last: serde_json::Value =
+        serde_json::from_str(entries.lines().last().expect("an entry")).expect("json");
+    assert_eq!(last["pandora_id"], "TR:3");
+    assert_eq!(last["status"], "matched");
+    assert_eq!(last["spotify_uri"], "spotify:track:t2");
+    assert_eq!(last["method"], "llm");
+    assert_eq!(last["session"], "sess-1");
+    assert_eq!(last["reason"], "the same song");
+    assert!(
+        Path::new(repo)
+            .join("profiles/alice/matches/llm/sess-1.json")
+            .exists()
+    );
+    for mock in &third {
+        mock.assert_calls(1);
+    }
+}
+
+/// Writes a fake `ccc` named `name` into `dir`: it logs its arguments and
+/// `CCC_AGENTS_CONFIG`, exits `which_exit` for `which`, and otherwise
+/// prints `outN` and exits `exitN` (default 0) on its Nth call.
+fn write_fake_ccc(dir: &Path, name: &str, which_exit: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let d = dir.display();
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{d}/argv'\n\
+             printf '%s\\n' \"$CCC_AGENTS_CONFIG\" >> '{d}/env'\n\
+             if [ \"$1\" = which ]; then echo 'no definition for agent type' >&2; exit {which_exit}; fi\n\
+             n=$(( $(cat '{d}/count' 2>/dev/null || echo 0) + 1 ))\n\
+             echo $n > '{d}/count'\n\
+             cat \"{d}/out$n\" 2>/dev/null\n\
+             exit $(cat \"{d}/exit$n\" 2>/dev/null || echo 0)\n"
+        ),
+    )
+    .expect("write fake ccc");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// A track as `tracks.json` holds it, by The Band.
+fn track_json(id: &str, title: &str) -> serde_json::Value {
+    serde_json::json!({"pandora_id": id, "music_id": null, "title": title,
+        "artist": "The Band", "album": null, "duration_s": 200, "track_num": null,
+        "disc_num": null, "explicit_hint": false, "isrc": null,
+        "artist_pandora_id": null, "album_pandora_id": null})
+}
+
+/// Writes profile alice's normalized export: one station whose feedback is
+/// `thumbs` (`(track id, title, positive)`), each track in `tracks.json`.
+fn write_export(repo: &str, thumbs: &[(&str, &str, bool)]) {
+    let feedback: Vec<_> = thumbs
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _, positive))| {
+            serde_json::json!({"feedback_id": format!("F{i}"), "track_pandora_id": id,
+                "positive": positive, "created": null, "station_id": "1"})
+        })
+        .collect();
+    let tracks: serde_json::Map<_, _> = thumbs
+        .iter()
+        .map(|(id, title, _)| ((*id).to_owned(), track_json(id, title)))
+        .collect();
+    let pandora = Path::new(repo).join("profiles/alice/pandora");
+    std::fs::create_dir_all(&pandora).expect("pandora dir");
+    let files = [
+        (
+            "stations.json",
+            serde_json::json!([{"station_id": "1", "pandora_id": "ST:1", "name": "Station",
+                "created": null, "last_played": null, "is_thumbprint": false,
+                "is_shuffle": false, "genres": [], "positive_feedback_count": null,
+                "negative_feedback_count": null, "seeds": [], "feedback": feedback}]),
+        ),
+        ("playlists.json", serde_json::json!([])),
+        (
+            "collection.json",
+            serde_json::json!({"tracks": [], "albums": [], "artists": []}),
+        ),
+        (
+            "bookmarks.json",
+            serde_json::json!({"tracks": [], "albums": []}),
+        ),
+        ("tracks.json", serde_json::Value::Object(tracks)),
+    ];
+    for (name, value) in files {
+        std::fs::write(pandora.join(name), value.to_string()).expect("write export");
+    }
+}
+
+#[test]
+fn match_review_lists_only_what_the_push_switches_select() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    write_export(
+        repo,
+        &[("TR:1", "Liked", true), ("TR:2", "Disliked", false)],
+    );
+    let matches = Path::new(repo).join("profiles/alice/matches");
+    std::fs::create_dir_all(&matches).expect("matches dir");
+    let entries: String = ["TR:1", "TR:2"]
+        .iter()
+        .map(|id| {
+            format!(
+                "{}\n",
+                serde_json::json!({"pandora_id": id, "status": "unmatched",
+                    "decided_at": "2026-10-15T00:00:00Z"})
+            )
+        })
+        .collect();
+    std::fs::write(matches.join("tracks.jsonl"), entries).expect("write matches");
+    let review = |thumbs_down_playlist: bool| {
+        std::fs::write(
+            Path::new(repo).join("config.toml"),
+            format!("[push]\nthumbs_down_playlist = {thumbs_down_playlist}\n"),
+        )
+        .expect("write config");
+        let out = sss(tmp.path())
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "match",
+                "review",
+                "--json",
+            ])
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let doc = json_document(&out.stdout);
+        let ids: Vec<String> = doc["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["pandora_id"].as_str().expect("id").to_owned())
+            .collect();
+        ids
+    };
+    // Push sends no thumbs-down track with the switch off, so there is
+    // nothing to decide about one.
+    assert_eq!(review(false), ["TR:1"]);
+    assert_eq!(review(true), ["TR:1", "TR:2"]);
+}
+
+#[test]
+fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
+    const TRACK: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+
+    write_export(repo, &[("TR:1", "First", true)]);
+    sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "match",
+            "set",
+            "TR:1",
+            TRACK,
+        ])
+        .assert()
+        .code(0);
+    let state_dir = tmp.path().join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "scopes": ["playlist-modify-private", "user-library-modify"]}})
+        .to_string(),
+    )
+    .expect("write token");
+    let push = |extra: &[&str]| {
+        let out = sss(tmp.path())
+            .env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+            .args(["--repo", repo, "--profile", "alice", "push", "--json"])
+            .args(extra)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        json_document(&out.stdout)
+    };
+    let ledger = Path::new(repo).join("profiles/alice/spotify/state.json");
+
+    let mut any = server.mock(|_, then| {
+        then.status(500);
+    });
+    let doc = push(&["--dry-run"]);
+    any.assert_calls(0);
+    any.delete();
+    assert_eq!(doc["command"], "push");
+    assert_eq!(doc["dry_run"], true);
+    let planned = &doc["parts"]["stations"]["playlists"][0];
+    assert_eq!(planned["key"], "ST:1");
+    assert_eq!(planned["action"], "create");
+    assert_eq!(planned["to_add"], 1);
+    assert_eq!(planned["added"], 0);
+    assert!(!ledger.exists(), "a dry run writes no ledger");
+
+    let create = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/me/playlists")
+            .header("authorization", "Bearer access-secret");
+        then.status(201)
+            .json_body(serde_json::json!({"id": "pl1", "snapshot_id": "s0"}));
+    });
+    let add = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/playlists/pl1/items")
+            .json_body(serde_json::json!({ "uris": [TRACK] }));
+        then.status(201)
+            .json_body(serde_json::json!({"snapshot_id": "s1"}));
+    });
+    let items = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/playlists/pl1/items");
+        then.status(200)
+            .json_body(serde_json::json!({"items": [{"item": {"uri": TRACK}}], "next": null}));
+    });
+
+    let doc = push(&[]);
+    assert_eq!(doc["dry_run"], false);
+    let pushed = &doc["parts"]["stations"]["playlists"][0];
+    assert_eq!(pushed["action"], "create");
+    assert_eq!(pushed["added"], 1);
+    assert_eq!(pushed["spotify_id"], "pl1");
+    create.assert_calls(1);
+    add.assert_calls(1);
+    items.assert_calls(0);
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger).expect("ledger")).expect("json");
+    assert_eq!(state["playlists"]["ST:1"]["status"], "created");
+    assert_eq!(state["playlists"]["ST:1"]["spotify_id"], "pl1");
+
+    let doc = push(&[]);
+    let again = &doc["parts"]["stations"]["playlists"][0];
+    assert_eq!(again["action"], "skip");
+    assert_eq!(again["added"], 0);
+    create.assert_calls(1);
+    add.assert_calls(1);
+    items.assert_calls(1);
+}
+
+#[test]
+fn report_writes_the_profile_report_and_prints_its_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    write_export(
+        repo,
+        &[("TR:1", "Liked", true), ("TR:2", "Disliked", false)],
+    );
+    let path = Path::new(repo).join("profiles/alice/report.md");
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "report", "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "report");
+    assert_eq!(doc["path"], path.to_str().expect("utf-8 path"));
+    let report = std::fs::read_to_string(&path).expect("report.md");
+    assert!(
+        report.starts_with("# Pandora to Spotify: alice\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains("\"Disliked\" by The Band: [search]("),
+        "{report}"
+    );
+
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "report"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", path.display())
+    );
 }

@@ -1,4 +1,5 @@
-//! Per-profile credentials, such as the Pandora session, under
+//! Per-profile credentials — the Pandora session, the Spotify token and a
+//! Spotify sign-in in progress — under
 //! `$XDG_STATE_HOME/streaming-service-sync/<profile>/`.
 //! The directory is mode 0700 and every file in it 0600; nothing here is
 //! ever written inside the data repository.
@@ -15,13 +16,20 @@ use serde::{Deserialize, Serialize};
 use crate::error::Kind;
 use crate::fail;
 use crate::repo::{self, APP_DIR};
+use crate::spotify::auth::{Pending, StoredToken, Token};
 
 /// File name of the stored Pandora session inside a profile's state dir.
 pub const PANDORA_SESSION_FILE: &str = "pandora-session.json";
 
+/// File name of the stored Spotify token inside a profile's state dir.
+pub const SPOTIFY_TOKEN_FILE: &str = "spotify-token.json";
+
+/// File name of a Spotify sign-in between its two steps.
+pub const SPOTIFY_PENDING_FILE: &str = "spotify-auth-pending.json";
+
 /// Every credential file a profile's state directory can hold; a directory
 /// under the state root holding at least one of them is a profile.
-pub const CREDENTIAL_FILES: &[&str] = &[PANDORA_SESSION_FILE];
+pub const CREDENTIAL_FILES: &[&str] = &[PANDORA_SESSION_FILE, SPOTIFY_TOKEN_FILE];
 
 /// The state root, `$XDG_STATE_HOME/streaming-service-sync/`, holding one
 /// directory per profile.
@@ -128,6 +136,56 @@ impl StateDir {
             &self.pandora_session_path(),
             repo::to_json(session)?.as_bytes(),
         )
+    }
+
+    pub fn spotify_token_path(&self) -> PathBuf {
+        self.dir.join(SPOTIFY_TOKEN_FILE)
+    }
+
+    /// The stored Spotify token, `None` when there is none.
+    pub fn load_spotify_token(&self) -> Result<Option<StoredToken>> {
+        repo::read_json_opt(&self.spotify_token_path())
+    }
+
+    /// Replaces the stored Spotify token, stamped with the current time.
+    pub fn save_spotify_token(&self, token: &Token) -> Result<StoredToken> {
+        let stored = StoredToken {
+            stored_at: repo::now_rfc3339()?,
+            token: token.clone(),
+        };
+        self.write_private(
+            &self.spotify_token_path(),
+            repo::to_json(&stored)?.as_bytes(),
+        )?;
+        Ok(stored)
+    }
+
+    pub fn spotify_pending_path(&self) -> PathBuf {
+        self.dir.join(SPOTIFY_PENDING_FILE)
+    }
+
+    /// The Spotify sign-in in progress, `None` when there is none.
+    pub fn load_spotify_pending(&self) -> Result<Option<Pending>> {
+        repo::read_json_opt(&self.spotify_pending_path())
+    }
+
+    /// Replaces the Spotify sign-in in progress.
+    pub fn save_spotify_pending(&self, pending: &Pending) -> Result<()> {
+        self.write_private(
+            &self.spotify_pending_path(),
+            repo::to_json(pending)?.as_bytes(),
+        )
+    }
+
+    /// Removes the Spotify sign-in in progress; none is not an error.
+    pub fn delete_spotify_pending(&self) -> Result<()> {
+        let path = self.spotify_pending_path();
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Atomically replaces `path` (inside this directory) with a 0600 file,
@@ -323,6 +381,48 @@ mod tests {
         std::os::unix::fs::symlink(&file, &file).unwrap();
         let err = format!("{:#}", StateRoot::at(tmp.path()).profiles().unwrap_err());
         assert!(err.contains(&dir.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_spotify_token_alone_makes_a_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StateRoot::at(tmp.path());
+        let state = root.profile("dave").unwrap();
+        assert_eq!(state.load_spotify_token().unwrap(), None);
+        let token = Token {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: "2026-10-15T01:00:00Z".into(),
+            scopes: vec![],
+        };
+        let stored = state.save_spotify_token(&token).unwrap();
+        assert_eq!(stored.token, token);
+        assert_eq!(state.load_spotify_token().unwrap(), Some(stored));
+        assert_eq!(mode(&state.spotify_token_path()), 0o600);
+        assert_eq!(mode(state.dir()), 0o700);
+        assert_eq!(root.profiles().unwrap(), ["dave"]);
+    }
+
+    #[test]
+    fn deleting_a_missing_pending_sign_in_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::under(tmp.path(), "alice").unwrap();
+        state.delete_spotify_pending().unwrap();
+        // A pending sign-in alone does not make a profile.
+        state
+            .save_spotify_pending(&Pending {
+                client_id: "test-client-id".into(),
+                redirect_uri: "https://127.0.0.1/callback".into(),
+                scopes: vec![],
+                state: "s".into(),
+                verifier: "v".into(),
+                created_at: "2026-10-15T00:00:00Z".into(),
+            })
+            .unwrap();
+        assert_eq!(mode(&state.spotify_pending_path()), 0o600);
+        assert!(StateRoot::at(tmp.path()).profiles().unwrap().is_empty());
+        state.delete_spotify_pending().unwrap();
+        assert!(!state.spotify_pending_path().exists());
     }
 
     #[test]

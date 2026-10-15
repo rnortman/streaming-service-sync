@@ -1,11 +1,13 @@
 //! Values pasted or piped to `sss`: the one rule every sign-in reads them
 //! by.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::error::{Kind, WithKind};
+use crate::fail;
 
 /// The trimmed, non-empty `lines` joined with no separator: a value copied
 /// across several lines, whole.
@@ -40,6 +42,37 @@ pub fn read_pasted(input: &mut dyn BufRead) -> Result<String> {
         }
         lines.push(line);
     }
+}
+
+/// A value read whole from `from_file` when given, else pasted on `input`
+/// ([`read_pasted`]) after writing `prompt_text` to `prompt`; either way its
+/// lines are joined by [`join_pasted`]. Nothing given is a [`Kind::Input`]
+/// error naming `what`.
+pub fn read_value(
+    from_file: Option<&Path>,
+    input: &mut dyn BufRead,
+    prompt: &mut dyn Write,
+    prompt_text: &str,
+    what: &str,
+) -> Result<String> {
+    let value = match from_file {
+        Some(path) => {
+            let text = pasted_text(std::fs::read_to_string(path), || {
+                format!("reading {}", path.display())
+            })?;
+            join_pasted(text.lines())
+        }
+        None => {
+            // The prompt is for people: a failed write of it does not stop
+            // the read.
+            let _ = write!(prompt, "{prompt_text}").and_then(|()| prompt.flush());
+            read_pasted(input)?
+        }
+    };
+    if value.is_empty() {
+        fail!(Kind::Input, "no {what} given");
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

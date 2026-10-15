@@ -5,8 +5,7 @@
 //! success, a failed step, or a rejected session.
 
 use std::fmt;
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -14,6 +13,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::error::{Kind, WithKind};
+use crate::http::{self, Pacer};
 use crate::repo;
 use crate::secrets::PandoraSession;
 
@@ -173,10 +173,6 @@ fn transport_warning(path: &str, attempt: u32, error: &anyhow::Error) -> String 
     )
 }
 
-fn print_warning(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{line}");
-}
-
 /// A paced Pandora API client for one session.
 pub struct Client {
     agent: ureq::Agent,
@@ -184,9 +180,10 @@ pub struct Client {
     auth_token: String,
     csrf_token: String,
     timing: Timing,
-    last_start: Option<Instant>,
+    pacer: Pacer,
     requests: u32,
-    /// Receives each warning line; [`print_warning`] writes it to stderr.
+    /// Receives each warning line; [`http::print_warning`] writes it to
+    /// stderr.
     warn: fn(&str),
 }
 
@@ -194,25 +191,20 @@ impl Client {
     /// A client for `base_url` (an origin such as [`DEFAULT_BASE_URL`]).
     pub fn new(base_url: &str, session: &PandoraSession, timing: Timing) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(60))
-                .build(),
+            agent: http::agent(),
             base: base_url.trim_end_matches('/').to_owned(),
             auth_token: session.auth_token.clone(),
             csrf_token: session.csrf_token.clone(),
             timing,
-            last_start: None,
+            pacer: Pacer::new(timing.min_interval),
             requests: 0,
-            warn: print_warning,
+            warn: http::print_warning,
         }
     }
 
     /// A live-paced client for `$SSS_PANDORA_BASE_URL`, else the live API.
     pub fn from_env(session: &PandoraSession) -> Self {
-        let base = std::env::var(BASE_URL_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+        let base = http::base_url_from_env(BASE_URL_ENV, DEFAULT_BASE_URL);
         Self::new(&base, session, Timing::LIVE)
     }
 
@@ -238,7 +230,7 @@ impl Client {
                 std::thread::sleep(backoff);
                 backoff = backoff.saturating_mul(2);
             }
-            self.pace();
+            self.pacer.pace();
             let at = repo::now_rfc3339()?;
             let (status, text) = match self.send(path, body) {
                 Ok(reply) => reply,
@@ -286,18 +278,6 @@ impl Client {
         unreachable!("the last attempt always returns")
     }
 
-    /// Sleeps until `min_interval` has passed since the previous request
-    /// started.
-    fn pace(&mut self) {
-        if let Some(last) = self.last_start {
-            let elapsed = last.elapsed();
-            if elapsed < self.timing.min_interval {
-                std::thread::sleep(self.timing.min_interval - elapsed);
-            }
-        }
-        self.last_start = Some(Instant::now());
-    }
-
     /// One HTTP exchange: the status and the body text, whatever the status.
     fn send(&self, path: &str, body: &Value) -> Result<(u16, String)> {
         let url = format!("{}/api/{path}", self.base);
@@ -313,17 +293,8 @@ impl Client {
             .set("X-CsrfToken", &self.csrf_token)
             .set("Cookie", &format!("csrftoken={}", self.csrf_token))
             .send_string(&body.to_string());
-        let response = match result {
-            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-            Err(ureq::Error::Transport(t)) => return Err(anyhow!(t)),
-        };
-        let status = response.status();
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut bytes)
-            .context("reading the response")?;
-        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+        let reply = http::read(result)?;
+        Ok((reply.status, reply.body))
     }
 }
 
@@ -333,6 +304,7 @@ mod tests {
     use crate::pandora::test_support::{FAST, session};
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::time::Instant;
 
     /// Posts once to `path` on `server`, returning the reply and the
     /// serialized exchanges recorded.

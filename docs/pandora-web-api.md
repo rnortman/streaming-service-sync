@@ -104,11 +104,12 @@ own and are skipped.
 Paged by `offset` until a page returns fewer than `limit` items. The
 response is `items[]` (each with `pandoraId` `PL:…`) and
 `annotations{"PL:…": {…}}`. The annotation carries the playlist's `name`,
-`description`, `version` and, for a playlist Pandora maintains rather than
-one the listener assembled, `linkedType` (`sss` also takes the creation
-time from `timeCreated`, not yet checked against a live response):
-`StationThumbs` (one station's thumbs up), `MyThumbsUp` (all thumbs up),
-`Personalized`, `SharedListening`, and possibly others.
+`description`, `version`, its creation time `timeCreated`, and
+`linkedType`. For a playlist the listener assembled, `linkedType` is the
+string `"None"`, which `sss` normalizes to `null`; for one Pandora
+maintains it names the kind: `StationThumbs` (one station's thumbs up),
+`MyThumbsUp` (all thumbs up), `Personalized`, `SharedListening`,
+`Curated`, and possibly others.
 
 `v7/playlists/getTracks`
 
@@ -164,16 +165,16 @@ records lack. `sss` reads these fields from a track annotation:
 | `artistName`, `artistId` | artist name and `AR:…` id |
 | `albumName`, `albumId` | album name and `AL:…` id |
 | `trackNumber` | position on the album |
-| `duration` | length in seconds |
+| `duration` | length in seconds (`durationMillis` accompanies it in milliseconds) |
 | `isrc` | the recording's ISRC |
-| `explicitness` | `EXPLICIT` for explicit tracks; other values are not explicit |
+| `explicitness` | `NONE`, `EXPLICIT` or `CLEAN`; only `EXPLICIT` is explicit |
 
-Album annotations (`AL:…`) supply `name`, `artistName` and `artistId`;
-artist annotations (`AR:…`) supply `name`. The field names in this table,
-the value set of `explicitness`, and whether `annotateObjects` track
-annotations carry `isrc` have not yet been checked against a live
-response; the raw run keeps every annotation in full, so a correction
-needs only `sss pandora normalize`.
+Every field in this table has been seen in live `getTracks` and
+`annotateObjects` responses; `annotateObjects` track annotations carry
+`isrc` too. Album annotations (`AL:…`) supply `name`, `artistName` and
+`artistId`; artist annotations (`AR:…`) supply `name`. The raw run keeps
+every annotation in full, so a correction needs only `sss pandora
+normalize`.
 
 ## Bookmarks
 

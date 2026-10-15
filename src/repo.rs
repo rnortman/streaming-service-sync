@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -323,9 +323,8 @@ pub fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 }
 
 /// Appends `value` to the JSONL file at `path` as one line. A torn tail (see
-/// [`split_torn_tail`]) is printed to stderr and cut off first, so the new
-/// record never fuses with it; a complete final record missing its newline
-/// gets one.
+/// [`split_torn_tail`]) is an error, the file left unchanged; a complete
+/// final record missing its newline gets one.
 pub fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
     let record = serde_json::to_string(value).context("serializing JSON")?;
     let dir = parent_dir(path);
@@ -338,21 +337,15 @@ pub fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     let mut line = String::with_capacity(record.len() + 2);
     if !ends_terminated(&mut file).with_context(|| format!("reading {}", path.display()))? {
-        // Only a file whose last write was interrupted gets here, so reading
-        // it whole is rare.
+        // Only a file whose last write was interrupted or that was edited by
+        // hand gets here, so reading it whole is rare.
         let mut text = Vec::new();
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.read_to_end(&mut text))
             .with_context(|| format!("reading {}", path.display()))?;
         let (body, torn) = split_torn_tail(&text);
         if !torn.is_empty() {
-            let _ = writeln!(
-                io::stderr(),
-                "{}",
-                torn_tail_warning(path, torn, "removing")
-            );
-            file.set_len(body.len() as u64)
-                .with_context(|| format!("repairing {}", path.display()))?;
+            bail!(torn_tail_error(path, body, torn));
         }
         if !body.is_empty() && !body.ends_with(b"\n") {
             line.push('\n');
@@ -392,11 +385,14 @@ fn split_torn_tail(text: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// The stderr line reporting a torn tail being skipped or removed. It quotes
-/// the bytes in full so a hand-edited line cut by mistake can be restored.
-fn torn_tail_warning(path: &Path, torn: &[u8], action: &str) -> String {
+/// The error refusing a torn tail: the file, the tail's 1-based line number
+/// and its bytes, quoted in full so a hand-edited line cut by mistake can be
+/// restored.
+fn torn_tail_error(path: &Path, body: &[u8], torn: &[u8]) -> String {
+    let line = body.iter().filter(|&&b| b == b'\n').count() + 1;
     format!(
-        "warning: {}: {action} an incomplete final line ({} bytes, not valid JSON): {:?}",
+        "{} line {line}: the final line is incomplete ({} bytes, not valid JSON): {:?}; \
+         remove it by hand, then re-run",
         path.display(),
         torn.len(),
         String::from_utf8_lossy(torn)
@@ -405,8 +401,8 @@ fn torn_tail_warning(path: &Path, torn: &[u8], action: &str) -> String {
 
 /// Reads every record of the JSONL file at `path`, in file order. A missing
 /// file has no records. Blank lines are skipped; a torn tail (see
-/// [`split_torn_tail`]) is skipped with a warning on stderr; any other
-/// unparseable line is an error naming its line number.
+/// [`split_torn_tail`]) or any other unparseable line is an error naming its
+/// line number.
 pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
@@ -415,11 +411,7 @@ pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     };
     let (body, torn) = split_torn_tail(&bytes);
     if !torn.is_empty() {
-        let _ = writeln!(
-            io::stderr(),
-            "{}",
-            torn_tail_warning(path, torn, "skipping")
-        );
+        bail!(torn_tail_error(path, body, torn));
     }
     let text = std::str::from_utf8(body).with_context(|| format!("reading {}", path.display()))?;
     let mut records = Vec::new();
@@ -672,8 +664,27 @@ mod tests {
         assert_eq!(latest["TR:2"].status, "unmatched");
     }
 
+    /// Asserts that reading and appending both refuse `path`'s torn tail
+    /// `torn` on line `line`, and that the file is left as it was.
+    fn assert_torn_tail_refused(path: &Path, line: usize, torn: &[u8]) {
+        let before = fs::read(path).unwrap();
+        let expected = format!(
+            "{} line {line}: the final line is incomplete ({} bytes, not valid JSON): {:?}; \
+             remove it by hand, then re-run",
+            path.display(),
+            torn.len(),
+            String::from_utf8_lossy(torn)
+        );
+        let err = read_jsonl::<Entry>(path).unwrap_err();
+        assert_eq!(format!("{err:#}"), expected);
+        assert_eq!(crate::error::kind(&err), Kind::Other);
+        let err = append_jsonl(path, &entry("TR:2", "matched")).unwrap_err();
+        assert_eq!(format!("{err:#}"), expected);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     #[test]
-    fn jsonl_torn_tail_is_skipped_and_cut_on_append() {
+    fn jsonl_torn_tail_is_refused_on_read_and_append() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("t.jsonl");
         fs::write(
@@ -681,20 +692,7 @@ mod tests {
             "{\"pandora_id\":\"TR:1\",\"status\":\"matched\"}\n{\"pandora_id\":\"TR:",
         )
         .unwrap();
-        assert_eq!(
-            read_jsonl::<Entry>(&path).unwrap(),
-            [entry("TR:1", "matched")]
-        );
-        append_jsonl(&path, &entry("TR:2", "matched")).unwrap();
-        assert_eq!(
-            read_jsonl::<Entry>(&path).unwrap(),
-            [entry("TR:1", "matched"), entry("TR:2", "matched")]
-        );
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "{\"pandora_id\":\"TR:1\",\"status\":\"matched\"}\n\
-             {\"pandora_id\":\"TR:2\",\"status\":\"matched\"}\n"
-        );
+        assert_torn_tail_refused(&path, 2, b"{\"pandora_id\":\"TR:");
     }
 
     #[test]
@@ -719,21 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_torn_tail_cut_mid_character_is_skipped() {
+    fn jsonl_torn_tail_cut_mid_character_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("t.jsonl");
-        let mut bytes = b"{\"pandora_id\":\"TR:1\",\"status\":\"matched\"}\n{\"x\":\"".to_vec();
+        let mut bytes = b"{\"pandora_id\":\"TR:1\",\"status\":\"matched\"}\n\n{\"x\":\"".to_vec();
         bytes.push("é".as_bytes()[0]);
         fs::write(&path, &bytes).unwrap();
-        assert_eq!(
-            read_jsonl::<Entry>(&path).unwrap(),
-            [entry("TR:1", "matched")]
-        );
-        append_jsonl(&path, &entry("TR:2", "matched")).unwrap();
-        assert_eq!(
-            read_jsonl::<Entry>(&path).unwrap(),
-            [entry("TR:1", "matched"), entry("TR:2", "matched")]
-        );
+        assert_torn_tail_refused(&path, 3, &bytes[bytes.len() - 7..]);
     }
 
     #[test]
@@ -750,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_hand_edited_unterminated_tail_is_quoted_in_the_warning() {
+    fn jsonl_hand_edited_unterminated_tail_is_quoted_in_the_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("t.jsonl");
         let typo = "{\"pandora_id\":\"TR:2\",\"status\":\"manual\",}";
@@ -759,17 +749,9 @@ mod tests {
             format!("{{\"pandora_id\":\"TR:1\",\"status\":\"matched\"}}\n{typo}"),
         )
         .unwrap();
-        let bytes = fs::read(&path).unwrap();
-        let (_, torn) = split_torn_tail(&bytes);
-        assert_eq!(torn, typo.as_bytes());
-        assert_eq!(
-            torn_tail_warning(&path, torn, "removing"),
-            format!(
-                "warning: {}: removing an incomplete final line ({} bytes, not valid JSON): {typo:?}",
-                path.display(),
-                typo.len()
-            )
-        );
+        let err = format!("{:#}", read_jsonl::<Entry>(&path).unwrap_err());
+        assert!(err.contains(&format!("{typo:?}")), "{err}");
+        assert_torn_tail_refused(&path, 2, typo.as_bytes());
     }
 
     #[test]
