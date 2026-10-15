@@ -6,6 +6,8 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
 ### Added
 
 - **Matching without `ccc`.** `sss match questions` prints, as one JSON
