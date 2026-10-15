@@ -6,6 +6,8 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
 ### Added
 
 - **Push to Spotify.** `sss push --profile NAME` copies a family member's
