@@ -10,8 +10,13 @@ use serde::Serialize;
 use crate::config::{self, Config};
 use crate::error::{self, ExportRun, Kind};
 use crate::fail;
+use crate::guide::{self, GuideReport};
+use crate::input;
 use crate::matching::llm;
-use crate::matching::run::{self as matching, MatchReport, MatchSetReport, ReviewReport};
+use crate::matching::run::{
+    self as matching, AnswerReport, DecisionsRefused, MatchReport, MatchSetReport, QuestionsReport,
+    ReviewReport,
+};
 use crate::pandora::auth::{self, AuthReport};
 use crate::pandora::client::Client;
 use crate::pandora::export::{self, ExportIncomplete, ExportReport, Manifest};
@@ -66,6 +71,12 @@ pub enum Command {
     Status,
     /// Write the profile's report.md and print its path
     Report,
+    /// Print the guide for an agent operating `sss`, or the matching protocol
+    Guide {
+        /// Which document [default: agent]
+        #[arg(value_enum)]
+        topic: Option<guide::Topic>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,11 +147,32 @@ impl From<MatchKind> for IdKind {
 
 #[derive(Debug, Subcommand)]
 pub enum MatchCommand {
-    /// List unmatched and low-confidence items with their top candidates
+    /// List unmatched, ambiguous, failed and low-confidence items with their
+    /// top candidates
     Review {
         /// Review only this kind of entity
         #[arg(long, value_enum)]
         only: Option<MatchKind>,
+    },
+    /// Print the items awaiting an LLM decision, with every candidate, as one
+    /// JSON document; contacts nothing
+    Questions {
+        /// List only this kind of entity
+        #[arg(long, value_enum)]
+        only: Option<MatchKind>,
+        /// List at most N items
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// Record decisions for open items from a `{"decisions":[…]}` document
+    /// (pasted up to an empty line, or --from-file)
+    Answer {
+        /// Read the decisions document from a file instead
+        #[arg(long, value_name = "FILE")]
+        from_file: Option<PathBuf>,
+        /// Record at most the first N decisions
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
     /// Record a manual match
     Set {
@@ -190,6 +222,9 @@ impl From<PushPart> for push::Part {
     }
 }
 
+/// What `sss match answer` writes to stderr before reading stdin.
+pub const ANSWER_PROMPT: &str = "Paste the decisions JSON, then an empty line:\n";
+
 /// The README `sss init` writes into the data repository.
 pub const DATA_README: &str = "\
 # streaming-service-sync data repository
@@ -229,6 +264,14 @@ impl Command {
                 ..
             }) => "match review",
             Command::Match(MatchArgs {
+                command: Some(MatchCommand::Questions { .. }),
+                ..
+            }) => "match questions",
+            Command::Match(MatchArgs {
+                command: Some(MatchCommand::Answer { .. }),
+                ..
+            }) => "match answer",
+            Command::Match(MatchArgs {
                 command: Some(MatchCommand::Set { .. }),
                 ..
             }) => "match set",
@@ -239,14 +282,18 @@ impl Command {
             Command::Push(_) => "push",
             Command::Status => "status",
             Command::Report => "report",
+            Command::Guide { .. } => "guide",
         }
     }
 
     /// Whether the command acts on one profile and so needs `--profile` or a
     /// single known profile. `status` covers every profile when none is
-    /// named.
+    /// named; `init` and `guide` act on none.
     fn needs_profile(&self) -> bool {
-        !matches!(self, Command::Init | Command::Status)
+        !matches!(
+            self,
+            Command::Init | Command::Status | Command::Guide { .. }
+        )
     }
 }
 
@@ -262,10 +309,13 @@ pub enum Output {
     SpotifyAuth(spotify::auth::AuthReport),
     Match(MatchReport),
     MatchReview(ReviewReport),
+    MatchQuestions(QuestionsReport),
+    MatchAnswer(AnswerReport),
     MatchSet(MatchSetReport),
     Push(PushReport),
     Report(ReportFile),
     Status(StatusReport),
+    Guide(GuideReport),
 }
 
 impl Output {
@@ -279,10 +329,13 @@ impl Output {
             Output::SpotifyAuth(r) => r.write_text(out),
             Output::Match(r) => r.write_text(out),
             Output::MatchReview(r) => r.write_text(out),
+            Output::MatchQuestions(r) => r.write_text(out),
+            Output::MatchAnswer(r) => r.write_text(out),
             Output::MatchSet(r) => r.write_text(out),
             Output::Push(r) => r.write_text(out),
             Output::Report(r) => r.write_text(out),
             Output::Status(r) => r.write_text(out),
+            Output::Guide(r) => r.write_text(out),
         }
     }
 }
@@ -307,10 +360,13 @@ struct FailureDocument<'a> {
     details: Option<Details<'a>>,
 }
 
-/// The `details` of a failed `pandora export`.
+/// The `details` of a failed `pandora export` or a refused `match answer`.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Details<'a> {
+    Refused {
+        problems: &'a [llm::Problem],
+    },
     Incomplete {
         run_id: &'a str,
         run_dir: &'a Path,
@@ -350,7 +406,7 @@ fn render(cli: &Cli, output: &Output) -> Result<Vec<u8>> {
 
 /// Under `--json`, writes the error object of `err` to `out`; without it,
 /// writes nothing. The `error: …` line on stderr is the caller's.
-pub fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Result<()> {
+fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Result<()> {
     if !cli.json {
         return Ok(());
     }
@@ -365,7 +421,12 @@ pub fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Re
             failed_steps: i.failed_steps(),
             manifest: &i.0.manifest,
         }),
-        None => None,
+        None => err
+            .chain()
+            .find_map(|e| e.downcast_ref::<DecisionsRefused>())
+            .map(|r| Details::Refused {
+                problems: &r.problems,
+            }),
     };
     let mut document = FailureDocument {
         ok: false,
@@ -387,19 +448,21 @@ pub fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Re
 }
 
 /// Runs the parsed command line against the profiles' state directories
-/// under `state_root`. Pasted values are read from `input`; the result goes
-/// to `out`, as text or, with `--json`, as one JSON document; prompts,
-/// progress and warnings go to `err`, and a failed write of them is ignored.
+/// under the state root `locate_state` returns, called only by a command
+/// that reads a repository (every one but `guide`). Pasted values are read
+/// from `input`; the result goes to `out`, as text or, with `--json`, as one
+/// JSON document; prompts, progress and warnings go to `err`, and a failed
+/// write of them is ignored.
 /// A failure, including a result that does not serialize, is returned
 /// unchanged after its JSON error object is written to `out` under `--json`.
 pub fn run(
     cli: Cli,
-    state_root: &StateRoot,
+    locate_state: impl FnOnce() -> Result<StateRoot>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<()> {
-    match dispatch(&cli, state_root, input, out, err).and_then(|output| render(&cli, &output)) {
+    match dispatch(&cli, locate_state, input, out, err).and_then(|output| render(&cli, &output)) {
         Ok(bytes) => out.write_all(&bytes).context("writing output"),
         Err(e) => {
             // A failure to write the error object leaves stdout broken;
@@ -412,11 +475,15 @@ pub fn run(
 
 fn dispatch(
     cli: &Cli,
-    state_root: &StateRoot,
+    locate_state: impl FnOnce() -> Result<StateRoot>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Output> {
+    if let Command::Guide { topic } = cli.command {
+        return Ok(Output::Guide(GuideReport::new(topic.unwrap_or_default())));
+    }
+    let state_root = &locate_state()?;
     let repo = Repo::locate(cli.repo.as_deref())?;
     if let Command::Init = cli.command {
         return Ok(Output::Init(init(&repo)?));
@@ -561,6 +628,37 @@ fn dispatch(
         }
         (
             Command::Match(MatchArgs {
+                command: Some(MatchCommand::Questions { only, limit }),
+                ..
+            }),
+            Some(name),
+        ) => {
+            let paths = repo.profile(name)?;
+            let items = matching::select(&model::read(&paths)?, &config.push);
+            Ok(Output::MatchQuestions(matching::questions(
+                &crate::matching::model::read_all_latest(&paths)?,
+                &items,
+                only.map(IdKind::from),
+                *limit,
+            )))
+        }
+        (
+            Command::Match(MatchArgs {
+                command: Some(MatchCommand::Answer { from_file, limit }),
+                ..
+            }),
+            Some(name),
+        ) => {
+            let text =
+                input::read_value(from_file.as_deref(), input, err, ANSWER_PROMPT, "decisions")?;
+            let paths = repo.profile(name)?;
+            let items = matching::select(&model::read(&paths)?, &config.push);
+            Ok(Output::MatchAnswer(matching::answer(
+                &paths, &items, &text, *limit,
+            )?))
+        }
+        (
+            Command::Match(MatchArgs {
                 command:
                     Some(MatchCommand::Set {
                         pandora_id,
@@ -620,9 +718,9 @@ fn dispatch(
         (Command::Status, profile) => Ok(Output::Status(status::status(
             &repo, state_root, &config, profile,
         )?)),
-        // `init` returned above, and every other command has a profile by
-        // now: `--profile`, or the only one.
-        (Command::Init, _) | (_, None) => fail!(
+        // `guide` and `init` returned above, and every other command has a
+        // profile by now: `--profile`, or the only one.
+        (Command::Guide { .. } | Command::Init, _) | (_, None) => fail!(
             Kind::Config,
             "`sss {}` needs --profile NAME",
             cli.command.name()
@@ -748,6 +846,16 @@ mod tests {
         (&["match", "--no-llm", "--limit", "5"], "match"),
         (&["match", "review"], "match review"),
         (&["match", "review", "--only", "tracks"], "match review"),
+        (&["match", "questions"], "match questions"),
+        (
+            &["match", "questions", "--only", "tracks", "--limit", "5"],
+            "match questions",
+        ),
+        (&["match", "answer"], "match answer"),
+        (
+            &["match", "answer", "--from-file", "f", "--limit", "1"],
+            "match answer",
+        ),
         (&["match", "set", "TR:1", "spotify:track:x"], "match set"),
         (&["match", "reject", "TR:1"], "match reject"),
         (&["push"], "push"),
@@ -756,6 +864,8 @@ mod tests {
         (&["push", "--only", "thumbs-down"], "push"),
         (&["status"], "status"),
         (&["report"], "report"),
+        (&["guide"], "guide"),
+        (&["guide", "matching"], "guide"),
     ];
 
     #[test]
@@ -826,11 +936,15 @@ mod tests {
             &["match", "--no-llm", "review"],
             &["match", "--limit", "x"],
             &["match", "--limit", "5", "review"],
+            &["match", "--only", "tracks", "questions"],
+            &["match", "--limit", "5", "answer"],
+            &["match", "answer", "--only", "tracks"],
             &["push", "--only", "everything"],
             &["match", "set", "TR:1"],
             &["spotify", "auth", "--from-file", "f"],
             &["pandora"],
             &["pandora", "import", "b.json"],
+            &["guide", "everything"],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("sss").chain(args.iter().copied())).is_err(),
@@ -921,7 +1035,7 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = run(
             parse(args),
-            state_root,
+            || Ok(state_root.clone()),
             &mut input.as_bytes(),
             &mut out,
             &mut err,
@@ -1076,6 +1190,10 @@ mod tests {
             ("match --no-llm --limit 5", Some(Kind::Other)),
             ("match review", Some(Kind::Other)),
             ("match review --only tracks", Some(Kind::Other)),
+            ("match questions", Some(Kind::Other)),
+            ("match questions --only tracks --limit 5", Some(Kind::Other)),
+            ("match answer", Some(Kind::Input)),
+            ("match answer --from-file f --limit 1", Some(Kind::Other)),
             ("match set TR:1 spotify:track:x", Some(Kind::Input)),
             ("match reject TR:1", None),
             ("push", Some(Kind::Other)),
@@ -1084,6 +1202,8 @@ mod tests {
             ("push --only thumbs-down", Some(Kind::Other)),
             ("status", None),
             ("report", Some(Kind::Other)),
+            ("guide", None),
+            ("guide matching", None),
         ];
         for (args, name) in DOCUMENTED {
             let mut full = with_repo(&repo, args);
@@ -1145,7 +1265,13 @@ mod tests {
         .unwrap();
         let state_root = StateRoot::at(tmp.path().join("state"));
         let mut out = Vec::new();
-        let result = run(cli, &state_root, &mut &b""[..], &mut out, &mut Vec::new());
+        let result = run(
+            cli,
+            || Ok(state_root.clone()),
+            &mut &b""[..],
+            &mut out,
+            &mut Vec::new(),
+        );
         let err = result.unwrap_err();
         assert_eq!(error::kind(&err), Kind::Other);
         let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1193,7 +1319,7 @@ mod tests {
         let mut out = Vec::new();
         let err = run(
             parse(&args),
-            &state_root,
+            || Ok(state_root.clone()),
             &mut &b""[..],
             &mut out,
             &mut crate::pandora::test_support::ClosedPipe,
@@ -1312,7 +1438,13 @@ mod tests {
         let mut input: &[u8] = b"  \n";
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let args = with_repo(&repo, &["pandora", "auth", "--profile", "alice", "--json"]);
-        let result = run(parse(&args), &state_root, &mut input, &mut out, &mut err);
+        let result = run(
+            parse(&args),
+            || Ok(state_root.clone()),
+            &mut input,
+            &mut out,
+            &mut err,
+        );
         // An empty first line ends the paste: no token.
         let e = result.unwrap_err();
         assert_eq!(error::kind(&e), Kind::Input);
@@ -1324,12 +1456,217 @@ mod tests {
         let mut input: &[u8] = b"\nlater\n";
         run(
             parse(&args),
-            &state_root,
+            || Ok(state_root.clone()),
             &mut input,
             &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap_err();
         assert_eq!(input, b"later\n");
+    }
+
+    /// A profile `alice` whose export holds collection track TR:1, matched
+    /// `ambiguous` with candidates a and b.
+    fn questions_fixture(repo: &Repo) {
+        use crate::matching::model::{Candidate, MatchEntry, Status};
+        use crate::pandora::model::{Bookmarks, Collection, Track};
+        let paths = repo.profile("alice").unwrap();
+        let mut tracks = std::collections::BTreeMap::new();
+        tracks.insert(
+            "TR:1".to_owned(),
+            Track {
+                pandora_id: "TR:1".into(),
+                title: Some("Song".into()),
+                artist: Some("The Band".into()),
+                ..Track::default()
+            },
+        );
+        repo::write_json(&paths.stations(), &serde_json::json!([])).unwrap();
+        repo::write_json(&paths.playlists(), &serde_json::json!([])).unwrap();
+        repo::write_json(
+            &paths.collection(),
+            &Collection {
+                tracks: vec!["TR:1".into()],
+                ..Collection::default()
+            },
+        )
+        .unwrap();
+        repo::write_json(&paths.bookmarks(), &Bookmarks::default()).unwrap();
+        repo::write_json(&paths.tracks(), &tracks).unwrap();
+        let candidate = |uri: &str| Candidate {
+            uri: uri.into(),
+            name: "Song".into(),
+            score: 0.5,
+            ..Candidate::default()
+        };
+        crate::matching::model::append(
+            &paths.track_matches(),
+            &MatchEntry {
+                pandora_id: "TR:1".into(),
+                status: Status::Ambiguous,
+                spotify_uri: None,
+                method: None,
+                confidence: None,
+                candidates: vec![candidate("spotify:track:a"), candidate("spotify:track:b")],
+                queries: Vec::new(),
+                decided_at: "2026-10-15T12:00:00Z".into(),
+                session: None,
+                reason: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn questions_print_json_and_answers_are_checked_and_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = setup(tmp.path());
+        std::fs::write(repo.config_path(), "[profiles.alice]\n").unwrap();
+        questions_fixture(&repo);
+        let run_args =
+            |args: &[&str], input: &str| exec(&with_repo(&repo, args), &state_root, input);
+
+        let ran = run_args(&["match", "questions"], "");
+        ran.result.as_ref().unwrap();
+        let doc = ran.document();
+        assert_eq!(doc["items"][0]["item"], "TR:1");
+        assert_eq!(doc["items"][0]["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["remaining"], 0);
+        assert!(doc.get("ok").is_none(), "the text form is the bare object");
+        assert_eq!(
+            ran.err,
+            "profile alice (the only one; pass --profile NAME to choose)\n"
+        );
+        let doc = run_args(&["match", "questions", "--limit", "0", "--json"], "").document();
+        assert_eq!(
+            (&doc["ok"], &doc["command"], &doc["remaining"]),
+            (
+                &serde_json::json!(true),
+                &serde_json::json!("match questions"),
+                &serde_json::json!(1)
+            )
+        );
+
+        let bad = r#"{"decisions":[{"item":"TR:1","choice":"spotify:track:z","confidence":"high"},{"choice":null}]}"#;
+        let ran = run_args(&["match", "answer", "--json"], &format!("{bad}\n\n"));
+        assert_eq!(ran.kind(), Kind::Input);
+        assert!(ran.err.contains(ANSWER_PROMPT), "{}", ran.err);
+        let doc = ran.document();
+        assert_eq!(doc["command"], "match answer");
+        assert_eq!(
+            doc["details"],
+            serde_json::json!({"problems": [
+                {"item": "TR:1",
+                 "problem": "item TR:1: choice \"spotify:track:z\" was not offered for it"},
+                {"item": null, "problem": "decision 2 has no \"item\" string"}]})
+        );
+        assert_eq!(
+            doc["error"],
+            "2 problems with the decisions; nothing was recorded: \
+             item TR:1: choice \"spotify:track:z\" was not offered for it; \
+             decision 2 has no \"item\" string"
+        );
+
+        let file = tmp.path().join("decisions.json");
+        std::fs::write(
+            &file,
+            "{\"decisions\": [\n\n  {\"item\": \"TR:1\", \"choice\": \"spotify:track:b\",\n   \"confidence\": \"high\", \"reason\": \"same\"}\n]}\n",
+        )
+        .unwrap();
+        let ran = run_args(
+            &["match", "answer", "--from-file", file.to_str().unwrap()],
+            "",
+        );
+        ran.result.as_ref().unwrap();
+        assert_eq!(
+            ran.out,
+            "TR:1 matched to spotify:track:b (external, high)\n"
+        );
+        let doc = run_args(&["match", "questions", "--json"], "").document();
+        assert_eq!(doc["items"], serde_json::json!([]));
+        let doc = run_args(&["match", "review", "--json"], "").document();
+        assert_eq!(doc["items"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn guide_prints_its_documents_with_no_repository_or_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-repo");
+        let missing = missing.to_str().unwrap();
+        // An empty state root, a repository that does not exist and two
+        // profiles' worth of ambiguity: none of it is read.
+        let state_root = StateRoot::at(tmp.path().join("state"));
+        let ran = exec(
+            &["--repo", missing, "--profile", "alice", "guide"],
+            &state_root,
+            "",
+        );
+        ran.result.as_ref().unwrap();
+        assert_eq!(ran.out, guide::AGENT);
+        assert_eq!(ran.err, "");
+        // The state root is never located.
+        let mut out = Vec::new();
+        run(
+            parse(&["guide"]),
+            || panic!("guide located the state root"),
+            &mut &b""[..],
+            &mut out,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(out, guide::AGENT.as_bytes());
+        let ran = exec(&["--repo", missing, "guide", "matching"], &state_root, "");
+        assert_eq!(ran.out, guide::MATCHING);
+        let ran = exec(&["guide", "agent", "--json"], &state_root, "");
+        assert_eq!(
+            ran.document(),
+            serde_json::json!({"ok": true, "command": "guide", "topic": "agent",
+                "text": guide::AGENT})
+        );
+        assert!(!tmp.path().join("no-such-repo").exists());
+        assert!(!tmp.path().join("state").exists());
+    }
+
+    #[test]
+    fn the_guide_names_every_command() {
+        let mut names: Vec<&str> = DOCUMENTED.iter().map(|(_, name)| *name).collect();
+        names.dedup();
+        // Every command line clap accepts is in `DOCUMENTED`, which
+        // `every_documented_command_parses` ties to `Command::name()`.
+        let mut runnable = Vec::new();
+        runnable_paths(&Cli::command(), "", &mut runnable);
+        let mut documented: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        documented.sort();
+        runnable.sort();
+        assert_eq!(
+            documented, runnable,
+            "DOCUMENTED and the command tree differ"
+        );
+        for name in names {
+            assert!(
+                guide::AGENT.contains(&format!("sss {name}")),
+                "docs/llm-guide.md never shows `sss {name}`"
+            );
+        }
+    }
+
+    /// The space-joined subcommand path of every command under `cmd` that
+    /// runs on its own: one with no subcommands, or whose subcommand is
+    /// optional.
+    fn runnable_paths(cmd: &clap::Command, path: &str, found: &mut Vec<String>) {
+        if !path.is_empty()
+            && (cmd.get_subcommands().next().is_none() || !cmd.is_subcommand_required_set())
+        {
+            found.push(path.to_owned());
+        }
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            let sub_path = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path} {name}")
+            };
+            runnable_paths(sub, &sub_path, found);
+        }
     }
 }

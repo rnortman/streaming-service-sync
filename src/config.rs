@@ -19,7 +19,7 @@ pub const SKELETON: &str = r#"# streaming-service-sync configuration.
 
 [spotify]
 client_id = ""          # the dev-mode app's client ID; per-profile override below
-market = ""             # empty = from the user's token
+market = ""             # empty = the market of the signed-in account
 
 [matcher]
 agent = "music-matcher"
@@ -59,7 +59,7 @@ pub struct Config {
 pub struct SpotifyConfig {
     /// The dev-mode app's client ID; empty when not configured.
     pub client_id: String,
-    /// Search market; empty means the market of the user's token.
+    /// Search market; empty means the market of the signed-in account.
     pub market: String,
 }
 

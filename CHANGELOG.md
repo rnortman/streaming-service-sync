@@ -6,6 +6,29 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Matching without `ccc`.** `sss match questions` prints, as one JSON
+  document, the ambiguous items `sss match` would ask its LLM about, with
+  every candidate, and contacts nothing. `sss match answer` takes back a
+  decisions document (`--from-file`, or piped in), checks all of it
+  against those items, and records the decisions — or, when anything in
+  it is wrong, records nothing and lists every problem, in `details` under
+  `--json`. Decisions recorded this way carry the new match method
+  `external`, which `sss report` counts in its own column.
+- **`sss guide`** prints a guide for an LLM agent operating `sss` for a
+  person, start to finish (`docs/llm-guide.md`); `sss guide matching`
+  prints the matching protocol, the rules and document formats for
+  deciding matches (`docs/matching-protocol.md`). Neither needs a data
+  repository.
+
+### Fixed
+
+- Spotify searches with the default empty `[spotify] market` no longer
+  fail with "Insufficient client scope": `sss` now leaves the market out
+  and Spotify uses the signed-in account's. Stored tokens keep working; no
+  new sign-in is needed.
+
 ## [0.1.0] - 2026-10-15
 
 ### Added

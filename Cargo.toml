@@ -9,7 +9,7 @@ repository = "https://github.com/rnortman/streaming-service-sync"
 readme = "README.md"
 keywords = ["pandora", "spotify", "migration", "playlist", "export"]
 categories = ["command-line-utilities"]
-include = ["/agents", "/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
+include = ["/agents", "/docs", "/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
 
 [[bin]]
 name = "sss"

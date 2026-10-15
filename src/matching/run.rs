@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use url::Url;
 
@@ -15,7 +15,9 @@ use crate::error::Kind;
 use crate::fail;
 use crate::lazy::Lazy;
 use crate::matching::candidates::{self, Found, Search};
-use crate::matching::llm::{BatchItem, LlmDecision, Matcher, Outcome, Verdict};
+use crate::matching::llm::{
+    self, BatchItem, Completeness, LlmDecision, Matcher, Outcome, Problem, Verdict,
+};
 use crate::matching::model::{self, ByKind, Candidate, Confidence, MatchEntry, Method, Status};
 use crate::matching::score::{Decision, TrackItem};
 use crate::pandora::model::{Normalized, SeedKind, Track};
@@ -416,11 +418,13 @@ fn find(search: &mut dyn Search, kind: IdKind, item: &Item) -> Result<Option<Fou
     }))
 }
 
-/// The entry the LLM's `decision` (or a failed batch) makes of `prior`,
-/// the item's stored `ambiguous` or `llm_failed` entry: its candidates and
+/// The entry an LLM's `decision`, made by `method` (`llm` through `ccc`,
+/// `external` from `match answer`), or a failed batch makes of `prior`, the
+/// item's stored `ambiguous` or `llm_failed` entry: its candidates and
 /// queries are kept.
 fn llm_entry(
     prior: &MatchEntry,
+    method: Method,
     session: Option<&str>,
     decision: Result<&LlmDecision, &str>,
     at: String,
@@ -433,7 +437,7 @@ fn llm_entry(
                 Status::Unmatched
             },
             d.choice.clone(),
-            Some(Method::Llm),
+            Some(method),
             Some(d.confidence),
             d.reason.clone(),
         ),
@@ -588,7 +592,13 @@ fn flush<S, F: FnOnce() -> Result<S>>(
             },
             Verdict::Failed(why) => Err(why.as_str()),
         };
-        let entry = llm_entry(&prior, session.as_deref(), decision, repo::now_rfc3339()?);
+        let entry = llm_entry(
+            &prior,
+            Method::Llm,
+            session.as_deref(),
+            decision,
+            repo::now_rfc3339()?,
+        );
         model::append(file, &entry)?;
         report.kinds.of_mut(kind).count(&entry);
         let _ = writeln!(progress, "{}", progress_line(kind, item, &entry));
@@ -776,6 +786,204 @@ pub fn reject(paths: &ProfilePaths, pandora_id: &str) -> Result<MatchSetReport> 
     let entry = MatchEntry::manual_reject(pandora_id, repo::now_rfc3339()?);
     model::append(&file, &entry)?;
     Ok(MatchSetReport { entry })
+}
+
+/// What `sss match questions` reports: the open items, as the `ccc`
+/// matcher is shown them, and how many more the limit left out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionsReport {
+    pub items: Vec<BatchItem>,
+    pub remaining: usize,
+}
+
+impl QuestionsReport {
+    /// The report as one pretty-printed JSON object: the text form is the
+    /// document itself.
+    pub fn write_text(&self, out: &mut dyn Write) -> io::Result<()> {
+        serde_json::to_writer_pretty(&mut *out, self)?;
+        writeln!(out)
+    }
+}
+
+/// `sss match questions`: every item of `items` whose entry in `latest`
+/// awaits an LLM decision (`ambiguous` or `llm_failed`, not set by hand) —
+/// what a `match` run sends to `ccc` — in kind then Pandora-id order, each
+/// with every stored candidate. `only` keeps one kind; `limit` lists at most
+/// that many, `remaining` counting the open items it left out.
+pub fn questions(
+    latest: &ByKind<BTreeMap<String, MatchEntry>>,
+    items: &Items,
+    only: Option<IdKind>,
+    limit: Option<usize>,
+) -> QuestionsReport {
+    let mut report = QuestionsReport {
+        items: Vec::new(),
+        remaining: 0,
+    };
+    for kind in IdKind::ALL {
+        if only.is_some_and(|o| o != kind) {
+            continue;
+        }
+        let entries = latest.of(kind);
+        for item in items.of(kind).values() {
+            let Some(entry) = entries.get(&item.pandora_id).filter(|e| e.awaits_llm()) else {
+                continue;
+            };
+            if limit.is_some_and(|n| report.items.len() >= n) {
+                report.remaining += 1;
+            } else {
+                report
+                    .items
+                    .push(BatchItem::new(kind, item, &entry.candidates));
+            }
+        }
+    }
+    report
+}
+
+/// A decisions document `sss match answer` refused, with every problem in
+/// it; nothing was recorded.
+#[derive(Debug)]
+pub struct DecisionsRefused {
+    pub problems: Vec<Problem>,
+}
+
+impl std::fmt::Display for DecisionsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.problems.len();
+        write!(
+            f,
+            "{n} problem{} with the decisions; nothing was recorded: {}",
+            if n == 1 { "" } else { "s" },
+            llm::join_problems(&self.problems)
+        )
+    }
+}
+
+impl std::error::Error for DecisionsRefused {}
+
+/// Why `pandora_id` has no open question, given the latest entries and the
+/// item set: the line a decision for it is refused with.
+fn no_open_question(
+    latest: &ByKind<BTreeMap<String, MatchEntry>>,
+    items: &Items,
+    pandora_id: &str,
+) -> String {
+    let why = match IdKind::of_pandora_id(pandora_id) {
+        None => "it is not a Pandora track, artist or album id (TR:…, AR:…, CO:…, AL:…)".into(),
+        Some(kind) if !items.of(kind).contains_key(pandora_id) => {
+            "it is not among the items push would send".into()
+        }
+        Some(kind) => match latest.of(kind).get(pandora_id) {
+            None => "it has not been searched yet; run sss match --no-llm".into(),
+            Some(e) => {
+                let mut why = format!("its latest entry is {}", e.status.as_str());
+                if let Some(m) = e.method {
+                    why.push_str(&format!(" by {}", m.as_str()));
+                }
+                why
+            }
+        },
+    };
+    format!("item {pandora_id:?} has no open question ({why})")
+}
+
+/// One decision `sss match answer` recorded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Recorded {
+    pub item: String,
+    pub status: Status,
+    pub spotify_uri: Option<String>,
+    pub confidence: Option<Confidence>,
+}
+
+/// What `sss match answer` reports: the decisions recorded, and the valid
+/// ones `--limit` left unrecorded, in document order.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnswerReport {
+    pub recorded: Vec<Recorded>,
+    pub not_recorded: Vec<String>,
+    #[serde(skip)]
+    pub limit: Option<usize>,
+}
+
+impl AnswerReport {
+    pub fn write_text(&self, out: &mut dyn Write) -> io::Result<()> {
+        if self.recorded.is_empty() && self.not_recorded.is_empty() {
+            writeln!(out, "no decisions recorded")?;
+        }
+        for r in &self.recorded {
+            let confidence = r.confidence.map_or("", Confidence::as_str);
+            match &r.spotify_uri {
+                Some(uri) => writeln!(out, "{} matched to {uri} (external, {confidence})", r.item)?,
+                None => writeln!(
+                    out,
+                    "{} {} (external, {confidence})",
+                    r.item,
+                    r.status.as_str()
+                )?,
+            }
+        }
+        if !self.not_recorded.is_empty() {
+            let n = self.not_recorded.len();
+            let limit = self
+                .limit
+                .map(|l| format!(" (--limit {l})"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "{n} decision{} not recorded{limit}: {}",
+                if n == 1 { "" } else { "s" },
+                self.not_recorded.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// `sss match answer`: validates the decisions document `text` against
+/// every open question (see [`questions`]) — any subset may be answered —
+/// and, only when it holds no problem at all, appends the first `limit`
+/// decisions (all without one), in document order, as `external` entries
+/// built from each item's latest entry. Any problem is a
+/// [`DecisionsRefused`] and nothing is written. A failed append stops at
+/// that decision; the ones before it stand.
+pub fn answer(
+    paths: &ProfilePaths,
+    items: &Items,
+    text: &str,
+    limit: Option<usize>,
+) -> Result<AnswerReport> {
+    let latest = model::read_all_latest(paths)?;
+    let open = questions(&latest, items, None, None).items;
+    let decisions = llm::parse_decisions(text, &open, Completeness::Any, |id| {
+        no_open_question(&latest, items, id)
+    })
+    .map_err(|problems| anyhow::Error::new(DecisionsRefused { problems }))?;
+    let take = limit.unwrap_or(decisions.len()).min(decisions.len());
+    let mut report = AnswerReport {
+        recorded: Vec::new(),
+        not_recorded: decisions[take..].iter().map(|d| d.item.clone()).collect(),
+        limit,
+    };
+    for d in &decisions[..take] {
+        let kind = open
+            .iter()
+            .find(|b| b.item == d.item)
+            .map(|b| b.kind)
+            .expect("a validated decision names an open item");
+        let prior = &latest.of(kind)[&d.item];
+        let entry = llm_entry(prior, Method::External, None, Ok(d), repo::now_rfc3339()?);
+        model::append(&model::file(paths, kind), &entry)
+            .with_context(|| format!("recording the decision for {}", d.item))?;
+        report.recorded.push(Recorded {
+            item: entry.pandora_id,
+            status: entry.status,
+            spotify_uri: entry.spotify_uri,
+            confidence: entry.confidence,
+        });
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1579,5 +1787,437 @@ mod tests {
         assert_eq!(error::kind(&err), Kind::Config);
         assert!(search.asked.is_empty());
         assert!(!paths.track_matches().exists());
+    }
+
+    fn offered(n: u8) -> Candidate {
+        Candidate {
+            uri: format!("spotify:track:{n}"),
+            name: format!("Song {n}"),
+            score: 0.5,
+            ..Candidate::default()
+        }
+    }
+
+    fn open_entry(id: &str, status: Status, candidates: u8) -> MatchEntry {
+        let mut e = entry(id, status);
+        e.candidates = (1..=candidates).map(offered).collect();
+        e.queries = vec![format!("{id} query")];
+        e
+    }
+
+    fn listed(report: &QuestionsReport) -> Vec<&str> {
+        report.items.iter().map(|b| b.item.as_str()).collect()
+    }
+
+    #[test]
+    fn questions_are_the_items_a_run_would_send_to_the_llm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let mut manual = entry("TR:3", Status::Ambiguous);
+        manual.method = Some(Method::Manual);
+        let mut done = entry("TR:4", Status::Matched);
+        done.method = Some(Method::Isrc);
+        for e in [
+            open_entry("TR:1", Status::Ambiguous, 10),
+            entry("TR:2", Status::LlmFailed),
+            manual,
+            done,
+            open_entry("TR:5", Status::Ambiguous, 2),
+            open_entry("TR:9", Status::Ambiguous, 1),
+        ] {
+            model::append(&paths.track_matches(), &e).unwrap();
+        }
+        let mut artist = open_entry("AR:1", Status::Ambiguous, 1);
+        artist.candidates[0].uri = "spotify:artist:1".into();
+        model::append(&paths.artist_matches(), &artist).unwrap();
+        let mut items = items_of(&[
+            ("TR:1", Some("One")),
+            ("TR:2", Some("Two")),
+            ("TR:3", Some("Three")),
+            ("TR:4", Some("Four")),
+        ]);
+        items.tracks.insert(
+            "TR:9".into(),
+            Item::named("TR:9", Some(&"Nine".into()), Some(&"Someone".into())),
+        );
+        items.artists.insert(
+            "AR:1".into(),
+            Item::named("AR:1", Some(&"Artist".into()), None),
+        );
+        let latest = model::read_all_latest(&paths).unwrap();
+
+        let all = questions(&latest, &items, None, None);
+        assert_eq!(
+            listed(&all),
+            ["TR:1", "TR:2", "TR:9", "AR:1"],
+            "not the manual, settled or out-of-set entries"
+        );
+        assert_eq!(all.remaining, 0);
+        assert_eq!(all.items[0].candidates.len(), 10, "every stored candidate");
+        assert_eq!(
+            review(&latest, &items, None).items[0].candidates.len(),
+            REVIEW_CANDIDATES
+        );
+        assert_eq!(
+            all.items[0],
+            BatchItem::new(
+                IdKind::Track,
+                &items.tracks["TR:1"],
+                &latest.tracks["TR:1"].candidates
+            )
+        );
+        assert!(all.items[1].candidates.is_empty());
+        let nine = &all.items[2].pandora;
+        assert_eq!(
+            (&nine["album"], &nine["duration_s"]),
+            (&serde_json::Value::Null, &serde_json::Value::Null),
+            "a bookmark-only track"
+        );
+        assert_eq!(all.items[3].kind, IdKind::Artist);
+
+        let artists = questions(&latest, &items, Some(IdKind::Artist), None);
+        assert_eq!((listed(&artists), artists.remaining), (vec!["AR:1"], 0));
+        let two = questions(&latest, &items, None, Some(2));
+        assert_eq!((listed(&two), two.remaining), (vec!["TR:1", "TR:2"], 2));
+        let tracks = questions(&latest, &items, Some(IdKind::Track), Some(1));
+        assert_eq!((listed(&tracks), tracks.remaining), (vec!["TR:1"], 2));
+        let none = questions(&latest, &items, None, Some(0));
+        assert_eq!((none.items.len(), none.remaining), (0, 4));
+
+        let mut text = Vec::new();
+        two.write_text(&mut text).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&text).unwrap();
+        assert_eq!(doc["items"][0]["item"], "TR:1");
+        assert_eq!(doc["items"][0]["kind"], "track");
+        assert_eq!(doc["remaining"], 2);
+    }
+
+    /// TR:1 ambiguous and TR:2 failed, both with candidates 1 and 2; AR:1
+    /// ambiguous with one artist candidate; TR:3 matched by isrc; TR:4 in
+    /// the set with no entry; TR:7 outside the set with a stale entry.
+    fn answer_fixture(paths: &ProfilePaths) -> Items {
+        let mut done = entry("TR:3", Status::Matched);
+        done.method = Some(Method::Isrc);
+        for e in [
+            open_entry("TR:1", Status::Ambiguous, 2),
+            open_entry("TR:2", Status::LlmFailed, 2),
+            done,
+            open_entry("TR:7", Status::Ambiguous, 1),
+        ] {
+            model::append(&paths.track_matches(), &e).unwrap();
+        }
+        let mut artist = open_entry("AR:1", Status::Ambiguous, 1);
+        artist.candidates[0].uri = "spotify:artist:1".into();
+        model::append(&paths.artist_matches(), &artist).unwrap();
+        let mut items = items_of(&[
+            ("TR:1", Some("One")),
+            ("TR:2", Some("Two")),
+            ("TR:3", Some("Three")),
+            ("TR:4", Some("Four")),
+        ]);
+        items.artists.insert(
+            "AR:1".into(),
+            Item::named("AR:1", Some(&"Artist".into()), None),
+        );
+        items
+    }
+
+    fn files(paths: &ProfilePaths) -> Vec<Option<Vec<u8>>> {
+        IdKind::ALL
+            .iter()
+            .map(|k| std::fs::read(model::file(paths, *k)).ok())
+            .collect()
+    }
+
+    fn answer_text(report: &AnswerReport) -> String {
+        let mut text = Vec::new();
+        report.write_text(&mut text).unwrap();
+        String::from_utf8(text).unwrap()
+    }
+
+    fn refused(err: &anyhow::Error) -> Vec<Problem> {
+        assert_eq!(error::kind(err), Kind::Input, "{err:#}");
+        err.downcast_ref::<DecisionsRefused>()
+            .unwrap_or_else(|| panic!("{err:#}"))
+            .problems
+            .clone()
+    }
+
+    #[test]
+    fn answers_are_recorded_as_external_decisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        let doc = r#"Here: {"decisions":[
+            {"item":"TR:1","choice":"spotify:track:2","confidence":"high","reason":"same take"},
+            {"item":"TR:2","choice":null,"confidence":"low","reason":"none fits"}]}"#;
+        let report = answer(&paths, &items, doc, None).unwrap();
+        assert_eq!(
+            answer_text(&report),
+            "TR:1 matched to spotify:track:2 (external, high)\n\
+             TR:2 unmatched (external, low)\n"
+        );
+        assert!(report.not_recorded.is_empty());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "recorded": [
+                    {"item": "TR:1", "status": "matched", "spotify_uri": "spotify:track:2",
+                     "confidence": "high"},
+                    {"item": "TR:2", "status": "unmatched", "spotify_uri": null,
+                     "confidence": "low"}],
+                "not_recorded": []
+            })
+        );
+
+        let latest = model::read_latest(&paths.track_matches()).unwrap();
+        let one = &latest["TR:1"];
+        assert_eq!(one.matched_uri(), Some("spotify:track:2"));
+        assert_eq!(one.method, Some(Method::External));
+        assert_eq!(one.session, None);
+        assert_eq!(one.confidence, Some(Confidence::High));
+        assert_eq!(one.reason.as_deref(), Some("same take"));
+        let prior = open_entry("TR:1", Status::Ambiguous, 2);
+        assert_eq!(
+            (&one.candidates, &one.queries),
+            (&prior.candidates, &prior.queries)
+        );
+        let two = &latest["TR:2"];
+        assert_eq!(
+            (two.status, two.method, two.confidence),
+            (
+                Status::Unmatched,
+                Some(Method::External),
+                Some(Confidence::Low)
+            )
+        );
+        assert_eq!(two.candidates.len(), 2);
+        assert!(one.is_settled() && two.is_settled());
+
+        let all = model::read_all_latest(&paths).unwrap();
+        assert_eq!(listed(&questions(&all, &items, None, None)), ["AR:1"]);
+        assert_eq!(
+            review(&all, &items, Some(IdKind::Track))
+                .items
+                .iter()
+                .map(|i| i.pandora_id.as_str())
+                .collect::<Vec<_>>(),
+            ["TR:2"],
+            "an external unmatched decision stays in review"
+        );
+
+        // A later run with a matcher asks it about nothing it was told.
+        let mut search = FakeSearch::default();
+        let mut matcher = FakeMatcher {
+            verdicts: vec![Ok(Verdict::Decided(vec![LlmDecision {
+                item: "AR:1".into(),
+                choice: None,
+                confidence: Confidence::Low,
+                reason: None,
+            }]))],
+            ..FakeMatcher::default()
+        };
+        let only_known = Items {
+            tracks: items
+                .tracks
+                .clone()
+                .into_iter()
+                .filter(|(id, _)| id != "TR:4")
+                .collect(),
+            ..items.clone()
+        };
+        run_llm(
+            &paths,
+            &only_known,
+            Options::default(),
+            &mut search,
+            &mut matcher,
+        )
+        .unwrap();
+        assert_eq!(matcher.batches, [vec!["AR:1"]]);
+    }
+
+    #[test]
+    fn a_limit_records_the_first_decisions_and_names_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        let doc = r#"{"decisions":[
+            {"item":"AR:1","choice":"spotify:artist:1","confidence":"medium"},
+            {"item":"TR:2","choice":"spotify:track:1","confidence":"high"},
+            {"item":"TR:1","choice":null,"confidence":"low"}]}"#;
+        let report = answer(&paths, &items, doc, Some(1)).unwrap();
+        assert_eq!(report.not_recorded, ["TR:2", "TR:1"]);
+        assert_eq!(
+            answer_text(&report),
+            "AR:1 matched to spotify:artist:1 (external, medium)\n\
+             2 decisions not recorded (--limit 1): TR:2, TR:1\n"
+        );
+        let latest = model::read_all_latest(&paths).unwrap();
+        assert_eq!(latest.artists["AR:1"].method, Some(Method::External));
+        assert_eq!(latest.tracks["TR:2"].status, Status::LlmFailed);
+
+        let before = files(&paths);
+        let empty = answer(&paths, &items, r#"{"decisions":[]}"#, None).unwrap();
+        assert!(empty.recorded.is_empty() && empty.not_recorded.is_empty());
+        assert_eq!(answer_text(&empty), "no decisions recorded\n");
+        assert_eq!(files(&paths), before);
+    }
+
+    #[test]
+    fn one_bad_decision_refuses_the_document_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        let before = files(&paths);
+        let doc = r#"{"decisions":[
+            {"item":"TR:1","choice":"spotify:track:1","confidence":"high"},
+            {"item":"TR:2","choice":"spotify:track:z","confidence":"high"},
+            {"item":"AR:1","choice":null,"confidence":"low"}]}"#;
+        // A limit that stops before the bad decision refuses the same way:
+        // the whole document is checked.
+        for limit in [None, Some(1)] {
+            let err = answer(&paths, &items, doc, limit).unwrap_err();
+            assert_eq!(
+                refused(&err),
+                [Problem {
+                    item: Some("TR:2".into()),
+                    problem: "item TR:2: choice \"spotify:track:z\" was not offered for it".into(),
+                }],
+                "{limit:?}"
+            );
+            assert_eq!(
+                format!("{err:#}"),
+                "1 problem with the decisions; nothing was recorded: \
+                 item TR:2: choice \"spotify:track:z\" was not offered for it"
+            );
+            assert_eq!(files(&paths), before, "no file changed with {limit:?}");
+        }
+    }
+
+    #[test]
+    fn each_item_without_an_open_question_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        let before = files(&paths);
+        let decision = |id: &str| {
+            format!(r#"{{"decisions":[{{"item":"{id}","choice":null,"confidence":"low"}}]}}"#)
+        };
+        for (id, why) in [
+            ("TR:3", "its latest entry is matched by isrc"),
+            (
+                "TR:4",
+                "it has not been searched yet; run sss match --no-llm",
+            ),
+            ("TR:7", "it is not among the items push would send"),
+            ("TR:8", "it is not among the items push would send"),
+            (
+                "ST:1",
+                "it is not a Pandora track, artist or album id (TR:…, AR:…, CO:…, AL:…)",
+            ),
+        ] {
+            let err = answer(&paths, &items, &decision(id), None).unwrap_err();
+            assert_eq!(
+                refused(&err),
+                [Problem {
+                    item: Some(id.into()),
+                    problem: format!("item \"{id}\" has no open question ({why})"),
+                }],
+                "{id}"
+            );
+        }
+        assert_eq!(files(&paths), before, "no refusal wrote anything");
+        model::append(&paths.track_matches(), &entry("TR:3", Status::Unmatched)).unwrap();
+        let err = answer(&paths, &items, &decision("TR:3"), None).unwrap_err();
+        assert_eq!(
+            refused(&err)[0].problem,
+            "item \"TR:3\" has no open question (its latest entry is unmatched)"
+        );
+        let err = answer(&paths, &items, "no json", None).unwrap_err();
+        assert_eq!(
+            refused(&err),
+            [Problem {
+                item: None,
+                problem: "the reply holds no JSON object".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_append_keeps_what_came_before_and_the_loop_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        let artists = paths.artist_matches();
+        let mode = |m| std::fs::set_permissions(&artists, std::fs::Permissions::from_mode(m));
+        mode(0o444).unwrap();
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&artists)
+            .is_ok()
+        {
+            // Running as root: mode bits do not stop the write.
+            mode(0o644).unwrap();
+            return;
+        }
+        let doc = r#"{"decisions":[
+            {"item":"TR:1","choice":"spotify:track:1","confidence":"high"},
+            {"item":"AR:1","choice":null,"confidence":"low"}]}"#;
+        let err = answer(&paths, &items, doc, None).unwrap_err();
+        mode(0o644).unwrap();
+        assert_eq!(error::kind(&err), Kind::Other);
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("AR:1") && message.contains(&artists.display().to_string()),
+            "{message}"
+        );
+        let latest = model::read_all_latest(&paths).unwrap();
+        assert_eq!(latest.tracks["TR:1"].method, Some(Method::External));
+        assert_eq!(latest.artists["AR:1"].status, Status::Ambiguous);
+
+        let err = answer(&paths, &items, doc, None).unwrap_err();
+        assert_eq!(
+            refused(&err),
+            [Problem {
+                item: Some("TR:1".into()),
+                problem: "item \"TR:1\" has no open question \
+                          (its latest entry is matched by external)"
+                    .into(),
+            }]
+        );
+        let open = questions(&model::read_all_latest(&paths).unwrap(), &items, None, None);
+        assert_eq!(listed(&open), ["TR:2", "AR:1"]);
+    }
+
+    #[test]
+    fn a_torn_match_file_fails_questions_and_answer_and_writes_nothing() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        let items = answer_fixture(&paths);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.artist_matches())
+            .unwrap()
+            .write_all(b"{\"pandora_id\":\"AR:2\",\"sta")
+            .unwrap();
+        let before = files(&paths);
+        let err = model::read_all_latest(&paths).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the final line is incomplete"),
+            "{err:#}"
+        );
+        let doc = r#"{"decisions":[{"item":"TR:1","choice":null,"confidence":"low"}]}"#;
+        let err = answer(&paths, &items, doc, None).unwrap_err();
+        assert_eq!(error::kind(&err), Kind::Other);
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&paths.artist_matches().display().to_string())
+                && message.contains("remove it by hand"),
+            "{message}"
+        );
+        assert_eq!(files(&paths), before);
     }
 }

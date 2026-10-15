@@ -1661,3 +1661,119 @@ fn report_writes_the_profile_report_and_prints_its_path() {
         format!("{}\n", path.display())
     );
 }
+
+#[test]
+fn match_questions_and_answer_close_the_loop_without_the_network() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    write_export(repo, &[("TR:1", "Song", true)]);
+    let matches = Path::new(repo).join("profiles/alice/matches");
+    std::fs::create_dir_all(&matches).expect("matches dir");
+    let candidates: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|id| serde_json::json!({"uri": format!("spotify:track:{id}"), "name": "Song", "score": 0.5}))
+        .collect();
+    std::fs::write(
+        matches.join("tracks.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"pandora_id": "TR:1", "status": "ambiguous",
+                "candidates": candidates, "decided_at": "2026-10-15T00:00:00Z"})
+        ),
+    )
+    .expect("write matches");
+    // Nothing listens on port 1: a Spotify request would fail the command.
+    let run = |args: &[&str], stdin: &str| {
+        sss(tmp.path())
+            .env("SSS_SPOTIFY_API_BASE_URL", "http://127.0.0.1:1")
+            .args(["--repo", repo, "--profile", "alice", "match"])
+            .args(args)
+            .arg("--json")
+            .write_stdin(stdin.to_owned())
+            .assert()
+            .get_output()
+            .clone()
+    };
+
+    let out = run(&["questions"], "");
+    assert_eq!(out.status.code(), Some(0));
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["command"], "match questions");
+    assert_eq!(doc["items"][0]["item"], "TR:1");
+    assert_eq!(doc["items"][0]["kind"], "track");
+    let offered: Vec<_> = doc["items"][0]["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(
+        offered,
+        ["spotify:track:a", "spotify:track:b", "spotify:track:c"]
+    );
+    assert_eq!(doc["remaining"], 0);
+
+    let out = run(
+        &["answer"],
+        r#"{"decisions":[{"item":"TR:1","choice":"spotify:track:z","confidence":"high"}]}"#,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kind"], "input");
+    assert_eq!(doc["details"]["problems"][0]["item"], "TR:1");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: 1 problem"));
+
+    let out = run(
+        &["answer"],
+        "{\"decisions\":[{\"item\":\"TR:1\",\"choice\":\"spotify:track:c\",\n\"confidence\":\"medium\",\"reason\":\"same\"}]}\n\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let doc = json_document(&out.stdout);
+    assert_eq!(
+        doc["recorded"],
+        serde_json::json!([{"item": "TR:1", "status": "matched",
+            "spotify_uri": "spotify:track:c", "confidence": "medium"}])
+    );
+    let review = json_document(&run(&["review"], "").stdout);
+    assert_eq!(review["items"], serde_json::json!([]));
+}
+
+#[test]
+fn guide_prints_with_no_data_repository() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    // No state root can be located either: the guide needs none.
+    let out = sss(tmp.path())
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .env("XDG_DATA_HOME", tmp.path().join("nowhere"))
+        .arg("guide")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert_eq!(
+        out.stdout,
+        std::fs::read(docs.join("llm-guide.md")).expect("guide")
+    );
+    assert!(out.stderr.is_empty());
+    let out = sss(tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join("nowhere"))
+        .args(["guide", "matching", "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["topic"], "matching");
+    assert_eq!(
+        doc["text"].as_str().expect("text").as_bytes(),
+        std::fs::read(docs.join("matching-protocol.md")).expect("protocol")
+    );
+    assert!(!tmp.path().join("nowhere").exists());
+}

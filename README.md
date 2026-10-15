@@ -23,8 +23,8 @@ you are already logged in.
 
 Early development. `sss init`, `sss pandora auth`, `sss pandora export`,
 `sss pandora normalize`, `sss spotify auth`, `sss match`,
-`sss match review|set|reject`, `sss push`, `sss report` and `sss status`
-work, and each also takes `--json` for one machine-readable document on
+`sss match review|questions|answer|set|reject`, `sss push`, `sss report`,
+`sss status` and `sss guide` work, and each also takes `--json` for one machine-readable document on
 stdout (see
 [Driving `sss` from a script or an LLM](#driving-sss-from-a-script-or-an-llm)).
 See [CHANGELOG.md](CHANGELOG.md).
@@ -137,8 +137,18 @@ fails is recorded as `llm_failed` and offered again by the next run, from
 the stored candidates, without searching Spotify again. `--no-llm` skips
 the step and leaves ambiguous items for a later run.
 
-- `sss match review` lists the ambiguous, unmatched and low-confidence
-  items with their best three candidates and a Spotify search link.
+Without `ccc`, the ambiguous items can be decided from outside, by an LLM
+agent or a person, in a loop: `sss match questions` prints the items the
+LLM step would be asked about, with every candidate, as one JSON document
+and contacts nothing; `sss match answer --from-file decisions.json` takes
+back a `{"decisions":[…]}` document of the same form the `music-matcher`
+agent answers with, checks the whole of it against the open items, and
+records its decisions with method `external`, or records nothing and lists
+every problem. Either path can take over from the other.
+`sss guide matching` prints the rules and the document formats.
+
+- `sss match review` lists the ambiguous, failed, unmatched and
+  low-confidence items with their best three candidates and a Spotify search link.
 - `sss match set TR:… <Spotify link, URI or id>` records a match by hand;
   `sss match reject TR:…` records that an item has no Spotify counterpart.
   Neither touches the network, and a later `match` run never overrides
@@ -195,6 +205,13 @@ it whenever you like, typically after `sss match` and again after
   what the library holds, and what to do about any `pending` playlist.
 
 ### Driving `sss` from a script or an LLM
+
+An LLM agent that operates `sss` on a person's behalf starts with
+[docs/llm-guide.md](docs/llm-guide.md), which `sss guide` also prints: the
+whole job in order, from installing to pushing, and what to leave to the
+person. `sss guide matching` prints
+[docs/matching-protocol.md](docs/matching-protocol.md), the rules for
+deciding a match.
 
 Every command can be run by another program — a shell script, or an LLM
 through its shell tool — with nothing typed at a terminal:
@@ -275,6 +292,9 @@ cd streaming-service-sync
 cargo build --release --locked
 ./target/release/sss --version
 ```
+
+`cargo install --path . --locked` builds it and puts `sss` on `PATH`
+(in `~/.cargo/bin`).
 
 ## Contributing
 

@@ -6,13 +6,29 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::matching::run::DecisionsRefused;
 use crate::pandora::client::SessionRejected;
 use crate::pandora::export::{ExportIncomplete, ExportStopped};
 
-/// What kind of failure ended a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
+/// Declares [`Kind`] and [`Kind::ALL`] from one list of variants, so `ALL`
+/// cannot miss one.
+macro_rules! kinds {
+    ($($(#[doc = $doc:literal])+ $variant:ident,)+) => {
+        /// What kind of failure ended a command.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Kind {
+            $($(#[doc = $doc])+ $variant,)+
+        }
+
+        impl Kind {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [Kind] = &[$(Kind::$variant),+];
+        }
+    };
+}
+
+kinds! {
     /// A stored session is missing, or the service refused it or the
     /// credential given to sign in.
     Auth,
@@ -114,6 +130,8 @@ fn carried_kind(err: &anyhow::Error) -> Option<Kind> {
             return Some(Kind::Auth);
         } else if e.is::<ExportIncomplete>() {
             return Some(Kind::Incomplete);
+        } else if e.is::<DecisionsRefused>() {
+            return Some(Kind::Input);
         } else if let Some(stopped) = e.downcast_ref::<ExportStopped>() {
             // Its own place in the chain stands for the outermost error of
             // `source`, which the chain therefore never yields.
@@ -149,6 +167,32 @@ mod tests {
 
     fn failing() -> anyhow::Result<()> {
         fail!(Kind::Input, "no token given {}", 1);
+    }
+
+    #[test]
+    fn all_lists_each_kind_once_under_its_json_spelling() {
+        let spellings: Vec<String> = Kind::ALL
+            .iter()
+            .map(|k| {
+                serde_json::to_value(k)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            spellings,
+            [
+                "auth",
+                "unavailable",
+                "quota",
+                "incomplete",
+                "input",
+                "config",
+                "other"
+            ]
+        );
     }
 
     #[test]
@@ -198,6 +242,23 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&Kind::Auth).unwrap(), "\"auth\"");
         assert_eq!(serde_json::to_string(&Kind::Quota).unwrap(), "\"quota\"");
+    }
+
+    #[test]
+    fn refused_decisions_are_input_through_contexts() {
+        let err = anyhow::Error::new(DecisionsRefused {
+            problems: vec![crate::matching::llm::Problem {
+                item: None,
+                problem: "decision 1 has no \"item\" string".into(),
+            }],
+        })
+        .context("answering");
+        assert_eq!(kind(&err), Kind::Input);
+        assert_eq!(
+            format!("{err:#}"),
+            "answering: 1 problem with the decisions; nothing was recorded: \
+             decision 1 has no \"item\" string"
+        );
     }
 
     #[test]

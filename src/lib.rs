@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod guide;
 pub mod http;
 pub mod input;
 pub mod lazy;

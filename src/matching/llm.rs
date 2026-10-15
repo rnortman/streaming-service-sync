@@ -51,6 +51,7 @@ pub fn ccc_program() -> OsString {
 pub struct BatchItem {
     /// The Pandora id; a decision names it.
     pub item: String,
+    pub kind: IdKind,
     pub pandora: Value,
     pub candidates: Vec<Offered>,
 }
@@ -138,6 +139,7 @@ impl BatchItem {
         };
         BatchItem {
             item: item.pandora_id.clone(),
+            kind,
             pandora,
             candidates: candidates.iter().map(Offered::from).collect(),
         }
@@ -203,23 +205,31 @@ fn confidence_spellings() -> String {
         .join(", ")
 }
 
-/// The first balanced `{…}` in `text` that parses as JSON, skipping prose,
-/// code fences and anything before or after it. When none parses, the
-/// parse error of the first balanced one.
+/// The first balanced `{…}` in `text` that parses as JSON and has a
+/// `decisions` key, skipping prose, code fences and anything before or
+/// after it. When there is none, the reading of the first `{`: the object
+/// it opens, or the parse error of that object — or of the rest of the
+/// text when the object never closes — so a broken document is reported
+/// as such, not as one of the decisions nested in it.
 fn extract_object(text: &str) -> std::result::Result<Value, String> {
-    let mut first_error = None;
+    let mut first = None;
     for (start, _) in text.match_indices('{') {
-        let Some(end) = balanced_end(&text[start..]) else {
-            continue;
+        let rest = &text[start..];
+        let parsed = match balanced_end(rest) {
+            Some(end) => serde_json::from_str::<Value>(&rest[..end]),
+            None if first.is_none() => serde_json::from_str::<Value>(rest),
+            None => continue,
         };
-        match serde_json::from_str::<Value>(&text[start..start + end]) {
-            Ok(value) => return Ok(value),
-            Err(e) => {
-                first_error.get_or_insert_with(|| format!("the JSON object does not parse: {e}"));
+        match parsed {
+            Ok(value) if value.get("decisions").is_some() => return Ok(value),
+            parsed => {
+                first.get_or_insert_with(|| {
+                    parsed.map_err(|e| format!("the JSON object does not parse: {e}"))
+                });
             }
         }
     }
-    Err(first_error.unwrap_or_else(|| "the reply holds no JSON object".into()))
+    first.unwrap_or_else(|| Err("the reply holds no JSON object".into()))
 }
 
 /// The length of the balanced object `text` starts with, strings and
@@ -253,44 +263,96 @@ fn balanced_end(text: &str) -> Option<usize> {
     None
 }
 
-/// Reads and validates a reply: every batch item decided exactly once,
-/// every choice `null` or an id offered for that item, every confidence
-/// `high`, `medium` or `low`. The error is the complaint sent back.
-pub fn parse_reply(
+/// One thing wrong with a decisions document: the item it concerns, or
+/// `None` for the document as a whole, and the full line describing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    pub item: Option<String>,
+    pub problem: String,
+}
+
+impl Problem {
+    fn of(item: Option<&str>, problem: String) -> Self {
+        Problem {
+            item: item.map(str::to_owned),
+            problem,
+        }
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.problem)
+    }
+}
+
+/// Which of the offered items a decisions document must answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completeness {
+    /// Every one: a missing item is a problem.
+    Every,
+    /// Any subset, down to none.
+    Any,
+}
+
+/// Reads and validates a decisions document against the `offered` items:
+/// no item decided twice, every choice `null` or an id offered for that
+/// item, every confidence `high`, `medium` or `low`; with
+/// [`Completeness::Every`], every offered item decided. An item not in
+/// `offered` is described by `unknown(id)`, so every decision returned names
+/// an item in `offered`. A `reason` that is not a string
+/// is read as none. The error lists every problem, in document order.
+pub fn parse_decisions(
     text: &str,
-    batch: &[BatchItem],
-) -> std::result::Result<Vec<LlmDecision>, String> {
-    let value = extract_object(text)?;
+    offered: &[BatchItem],
+    completeness: Completeness,
+    unknown: impl Fn(&str) -> String,
+) -> std::result::Result<Vec<LlmDecision>, Vec<Problem>> {
+    let value = extract_object(text).map_err(|e| vec![Problem::of(None, e)])?;
     let Some(list) = value.get("decisions").and_then(Value::as_array) else {
-        return Err("the object has no \"decisions\" array".into());
+        return Err(vec![Problem::of(
+            None,
+            "the object has no \"decisions\" array".into(),
+        )]);
     };
     let mut problems = Vec::new();
     let mut decisions: Vec<LlmDecision> = Vec::new();
     let mut answered: Vec<&str> = Vec::new();
     for (i, d) in list.iter().enumerate() {
         let Some(id) = d.get("item").and_then(Value::as_str) else {
-            problems.push(format!("decision {} has no \"item\" string", i + 1));
+            problems.push(Problem::of(
+                None,
+                format!("decision {} has no \"item\" string", i + 1),
+            ));
             continue;
         };
-        let Some(offered) = batch.iter().find(|b| b.item == id) else {
-            problems.push(format!("item {id:?} is not in the batch"));
+        let item = Some(id);
+        let Some(offer) = offered.iter().find(|b| b.item == id) else {
+            problems.push(Problem::of(item, unknown(id)));
             continue;
         };
         if answered.contains(&id) {
-            problems.push(format!("item {id} is decided more than once"));
+            problems.push(Problem::of(
+                item,
+                format!("item {id} is decided more than once"),
+            ));
             continue;
         }
         answered.push(id);
         let choice = match d.get("choice") {
             None | Some(Value::Null) => None,
-            Some(Value::String(c)) if offered.offers(c) => Some(c.clone()),
+            Some(Value::String(c)) if offer.offers(c) => Some(c.clone()),
             Some(Value::String(c)) => {
-                problems.push(format!("item {id}: choice {c:?} was not offered for it"));
+                problems.push(Problem::of(
+                    item,
+                    format!("item {id}: choice {c:?} was not offered for it"),
+                ));
                 continue;
             }
             Some(other) => {
-                problems.push(format!(
-                    "item {id}: choice must be a candidate id or null, not {other}"
+                problems.push(Problem::of(
+                    item,
+                    format!("item {id}: choice must be a candidate id or null, not {other}"),
                 ));
                 continue;
             }
@@ -298,9 +360,12 @@ pub fn parse_reply(
         let confidence = match d.get("confidence").cloned().map(serde_json::from_value) {
             Some(Ok(c)) => c,
             _ => {
-                problems.push(format!(
-                    "item {id}: confidence must be one of {}",
-                    confidence_spellings()
+                problems.push(Problem::of(
+                    item,
+                    format!(
+                        "item {id}: confidence must be one of {}",
+                        confidence_spellings()
+                    ),
                 ));
                 continue;
             }
@@ -312,19 +377,46 @@ pub fn parse_reply(
             reason: d.get("reason").and_then(Value::as_str).map(str::to_owned),
         });
     }
-    let missing: Vec<&str> = batch
-        .iter()
-        .map(|b| b.item.as_str())
-        .filter(|id| !answered.contains(id))
-        .collect();
-    if !missing.is_empty() {
-        problems.push(format!("no decision for {}", missing.join(", ")));
+    if completeness == Completeness::Every {
+        let missing: Vec<&str> = offered
+            .iter()
+            .map(|b| b.item.as_str())
+            .filter(|id| !answered.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            problems.push(Problem::of(
+                None,
+                format!("no decision for {}", missing.join(", ")),
+            ));
+        }
     }
     if problems.is_empty() {
         Ok(decisions)
     } else {
-        Err(problems.join("; "))
+        Err(problems)
     }
+}
+
+/// Reads and validates a `ccc` reply to `batch`: [`parse_decisions`] with
+/// every item required. The error is the complaint sent back, the problems
+/// joined by `"; "`.
+pub fn parse_reply(
+    text: &str,
+    batch: &[BatchItem],
+) -> std::result::Result<Vec<LlmDecision>, String> {
+    parse_decisions(text, batch, Completeness::Every, |id| {
+        format!("item {id:?} is not in the batch")
+    })
+    .map_err(|problems| join_problems(&problems))
+}
+
+/// The problems' lines joined by `"; "`.
+pub fn join_problems(problems: &[Problem]) -> String {
+    problems
+        .iter()
+        .map(|p| p.problem.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Writes `contents` to `path` unless it holds exactly that already.
@@ -862,6 +954,124 @@ mod tests {
         for (text, want) in cases {
             assert_eq!(parse_reply(text, &b).unwrap_err(), want, "{text}");
         }
+    }
+
+    #[test]
+    fn a_broken_document_is_reported_as_broken_not_by_a_decision_inside_it() {
+        let b = batch(&["TR:1", "TR:2"]);
+        let cases = [
+            // A trailing comma: the outer object is balanced but does not
+            // parse, while each decision in it does.
+            (
+                r#"{"decisions":[{"item":"TR:1","choice":null,"confidence":"high"},]}"#,
+                "the JSON object does not parse: trailing comma at line 1 column 65",
+            ),
+            // Cut short, as a paste stops at a blank line: the outer object
+            // never closes.
+            (
+                "{\"decisions\": [\n  {\"item\": \"TR:1\", \"choice\": null, \"confidence\": \"high\"},\n",
+                "the JSON object does not parse: EOF while parsing a value at line 3 column 0",
+            ),
+        ];
+        for (text, want) in cases {
+            let problems =
+                parse_decisions(text, &b, Completeness::Any, |id| id.into()).unwrap_err();
+            assert_eq!(join_problems(&problems), want, "{text}");
+        }
+        // Braces in prose before the document do not hide it.
+        let text = "Here is {my answer}, not { this one:\n\
+                    {\"decisions\":[{\"item\":\"TR:1\",\"choice\":null,\"confidence\":\"low\"}]}";
+        let d = parse_decisions(text, &b, Completeness::Any, |id| id.into()).unwrap();
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn any_subset_may_be_answered_and_unknown_items_carry_the_callers_line() {
+        let b = batch(&["TR:1", "TR:2", "TR:3"]);
+        let unknown = |id: &str| format!("item {id:?} has no open question");
+        let one = r#"{"decisions":[{"item":"TR:2","choice":"spotify:track:a","confidence":"medium","reason":7}]}"#;
+        let d = parse_decisions(one, &b, Completeness::Any, unknown).unwrap();
+        assert_eq!(
+            d,
+            [LlmDecision {
+                item: "TR:2".into(),
+                choice: Some("spotify:track:a".into()),
+                confidence: Confidence::Medium,
+                reason: None,
+            }],
+            "a reason that is not a string is none"
+        );
+        assert_eq!(
+            parse_reply(one, &b).unwrap_err(),
+            "no decision for TR:1, TR:3",
+            "the ccc path still needs every item"
+        );
+        assert!(
+            parse_decisions(r#"{"decisions":[]}"#, &b, Completeness::Any, unknown)
+                .unwrap()
+                .is_empty()
+        );
+
+        let bad = r#"{"decisions":[{"item":"TR:9","choice":null,"confidence":"low"},
+                                   {"choice":null},
+                                   {"item":"TR:1","choice":"spotify:track:z","confidence":"low"}]}"#;
+        let problems = parse_decisions(bad, &b, Completeness::Any, unknown).unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                Problem::of(Some("TR:9"), "item \"TR:9\" has no open question".into()),
+                Problem::of(None, "decision 2 has no \"item\" string".into()),
+                Problem::of(
+                    Some("TR:1"),
+                    "item TR:1: choice \"spotify:track:z\" was not offered for it".into()
+                ),
+            ]
+        );
+        assert!(
+            problems
+                .iter()
+                .all(|p| !p.problem.contains("no decision for"))
+        );
+        assert_eq!(
+            problems[0].to_string(),
+            "item \"TR:9\" has no open question"
+        );
+        assert_eq!(problems[1].to_string(), "decision 2 has no \"item\" string");
+        assert_eq!(
+            parse_decisions("nothing", &b, Completeness::Any, unknown).unwrap_err(),
+            [Problem::of(None, "the reply holds no JSON object".into())]
+        );
+    }
+
+    #[test]
+    fn every_problem_of_a_full_reply_is_kept_apart() {
+        let b = batch(&["TR:1", "TR:2"]);
+        let text = r#"{"decisions":[{"item":"TR:1","choice":"spotify:track:z","confidence":"high"},
+                                     {"item":"TR:9","choice":null,"confidence":"high"}]}"#;
+        let problems = parse_decisions(text, &b, Completeness::Every, |id| {
+            format!("item {id:?} is not in the batch")
+        })
+        .unwrap_err();
+        let items: Vec<Option<&str>> = problems.iter().map(|p| p.item.as_deref()).collect();
+        assert_eq!(items, [Some("TR:1"), Some("TR:9"), None]);
+        assert_eq!(join_problems(&problems), parse_reply(text, &b).unwrap_err());
+    }
+
+    #[test]
+    fn a_batch_item_names_its_kind_second() {
+        let item = &batch(&["TR:1"])[0];
+        assert_eq!(item.kind, IdKind::Track);
+        let json = serde_json::to_string(item).unwrap();
+        assert!(
+            json.starts_with(r#"{"item":"TR:1","kind":"track","pandora":"#),
+            "{json}"
+        );
+        let prompt = render_prompt(IdKind::Track, &batch(&["TR:1", "TR:2"])).unwrap();
+        assert!(
+            prompt.starts_with("Match these 2 Pandora tracks"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("\"kind\": \"track\""), "{prompt}");
     }
 
     #[test]

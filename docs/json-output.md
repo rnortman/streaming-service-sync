@@ -25,9 +25,9 @@ reported as a failure of kind `other`, after the command has done its work.
 
 Every success document starts with `"ok": true` and `"command"`, the command
 as typed (`"init"`, `"pandora auth"`, `"pandora export"`, `"pandora
-normalize"`, `"spotify auth"`, `"match"`, `"match review"`, `"match set"`,
-`"match reject"`, `"push"`, `"status"`, `"report"`). The rest is the
-command's report.
+normalize"`, `"spotify auth"`, `"match"`, `"match review"`, `"match
+questions"`, `"match answer"`, `"match set"`, `"match reject"`, `"push"`,
+`"status"`, `"report"`, `"guide"`). The rest is the command's report.
 
 ### `init`
 
@@ -247,7 +247,7 @@ A **Kind** is:
 |---|---|---|
 | `processed` | number | items decided this run |
 | `by_status` | object | count per status decided: `matched`, `unmatched`, `ambiguous`, `llm_failed` |
-| `by_method` | object | count per method of the matches: `isrc`, `exact`, `llm` |
+| `by_method` | object | count per method of the matches: `isrc`, `exact`, `llm` (`manual` and `external` decisions are not made by `match`) |
 | `llm_batches` | number | LLM batches run (0 with `--no-llm`) |
 | `llm_failed_ids` | [string] | Pandora ids left `llm_failed` |
 | `unmatched_ids` | [string] | Pandora ids decided `unmatched` |
@@ -327,6 +327,87 @@ where Spotify gave them, an album's `artists`, `album_type` and
 }
 ```
 
+### `match questions`
+
+The items whose latest entry is `ambiguous` or `llm_failed` (not set by
+hand) among those push would send: what `sss match` would ask its LLM
+about. Contacts no service. Without `--json` stdout is the same object
+without `ok` and `command`, pretty-printed: the one command whose text
+form is JSON.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `items` | [Question] | in kind order (tracks, artists, albums), then Pandora id; `--only` keeps one kind, `--limit N` the first N |
+| `remaining` | number | open items of the selected kinds `--limit` left out; 0 without it |
+
+A **Question** is:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `item` | string | the Pandora id |
+| `kind` | `"track"` \| `"artist"` \| `"album"` | |
+| `pandora` | object | a track's `title`, `artist`, `album`, `duration_s`, `explicit_hint`, `flags`, `station_names`, `playlist_names`; an artist's `name`, `station_names`, `station_thumbs_up`; an album's `name`, `artist` |
+| `candidates` | [Offered] | every stored candidate, best score first |
+
+An **Offered** candidate has `id` (the Spotify URI a decision names) and
+`name`; a track's adds `artists`, `album`, `album_type`, `release_date`,
+`duration_ms`, `explicit` and `isrc`, an album's `artists`, `album_type`
+and `release_date`, each only where Spotify gave it. There is no `score`.
+
+```json
+{
+  "ok": true,
+  "command": "match questions",
+  "items": [
+    {
+      "item": "TR:123",
+      "kind": "track",
+      "pandora": { "title": "Song", "artist": "Artist", "album": "Album",
+        "duration_s": 215, "explicit_hint": false, "flags": [],
+        "station_names": ["Artist Radio"], "playlist_names": [] },
+      "candidates": [
+        { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+          "artists": ["Artist"], "album": "Album", "duration_ms": 215000 }
+      ]
+    }
+  ],
+  "remaining": 0
+}
+```
+
+### `match answer`
+
+Reads a decisions document, `{"decisions": [{"item", "choice",
+"confidence", "reason"}]}`, from `--from-file` or stdin (up to an empty
+line), checks all of it against the open items of `match questions`, and
+appends one entry per decision with method `external`. Any problem
+refuses the whole document with kind `input` and nothing recorded (see
+*Details*). `--limit N` records the first N decisions of a valid document.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `recorded` | [Recorded] | the decisions recorded, in document order |
+| `not_recorded` | [string] | the Pandora ids of the valid decisions `--limit` left out, in order |
+
+A **Recorded** is `{ item, status, spotify_uri, confidence }`: `status`
+`matched` with the chosen URI, or `unmatched` with `spotify_uri` `null`
+for a `null` choice.
+
+```json
+{
+  "ok": true,
+  "command": "match answer",
+  "recorded": [
+    { "item": "TR:123", "status": "matched",
+      "spotify_uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "confidence": "high" }
+  ],
+  "not_recorded": []
+}
+```
+
+A failed write part-way is kind `other`, naming the file and the item it
+stopped at; the decisions before it are recorded.
+
 ### `match set` and `match reject`
 
 `sss match set <pandora-id> <spotify>` takes a Spotify URI
@@ -334,7 +415,9 @@ where Spotify gave them, an album's `artists`, `album_type` and
 a bare id; its type must be the one the Pandora id's prefix calls for
 (`TR:` a track, `AR:`/`CO:` an artist, `AL:` an album), else kind `input`.
 `sss match reject <pandora-id>` records that the item has no Spotify
-counterpart. Neither makes a network request.
+counterpart. Neither makes a network request. Their entries have method
+`manual`; the other methods an entry can carry are `isrc`, `exact`, `llm`
+(`sss match`) and `external` (`sss match answer`).
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -498,11 +581,30 @@ A **Profile** is:
 }
 ```
 
+### `guide`
+
+Needs no data repository or profile and reads nothing.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `topic` | `"agent"` \| `"matching"` | the document: `sss guide` or `sss guide matching` |
+| `text` | string | the document, exactly as printed without `--json` |
+
+```json
+{
+  "ok": true,
+  "command": "guide",
+  "topic": "agent",
+  "text": "# Operating `sss` for a person: a guide for an agent\n…"
+}
+```
+
 ### `report`
 
 Writes `profiles/<name>/report.md` from the normalized export, the match
 entries and `spotify/state.json`, without contacting any service, and
-reports where.
+reports where. Its match table counts the matches of each kind by method:
+`isrc`, `exact`, `llm`, `manual` and `external`.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -542,13 +644,13 @@ reports where.
 | `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again |
 | `quota` | Spotify's rate or quota limit, or `ccc`'s usage limit, was reached; everything done so far is recorded | run the command again later; it continues where it stopped |
 | `incomplete` | an export run ended with failed steps | look at `details.failed_steps`; the run is kept |
-| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type) | supply the value again |
+| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
 | `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
 | `other` | anything else: a file that cannot be read or written, unparseable data | read `error` |
 
 ### Details
 
-Only `pandora export` gives `details`, in two cases.
+`pandora export` gives `details` in two cases, and `match answer` in one.
 
 - **The run ended with failed steps** (`kind` `incomplete`):
   `{ run_id, run_dir, failed_steps: [step name], manifest }`.
@@ -587,5 +689,25 @@ Only `pandora export` gives `details`, in two cases.
   }
   ```
 
+- **`match answer` refused the decisions document** (`kind` `input`):
+  `{ problems: [{ item, problem }] }`, one per problem in document order;
+  `item` is the Pandora id concerned, `null` for the document as a whole,
+  and `problem` is the line as it appears in `error`. Nothing was recorded.
+
+  ```json
+  {
+    "ok": false,
+    "command": "match answer",
+    "kind": "input",
+    "error": "2 problems with the decisions; nothing was recorded: item TR:1: choice \"spotify:track:z\" was not offered for it; decision 2 has no \"item\" string",
+    "details": {
+      "problems": [
+        { "item": "TR:1", "problem": "item TR:1: choice \"spotify:track:z\" was not offered for it" },
+        { "item": null, "problem": "decision 2 has no \"item\" string" }
+      ]
+    }
+  }
+  ```
+
 A failure before the run directory exists, a run directory whose path is
-not UTF-8, and every failure of the other commands, have no `details`.
+not UTF-8, and every other failure, have no `details`.

@@ -354,7 +354,7 @@ pub struct Spotify {
 impl Spotify {
     /// A client for the token stored in `state`, renewed with `client_id`.
     /// `market` is the `[spotify] market` setting; empty means the
-    /// market of the member's token. No stored token is kind `auth`.
+    /// market of the signed-in account. No stored token is kind `auth`.
     pub fn new(
         state: StateDir,
         client_id: &str,
@@ -404,21 +404,17 @@ impl Spotify {
 
     /// `GET search`: up to [`SEARCH_LIMIT`] results of `kind` for `q`.
     pub fn search(&mut self, q: &str, kind: IdKind) -> Result<SearchResults> {
-        let market = if self.market.is_empty() {
-            "from_token".to_owned()
-        } else {
-            self.market.clone()
-        };
         let limit = SEARCH_LIMIT.to_string();
+        let market = self.market.clone();
+        let mut query = vec![("q", q), ("type", kind.as_str()), ("limit", &limit)];
+        // With no `market`, Spotify uses the country of the user's token.
+        if !market.is_empty() {
+            query.push(("market", &market));
+        }
         let wire: WireSearch = self.json(&Call {
             method: "GET",
             path: "search",
-            query: &[
-                ("q", q),
-                ("type", kind.as_str()),
-                ("limit", &limit),
-                ("market", &market),
-            ],
+            query: &query,
             body: None,
         })?;
         Ok(SearchResults {
@@ -835,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn search_sends_the_bearer_and_parses_a_lenient_body() {
+    fn search_with_no_market_sends_none_and_parses_a_lenient_body() {
         let tmp = tempfile::tempdir().unwrap();
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -845,7 +841,7 @@ mod tests {
                 .query_param("q", "isrc:USRC17607839")
                 .query_param("type", "track")
                 .query_param("limit", "10")
-                .query_param("market", "from_token");
+                .query_param_missing("market");
             then.status(200)
                 .json_body(json!({"tracks": {"href": "x", "items": [
                 {"uri": "spotify:track:a", "name": "Song", "popularity": 3,

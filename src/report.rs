@@ -694,7 +694,7 @@ mod tests {
 
     /// Profile alice with [`export`] written and `TR:a` matched, `TR:b`
     /// ambiguous with one candidate, `TR:d` (thumbs-down only) unmatched,
-    /// `AR:1` matched and `AR:2` unmatched.
+    /// `AR:1` matched and `AR:2` unmatched by an `external` decision.
     fn fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         // Underscores after a `/` would open emphasis if left unescaped.
@@ -727,7 +727,10 @@ mod tests {
             &entry("AR:1", Status::Matched, Some(&uri("artist", '1'))),
         )
         .unwrap();
-        matches::append(&artists, &entry("AR:2", Status::Unmatched, None)).unwrap();
+        let mut external = entry("AR:2", Status::Unmatched, None);
+        external.method = Some(Method::External);
+        external.confidence = Some(Confidence::Medium);
+        matches::append(&artists, &external).unwrap();
         Fixture { _tmp: tmp, paths }
     }
 
@@ -767,11 +770,15 @@ mod tests {
         let summary = section(&doc, "Matches");
         // Tracks push sends: TR:a, TR:b (thumbs up), not TR:d or TR:c.
         assert!(
-            summary.contains("| tracks | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |"),
+            summary.contains("| by llm | by manual | by external |"),
             "{summary}"
         );
         assert!(
-            summary.contains("| artists | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 |"),
+            summary.contains("| tracks | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("| artists | 2 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |"),
             "{summary}"
         );
         assert!(summary.contains("| albums | 0 | 0 |"), "{summary}");

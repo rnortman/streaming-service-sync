@@ -22,21 +22,13 @@ fn main() -> ExitCode {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    let result = match StateRoot::locate() {
-        Ok(state_root) => cli::run(
-            cli,
-            &state_root,
-            &mut std::io::stdin().lock(),
-            &mut stdout,
-            &mut std::io::stderr(),
-        ),
-        Err(e) => {
-            // A write failure here leaves stdout broken; `e` is still the
-            // error to report.
-            let _ = cli::report_failure(&cli, &e, &mut stdout);
-            Err(e)
-        }
-    };
+    let result = cli::run(
+        cli,
+        StateRoot::locate,
+        &mut std::io::stdin().lock(),
+        &mut stdout,
+        &mut std::io::stderr(),
+    );
     let flushed = stdout
         .flush()
         .map_err(|e| anyhow::Error::new(e).context("writing output"));

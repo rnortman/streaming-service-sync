@@ -91,11 +91,19 @@ pub enum Method {
     Exact,
     Llm,
     Manual,
+    /// Decided outside `sss` and submitted with `sss match answer`.
+    External,
 }
 
 impl Method {
     /// Every variant, in declaration order.
-    pub const ALL: [Method; 4] = [Method::Isrc, Method::Exact, Method::Llm, Method::Manual];
+    pub const ALL: [Method; 5] = [
+        Method::Isrc,
+        Method::Exact,
+        Method::Llm,
+        Method::Manual,
+        Method::External,
+    ];
 
     /// The JSON spelling.
     pub fn as_str(self) -> &'static str {
@@ -104,6 +112,7 @@ impl Method {
             Method::Exact => "exact",
             Method::Llm => "llm",
             Method::Manual => "manual",
+            Method::External => "external",
         }
     }
 }
@@ -173,7 +182,7 @@ pub struct MatchEntry {
     #[serde(default)]
     pub queries: Vec<String>,
     pub decided_at: String,
-    /// The ccc session id of an `llm` decision.
+    /// The ccc session id of an `llm` decision; `None` for an `external` one.
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
@@ -346,6 +355,11 @@ mod tests {
             serde_json::to_value(Method::Manual).unwrap(),
             serde_json::json!("manual")
         );
+        assert_eq!(
+            serde_json::to_value(Method::External).unwrap(),
+            serde_json::json!("external")
+        );
+        assert!(Method::ALL.contains(&Method::External));
         assert!(serde_json::from_value::<Status>(serde_json::json!("pending")).is_err());
     }
 
@@ -394,6 +408,8 @@ mod tests {
             (Status::Ambiguous, None, false, true),
             (Status::LlmFailed, None, false, true),
             (Status::Ambiguous, Some(Method::Manual), true, false),
+            (Status::Unmatched, Some(Method::External), true, false),
+            (Status::Matched, Some(Method::External), true, false),
         ];
         for (status, method, settled, llm) in cases {
             let e = entry("TR:1", status, method);
