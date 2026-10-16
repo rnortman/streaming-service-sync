@@ -32,14 +32,20 @@ pub const REDIRECT_URI: &str = "https://127.0.0.1/callback";
 
 /// The scopes every sign-in asks for.
 pub const SCOPES: &[&str] = &[
-    "playlist-read-private",
+    PLAYLIST_READ_SCOPES[0],
+    PLAYLIST_READ_SCOPES[1],
     "playlist-modify-private",
+    PLAYLIST_MODIFY_PUBLIC_SCOPE,
     "user-library-read",
     "user-library-modify",
     "user-follow-read",
     "user-follow-modify",
     PLAYBACK_READ_SCOPE,
     PLAYBACK_MODIFY_SCOPE,
+    "user-read-currently-playing",
+    "user-read-playback-position",
+    RECENTLY_PLAYED_SCOPE,
+    TOP_READ_SCOPE,
 ];
 
 /// The scope that reads the player's devices, state and queue.
@@ -48,8 +54,17 @@ pub const PLAYBACK_READ_SCOPE: &str = "user-read-playback-state";
 /// The scope that controls playback: play, pause, skip, queue, shuffle.
 pub const PLAYBACK_MODIFY_SCOPE: &str = "user-modify-playback-state";
 
-/// The extra scope asked for when `[push] public_playlists = true`.
-pub const PUBLIC_PLAYLISTS_SCOPE: &str = "playlist-modify-public";
+/// The scope that reads the member's play history.
+pub const RECENTLY_PLAYED_SCOPE: &str = "user-read-recently-played";
+
+/// The scope that reads the member's top tracks and artists.
+pub const TOP_READ_SCOPE: &str = "user-top-read";
+
+/// The scope that creates and changes public playlists.
+pub const PLAYLIST_MODIFY_PUBLIC_SCOPE: &str = "playlist-modify-public";
+
+/// The scopes that list the member's playlists, private and collaborative.
+pub const PLAYLIST_READ_SCOPES: &[&str] = &["playlist-read-private", "playlist-read-collaborative"];
 
 /// The public document that walks through registering the app.
 pub const SETUP_DOC: &str = "docs/spotify-app-setup.md";
@@ -60,13 +75,18 @@ Paste the whole address the browser landed on (https://127.0.0.1/callback?code=â
 then press Enter on an empty line.
 Address: ";
 
-/// The scopes to ask for.
-pub fn scopes(public_playlists: bool) -> Vec<String> {
-    let mut scopes: Vec<String> = SCOPES.iter().map(|&s| s.to_owned()).collect();
-    if public_playlists {
-        scopes.push(PUBLIC_PLAYLISTS_SCOPE.to_owned());
-    }
-    scopes
+/// The scopes to ask for: [`SCOPES`], owned.
+pub fn scopes() -> Vec<String> {
+    SCOPES.iter().map(|&s| s.to_owned()).collect()
+}
+
+/// The scopes of `wanted` that `granted` lacks, in `wanted` order.
+pub fn missing<'a>(wanted: &[&'a str], granted: &[String]) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .copied()
+        .filter(|s| !granted.iter().any(|g| g == s))
+        .collect()
 }
 
 /// `$SSS_SPOTIFY_AUTH_BASE_URL` when set and non-empty, else the live
@@ -223,7 +243,6 @@ pub fn start(
     profile: &str,
     client_id: Option<&str>,
     config_path: &Path,
-    public_playlists: bool,
     state: &StateDir,
     auth_base: &str,
 ) -> Result<AuthStartReport> {
@@ -231,7 +250,7 @@ pub fn start(
     let pending = Pending {
         client_id: client_id.to_owned(),
         redirect_uri: REDIRECT_URI.to_owned(),
-        scopes: scopes(public_playlists),
+        scopes: scopes(),
         state: new_state()?,
         verifier: new_verifier()?,
         created_at: crate::repo::now_rfc3339()?,
@@ -497,7 +516,7 @@ mod tests {
         Pending {
             client_id: "test-client-id".into(),
             redirect_uri: REDIRECT_URI.into(),
-            scopes: scopes(false),
+            scopes: scopes(),
             state: "st4te".into(),
             verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
             created_at: "2026-10-15T00:00:00Z".into(),
@@ -579,18 +598,42 @@ mod tests {
     fn every_sign_in_asks_for_the_playback_scopes() {
         for scope in ["user-read-playback-state", "user-modify-playback-state"] {
             assert!(SCOPES.contains(&scope), "{scope}");
-            assert!(scopes(false).iter().any(|s| s == scope), "{scope}");
+            assert!(scopes().iter().any(|s| s == scope), "{scope}");
             let url = authorize_url("https://accounts.example", &pending()).unwrap();
             assert!(url.contains(scope), "{url}");
         }
     }
 
     #[test]
-    fn public_playlists_add_their_scope() {
-        assert!(!scopes(false).contains(&PUBLIC_PLAYLISTS_SCOPE.to_owned()));
-        let public = scopes(true);
-        assert_eq!(public.len(), SCOPES.len() + 1);
-        assert_eq!(public.last().unwrap(), PUBLIC_PLAYLISTS_SCOPE);
+    fn every_sign_in_asks_for_the_fourteen_scopes_once() {
+        let want = [
+            "playlist-read-private",
+            "playlist-read-collaborative",
+            "playlist-modify-private",
+            "playlist-modify-public",
+            "user-library-read",
+            "user-library-modify",
+            "user-follow-read",
+            "user-follow-modify",
+            "user-read-playback-state",
+            "user-modify-playback-state",
+            "user-read-currently-playing",
+            "user-read-playback-position",
+            "user-read-recently-played",
+            "user-top-read",
+        ];
+        assert_eq!(SCOPES, want);
+        assert_eq!(scopes(), want);
+        let unique: std::collections::BTreeSet<_> = SCOPES.iter().collect();
+        assert_eq!(unique.len(), SCOPES.len());
+    }
+
+    #[test]
+    fn missing_is_wanted_minus_granted_in_wanted_order() {
+        let granted = vec!["c".to_owned(), "a".to_owned(), "extra".to_owned()];
+        assert_eq!(missing(&["d", "a", "b", "c"], &granted), ["d", "b"]);
+        assert!(missing(&["a", "c"], &granted).is_empty());
+        assert_eq!(missing(&["a"], &[]), ["a"]);
     }
 
     #[test]
@@ -601,7 +644,6 @@ mod tests {
             "alice",
             None,
             Path::new("/data/config.toml"),
-            false,
             &state,
             "https://a",
         )
@@ -623,7 +665,6 @@ mod tests {
             "alice",
             Some("test-client-id"),
             Path::new("/c"),
-            true,
             &state,
             "https://a",
         )
@@ -633,7 +674,7 @@ mod tests {
         assert_eq!(stored.verifier.len(), 86);
         assert_eq!(stored.client_id, "test-client-id");
         assert_eq!(stored.redirect_uri, REDIRECT_URI);
-        assert_eq!(stored.scopes, scopes(true));
+        assert_eq!(stored.scopes, scopes());
         assert_eq!(
             report.authorize_url,
             authorize_url("https://a", &stored).unwrap()
@@ -822,7 +863,7 @@ mod tests {
             200,
             json!({"access_token": "a", "expires_in": 60, "refresh_token": "r"}),
         );
-        assert_eq!(run_complete(&state, &server).unwrap().scopes, scopes(false));
+        assert_eq!(run_complete(&state, &server).unwrap().scopes, scopes());
     }
 
     #[test]

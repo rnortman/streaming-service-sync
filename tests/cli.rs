@@ -1903,6 +1903,101 @@ fn playback_without_the_playback_scopes_is_kind_auth_before_any_request() {
     );
 }
 
+/// The scopes `sss spotify auth` asks for, in order.
+const ALL_SCOPES: &[&str] = &[
+    "playlist-read-private",
+    "playlist-read-collaborative",
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "user-library-read",
+    "user-library-modify",
+    "user-follow-read",
+    "user-follow-modify",
+    "user-read-playback-state",
+    "user-modify-playback-state",
+    "user-read-currently-playing",
+    "user-read-playback-position",
+    "user-read-recently-played",
+    "user-top-read",
+];
+
+#[test]
+fn spotify_auth_asks_for_every_scope_whatever_public_playlists_says() {
+    for public in ["false", "true"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_spotify_token(tmp.path(), &[]);
+        std::fs::write(
+            Path::new(&repo).join("config.toml"),
+            format!(
+                "[spotify]\nclient_id = \"test-client-id\"\n[push]\npublic_playlists = {public}\n"
+            ),
+        )
+        .expect("write config");
+        let out = sss(tmp.path())
+            .env("SSS_SPOTIFY_AUTH_BASE_URL", "https://accounts.example")
+            .args(["--repo", &repo, "--profile", "alice", "spotify", "auth"])
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let address = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(
+            url_param(&address, "scope").replace('+', " "),
+            ALL_SCOPES.join(" "),
+            "public_playlists = {public}"
+        );
+    }
+}
+
+#[test]
+fn status_names_the_scopes_an_old_token_lacks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let old_eight = [
+        "playlist-read-private",
+        "playlist-modify-private",
+        "user-library-read",
+        "user-library-modify",
+        "user-follow-read",
+        "user-follow-modify",
+        "user-read-playback-state",
+        "user-modify-playback-state",
+    ];
+    let repo = repo_with_spotify_token(tmp.path(), &old_eight);
+    let new_six = [
+        "playlist-read-collaborative",
+        "playlist-modify-public",
+        "user-read-currently-playing",
+        "user-read-playback-position",
+        "user-read-recently-played",
+        "user-top-read",
+    ];
+    let out = sss(tmp.path())
+        .args(["--repo", &repo, "status", "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(
+        doc["profiles"][0]["spotify_token"]["missing_scopes"],
+        serde_json::json!(new_six)
+    );
+    let out = sss(tmp.path())
+        .args(["--repo", &repo, "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!(
+            "    lacks {}; run `sss spotify auth --profile alice` to sign in again\n",
+            new_six.join(", ")
+        )),
+        "{text}"
+    );
+}
+
 #[test]
 fn play_with_no_player_open_is_kind_player() {
     let server = httpmock::MockServer::start();
@@ -2091,4 +2186,157 @@ fn play_station_shuffled_starts_at_a_random_track() {
     assert_eq!(body["context_uri"], "spotify:playlist:pl1");
     let position = body["offset"]["position"].as_u64().expect("position");
     assert!(position < 40, "{body}");
+}
+
+#[test]
+fn history_reads_the_last_plays_in_one_request() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), &["user-read-recently-played"]);
+    let read = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/player/recently-played")
+            .query_param("limit", "50");
+        then.status(200).json_body(serde_json::json!({"items": [
+            {"played_at": "2026-10-16T13:02:11.483Z",
+             "track": {"type": "track", "uri": TRACK_A, "name": "Song",
+                       "artists": [{"name": "Artist"}], "duration_ms": 215000},
+             "context": null}]}));
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["history"]);
+    assert_eq!(code, 0, "{doc}");
+    read.assert_calls(1);
+    assert_eq!(doc["command"], "history");
+    assert_eq!(doc["items"][0]["played_at"], "2026-10-16T13:02:11.483Z");
+    assert_eq!(doc["items"][0]["track"]["id"], TRACK_A);
+}
+
+#[test]
+fn history_without_its_scope_is_kind_auth_before_any_request() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), &["user-library-read"]);
+    let any = server.mock(|_, then| {
+        then.status(500);
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["history"]);
+    assert_eq!(code, 1);
+    any.assert_calls(0);
+    assert_eq!(doc["kind"], "auth");
+    let error = doc["error"].as_str().expect("error");
+    assert!(error.contains("user-read-recently-played"), "{error}");
+}
+
+#[test]
+fn top_sends_the_range_and_limit_given() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), &["user-top-read"]);
+    let read = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/top/artists")
+            .query_param("time_range", "short_term")
+            .query_param("limit", "5");
+        then.status(200).json_body(serde_json::json!({"items": [
+            {"uri": "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist"}]}));
+    });
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["top", "artists", "--range", "short", "--limit", "5"],
+    );
+    assert_eq!(code, 0, "{doc}");
+    read.assert_calls(1);
+    assert_eq!(doc["kind"], "artists");
+    assert_eq!(doc["range"], "short");
+    assert_eq!(
+        doc["items"][0]["id"],
+        "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF"
+    );
+}
+
+/// The scopes both playlist commands need.
+const PLAYLIST_SCOPES: &[&str] = &["playlist-read-private", "playlist-read-collaborative"];
+
+/// A wire playlist owned by `owner`.
+fn wire_playlist(id: &str, owner: &str) -> serde_json::Value {
+    serde_json::json!({"uri": format!("spotify:playlist:{id}"), "name": "Morning",
+        "description": "", "public": false, "collaborative": false,
+        "owner": {"id": owner, "display_name": null},
+        "items": {"href": "https://api.spotify.com/v1/x", "total": 1}})
+}
+
+#[test]
+fn playlists_names_the_account_and_reads_every_page() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYLIST_SCOPES);
+    let me = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/me");
+        then.status(200)
+            .json_body(serde_json::json!({"id": "alice-spotify", "display_name": "Alice"}));
+    });
+    let first: Vec<_> = (0..50)
+        .map(|n| wire_playlist(&format!("{n:0>22}"), "alice-spotify"))
+        .collect();
+    let page1 = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/playlists")
+            .query_param("offset", "0");
+        then.status(200).json_body(serde_json::json!({
+            "items": first, "next": "https://api.spotify.com/v1/me/playlists?offset=50"}));
+    });
+    let page2 = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/playlists")
+            .query_param("offset", "50");
+        then.status(200).json_body(serde_json::json!({
+            "items": [wire_playlist("37i9dQZF1DXcBWIGoYBM5M", "bob-spotify")],
+            "next": null}));
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["playlists"]);
+    assert_eq!(code, 0, "{doc}");
+    me.assert_calls(1);
+    page1.assert_calls(1);
+    page2.assert_calls(1);
+    assert_eq!(doc["user"]["id"], "alice-spotify");
+    let playlists = doc["playlists"].as_array().expect("playlists");
+    assert_eq!(playlists.len(), 51);
+    assert_eq!(playlists[50]["owner"]["id"], "bob-spotify");
+    assert_eq!(playlists[50]["owner"]["name"], "bob-spotify");
+}
+
+#[test]
+fn playlist_reads_the_details_then_the_items() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYLIST_SCOPES);
+    let id = "37i9dQZF1DXcBWIGoYBM5M";
+    let details = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/v1/playlists/{id}"));
+        then.status(200)
+            .json_body(wire_playlist(id, "alice-spotify"));
+    });
+    let items = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/v1/playlists/{id}/items"))
+            .query_param("limit", "100");
+        then.status(200).json_body(serde_json::json!({"items": [
+            {"item": {"type": "track", "uri": TRACK_B, "name": "Other song",
+                      "artists": [{"name": "Artist"}]}}], "next": null}));
+    });
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["playlist", &format!("spotify:playlist:{id}")],
+    );
+    assert_eq!(code, 0, "{doc}");
+    details.assert_calls(1);
+    items.assert_calls(1);
+    let entry = &doc["playlists"][0];
+    assert_eq!(entry["playlist"]["total"], 1);
+    assert_eq!(entry["items"][0]["id"], TRACK_B);
 }

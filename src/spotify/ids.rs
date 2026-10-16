@@ -115,27 +115,29 @@ fn is_base62_id(id: &str) -> bool {
     id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// The guidance [`parse`] and [`parse_target`] end their refusals with.
 const FORMS: &str = "give a Spotify URI (spotify:track:<id>), an https://open.spotify.com/track/<id> \
                      address or a bare 22-character id";
 
 /// Splits `text`, a URI, an open.spotify.com address (an `intl-xx` path
 /// segment and any query allowed) or a bare id, into its type segment
-/// (none for a bare id) and its base-62 id.
-fn split(text: &str) -> Result<(Option<String>, String)> {
+/// (none for a bare id) and its base-62 id. Every refusal ends with
+/// `forms`, the guidance on what the caller takes.
+pub fn split(text: &str, forms: &str) -> Result<(Option<String>, String)> {
     let text = text.trim();
     let (segment, id) = if let Some(rest) = text.strip_prefix("spotify:") {
         let Some((kind, id)) = rest.split_once(':') else {
-            fail!(Kind::Input, "{text:?} is not a Spotify URI; {FORMS}");
+            fail!(Kind::Input, "{text:?} is not a Spotify URI; {forms}");
         };
         (Some(kind.to_owned()), id.to_owned())
     } else if text.contains('/') {
         let Ok(url) = Url::parse(text) else {
-            fail!(Kind::Input, "{text:?} is not a web address; {FORMS}");
+            fail!(Kind::Input, "{text:?} is not a web address; {forms}");
         };
         if url.host_str() != Some("open.spotify.com") {
             fail!(
                 Kind::Input,
-                "{text:?} is not an open.spotify.com address; {FORMS}"
+                "{text:?} is not an open.spotify.com address; {forms}"
             );
         }
         let segments: Vec<&str> = url
@@ -149,7 +151,7 @@ fn split(text: &str) -> Result<(Option<String>, String)> {
         let [kind, id] = segments else {
             fail!(
                 Kind::Input,
-                "{text:?} is not the address of a track, artist or album; {FORMS}"
+                "{text:?} is not the address of a Spotify item; {forms}"
             );
         };
         (Some((*kind).to_owned()), (*id).to_owned())
@@ -157,7 +159,7 @@ fn split(text: &str) -> Result<(Option<String>, String)> {
         (None, text.to_owned())
     };
     if !is_base62_id(&id) {
-        fail!(Kind::Input, "{text:?} does not carry a Spotify id; {FORMS}");
+        fail!(Kind::Input, "{text:?} does not carry a Spotify id; {forms}");
     }
     Ok((segment, id))
 }
@@ -166,7 +168,7 @@ fn split(text: &str) -> Result<(Option<String>, String)> {
 /// segment and any query allowed) or a bare id of a track, artist or
 /// album. A bare id has no kind.
 pub fn parse(text: &str) -> Result<(Option<IdKind>, String)> {
-    let (segment, id) = split(text)?;
+    let (segment, id) = split(text, FORMS)?;
     let text = text.trim();
     let kind = match segment {
         None => None,
@@ -232,7 +234,7 @@ impl Target {
 /// Parses `text` (any form [`parse`] takes) as a track, album, artist or
 /// playlist; a bare id is a track.
 pub fn parse_target(text: &str) -> Result<Target> {
-    let (segment, id) = split(text)?;
+    let (segment, id) = split(text, FORMS)?;
     let context = |kind| {
         Ok(Target::Context {
             kind,
@@ -319,6 +321,29 @@ mod tests {
             assert_eq!(crate::error::kind(&err), Kind::Input, "{text}");
             assert!(format!("{err:#}").contains(needle), "{text}: {err:#}");
         }
+    }
+
+    #[test]
+    fn split_ends_every_refusal_with_the_forms_given() {
+        for text in [
+            "spotify:track",
+            "https://example.com/track/4uLU6hMCjMI75M1A2tKUQC",
+            "https://open.spotify.com/track",
+            "https://open.spotify.com/track/short",
+            "://open.spotify.com/x",
+            "not an id",
+        ] {
+            let err = split(text, "take a widget").unwrap_err();
+            assert_eq!(crate::error::kind(&err), Kind::Input, "{text}");
+            assert!(
+                format!("{err:#}").ends_with("; take a widget"),
+                "{text}: {err:#}"
+            );
+        }
+        assert_eq!(
+            split(&format!("spotify:playlist:{ID}"), "x").unwrap(),
+            (Some("playlist".to_owned()), ID.to_owned())
+        );
     }
 
     #[test]

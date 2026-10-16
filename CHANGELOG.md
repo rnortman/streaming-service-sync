@@ -6,6 +6,40 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+Every profile should sign in to Spotify once more: `sss` now asks for the
+full set of permissions ("scopes") it can use for music, so no later
+feature needs another sign-in. Old tokens keep working for everything they
+could already do.
+
+### Added
+
+- **`sss history`**: the member's last finished plays, newest first, each
+  with the playlist, album or artist it was played from.
+- **`sss top tracks|artists`**: Spotify's ranking of what the member plays
+  most, over `--range short|medium|long`.
+- **`sss playlists`** lists every playlist on the account, the member's
+  own and the ones they follow, with owner and item count; **`sss playlist
+  TARGET...`** shows playlists' contents (Spotify shows a playlist's items
+  only to its owner and collaborators; any other is reported with `items:
+  null`).
+- `sss status` names the scopes the stored Spotify token lacks
+  (`spotify_token.missing_scopes`).
+
+### Changed
+
+- Spotify sign-in asks for the full scope set: `playlist-read-private`,
+  `playlist-read-collaborative`, `playlist-modify-private`,
+  `playlist-modify-public`, `user-library-read`, `user-library-modify`,
+  `user-follow-read`, `user-follow-modify`, `user-read-playback-state`,
+  `user-modify-playback-state`, `user-read-currently-playing`,
+  `user-read-playback-position`, `user-read-recently-played` and
+  `user-top-read`. A command needing a scope the token lacks stops with
+  kind `auth` and says to sign in again.
+- `playlist-modify-public` is always asked for, so `[push]
+  public_playlists` only decides whether the playlists `sss push` creates
+  are public. With an older token that lacks the scope, `sss push` stops
+  with kind `auth` before creating a public playlist.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

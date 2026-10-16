@@ -27,7 +27,8 @@ Every success document starts with `"ok": true` and `"command"`, the command
 as typed (`"init"`, `"pandora auth"`, `"pandora export"`, `"pandora
 normalize"`, `"spotify auth"`, `"match"`, `"match review"`, `"match
 questions"`, `"match answer"`, `"match set"`, `"match reject"`, `"push"`,
-`"status"`, `"report"`, `"guide"`, `"search"`, `"devices"`, `"player"`,
+`"status"`, `"report"`, `"guide"`, `"search"`, `"history"`, `"top"`,
+`"playlists"`, `"playlist"`, `"devices"`, `"player"`,
 `"play"`, `"pause"`, `"next"`, `"previous"`, `"queue"`, `"shuffle"`,
 `"repeat"`, `"volume"`, `"seek"`). The rest is the command's report.
 
@@ -69,6 +70,30 @@ A **PlayerState** is the player as Spotify reports it:
 
 A **Context** is `{ type, uri }`: `type` is `playlist`, `album`, `artist`
 or another kind Spotify names, `uri` its Spotify URI.
+
+A **Played** is one finished play from the member's history:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `played_at` | string | when the play finished, RFC 3339, as Spotify gives it |
+| `track` | Offered | what was played |
+| `context` | Context, optional | the playlist, album or artist it was played from; `null` when none |
+
+A **User** is the signed-in Spotify account, an **Owner** a playlist's
+owner; both are `{ id, name }`: the Spotify user id, and the display name,
+else the id.
+
+A **Playlist** is a playlist on the member's account, or one read by URI:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | its Spotify URI, the value `sss play` and `sss playlist` take |
+| `name` | string | |
+| `owner` | Owner | its owner; not `user` (`sss playlists`) for one shared with the member |
+| `public` | boolean, optional | Spotify's flag; `null` when Spotify gives none |
+| `collaborative` | boolean | |
+| `total` | number, optional | the item count: a number, or `null` when Spotify does not expose the playlist's items to the member — a playlist they neither own nor collaborate on |
+| `description` | string, optional | absent when empty; a playlist `sss push` made ends it with `sss:<key>` |
 
 ### `init`
 
@@ -578,7 +603,7 @@ A **Profile** is:
 |---|---|---|
 | `name` | string | the profile |
 | `pandora_session` | object, optional | `{ stored_at, webname (optional), source }` of the stored session; never its token |
-| `spotify_token` | object, optional | `{ stored_at, expires_at, scopes }` of the stored Spotify token; never its values |
+| `spotify_token` | object, optional | `{ stored_at, expires_at, scopes, missing_scopes }` of the stored Spotify token; never its values. `missing_scopes` lists the scopes this `sss` signs in with that the token was not granted — `[]` when none; a command that needs one fails with kind `auth` until the member runs `sss spotify auth` again |
 | `export.latest_run` | object, optional | `{ run_id, manifest }` of the newest run; `manifest` is `null` for a run that did not finish |
 | `export.latest_complete_run` | string, optional | the newest run whose manifest says `complete` |
 | `matches.tracks`, `matches.artists`, `matches.albums` | object | the count of each match status, over the latest entry per Pandora id |
@@ -598,7 +623,8 @@ A **Profile** is:
       "spotify_token": {
         "stored_at": "2026-10-15T12:02:11Z",
         "expires_at": "2026-10-15T13:02:11Z",
-        "scopes": ["playlist-read-private", "…"]
+        "scopes": ["playlist-read-private", "…"],
+        "missing_scopes": ["user-read-recently-played", "user-top-read"]
       },
       "export": {
         "latest_run": {
@@ -684,6 +710,133 @@ not searched, or with no match, is `[]`.
       "artists": [{ "id": "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist" }],
       "albums": []
     }
+  ]
+}
+```
+
+### `history`
+
+`sss history [--limit N]` reads the member's last finished plays (`--limit`
+1 to 50, default 50), newest first. Spotify keeps only the last 50
+completed tracks: a track playing now is not in it until it ends, and
+podcast episodes never are. Needs `user-read-recently-played`; a token
+without it is kind `auth` before any request.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `items` | [Played] | newest first; `[]` is a success |
+
+```json
+{
+  "ok": true,
+  "command": "history",
+  "profile": "alice",
+  "items": [
+    { "played_at": "2026-10-16T13:02:11.483Z",
+      "track": { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+                 "artists": ["Artist"], "album": "Album", "duration_ms": 215000 },
+      "context": { "type": "playlist", "uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M" } }
+  ]
+}
+```
+
+### `top`
+
+`sss top tracks|artists [--range short|medium|long] [--limit N]` reads
+Spotify's ranking of the member's most played tracks or artists over
+about the last four weeks, about the last six months (the default) or
+several years; `--limit` 1 to 50, default 50. Needs `user-top-read`; a
+token without it is kind `auth` before any request.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `kind` | `"tracks"` \| `"artists"` | |
+| `range` | `"short"` \| `"medium"` \| `"long"` | |
+| `items` | [Offered] | ranked, first place first; an artist has only `id` and `name`; `[]` is a success |
+
+```json
+{
+  "ok": true,
+  "command": "top",
+  "profile": "alice",
+  "kind": "artists",
+  "range": "medium",
+  "items": [{ "id": "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist" }]
+}
+```
+
+### `playlists`
+
+`sss playlists` reads the account, then every playlist on it — the
+member's own and those they follow — in Spotify's order. Needs
+`playlist-read-private` and `playlist-read-collaborative`; a token without
+either is kind `auth` before any request.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `user` | User | the account; a playlist whose `owner.id` differs is shared with the member |
+| `playlists` | [Playlist] | `[]` is a success |
+
+```json
+{
+  "ok": true,
+  "command": "playlists",
+  "profile": "alice",
+  "user": { "id": "alice-spotify", "name": "Alice" },
+  "playlists": [
+    { "id": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Morning",
+      "owner": { "id": "alice-spotify", "name": "Alice" }, "public": false,
+      "collaborative": false, "total": 42 },
+    { "id": "spotify:playlist:4uLU6hMCjMI75M1A2tKUQC", "name": "Road trip",
+      "owner": { "id": "bob-spotify", "name": "Bob" }, "public": true,
+      "collaborative": false, "total": 17, "description": "Songs for the drive" }
+  ]
+}
+```
+
+### `playlist`
+
+`sss playlist TARGET...` reads each playlist named, in the order given:
+its details, then its contents. A target is a playlist URI
+(`spotify:playlist:<id>`) or an `https://open.spotify.com/playlist/<id>`
+address; anything else — another kind, a bare id, a malformed address — is
+kind `input` before any request. Spotify shows a playlist's items only to
+its owner and collaborators, so a playlist the member only follows is
+reported with `items: null` and the command goes on. A playlist Spotify
+does not know ends the command with kind `other`, quoting Spotify. Needs
+the same scopes as `playlists`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `playlists` | [Contents] | one per target, in the order given |
+
+A **Contents** is `{ playlist, items }`: the Playlist (*Shapes*), and
+`items`, its tracks and episodes as Offered in playlist order, or `null`
+for a playlist whose `total` is `null` — one the member neither owns nor
+collaborates on. A local file is an Offered whose `id` is
+`spotify:local:…`; a removed item is left out.
+
+```json
+{
+  "ok": true,
+  "command": "playlist",
+  "profile": "alice",
+  "playlists": [
+    { "playlist": { "id": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Morning",
+                    "owner": { "id": "alice-spotify", "name": "Alice" }, "public": false,
+                    "collaborative": false, "total": 1 },
+      "items": [
+        { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+          "artists": ["Artist"], "album": "Album", "duration_ms": 215000 }
+      ] },
+    { "playlist": { "id": "spotify:playlist:4uLU6hMCjMI75M1A2tKUQC", "name": "Road trip",
+                    "owner": { "id": "bob-spotify", "name": "Bob" }, "public": true,
+                    "collaborative": false, "total": null },
+      "items": null }
   ]
 }
 ```
@@ -829,7 +982,7 @@ queued as well.
 | `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again; a playback command whose `error` says Spotify may have applied it: run `sss player` first |
 | `quota` | Spotify's rate or quota limit, or `ccc`'s usage limit, was reached; everything done so far is recorded | run the command again later; it continues where it stopped |
 | `incomplete` | an export run ended with failed steps | look at `details.failed_steps`; the run is kept |
-| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, an unknown device, station or item), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
+| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, a `playlist` target that is not a playlist URI or link, an unknown device, station or item), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
 | `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
 | `player` | the Spotify player cannot take the command: no player open, several open and none active, Premium missing, or Spotify refused the control | relay the message, then run again |
 | `other` | anything else: a file that cannot be read or written, unparseable data | read `error` |

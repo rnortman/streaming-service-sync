@@ -66,7 +66,10 @@ sss spotify auth --profile NAME
 
 prints an address. Open it in a browser where the family member is logged
 in to Spotify (a private window works well when several members share a
-computer) and approve. The browser lands on
+computer) and approve. The consent page lists what `sss` may do — read
+and change playlists, library and follows, read and control playback,
+read play history and top items; `sss` reads nothing it does not show in
+a command's output. The browser lands on
 `https://127.0.0.1/callback?code=…&state=…` and shows an error such as
 "can't connect" — that is expected. Copy the whole address from the
 address bar, then run

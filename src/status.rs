@@ -14,6 +14,7 @@ use crate::pandora::export::{self, Manifest, Step};
 use crate::profiles;
 use crate::repo::{self, ProfilePaths, Repo};
 use crate::secrets::{StateDir, StateRoot, TokenSource};
+use crate::spotify::auth::{self, SCOPES};
 
 /// What `sss status` reports: one entry per profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +45,9 @@ pub struct TokenStatus {
     pub stored_at: String,
     pub expires_at: String,
     pub scopes: Vec<String>,
+    /// Scopes this build's sign-in asks for that the token was not granted;
+    /// empty for a token signed in since the list last grew.
+    pub missing_scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -101,6 +105,7 @@ fn profile_status(name: String, state: &StateDir, paths: &ProfilePaths) -> Resul
     let spotify_token = state.load_spotify_token()?.map(|s| TokenStatus {
         stored_at: s.stored_at,
         expires_at: s.token.expires_at,
+        missing_scopes: missing_scopes(&s.token.scopes),
         scopes: s.token.scopes,
     });
     let latest_run = match export::run_ids(paths)?.pop() {
@@ -131,6 +136,15 @@ fn profile_status(name: String, state: &StateDir, paths: &ProfilePaths) -> Resul
             albums: match_counts(&paths.album_matches())?,
         },
     })
+}
+
+/// [`SCOPES`] minus `granted`, in `SCOPES` order. A granted scope outside
+/// `SCOPES` is ignored.
+fn missing_scopes(granted: &[String]) -> Vec<String> {
+    auth::missing(SCOPES, granted)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 impl StatusReport {
@@ -177,6 +191,14 @@ impl ProfileStatus {
                 t.stored_at, t.expires_at
             ),
         });
+        if let Some(t) = &self.spotify_token
+            && !t.missing_scopes.is_empty()
+        {
+            lines.push(format!(
+                "    lacks {}; run `sss spotify auth --profile {name}` to sign in again",
+                t.missing_scopes.join(", ")
+            ));
+        }
         let mut newest_complete = true;
         match &self.export.latest_run {
             None => lines.push("  export: no run yet".to_owned()),
@@ -496,6 +518,11 @@ mod tests {
                 stored_at: stored.stored_at.clone(),
                 expires_at: "2026-10-15T01:00:00Z".into(),
                 scopes: vec!["user-library-read".into()],
+                missing_scopes: SCOPES
+                    .iter()
+                    .filter(|&&s| s != "user-library-read")
+                    .map(|&s| s.to_owned())
+                    .collect(),
             })
         );
         let text = run_status(&repo, &state_root, None);
@@ -510,6 +537,80 @@ mod tests {
         for out in [&text, &json] {
             assert!(!out.contains("secret"), "{out}");
         }
+    }
+
+    fn token_with(scopes: &[&str]) -> crate::spotify::auth::Token {
+        crate::spotify::auth::Token {
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: "2026-10-15T01:00:00Z".into(),
+            scopes: scopes.iter().map(|&s| s.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn missing_scopes_are_the_sign_in_set_minus_the_grant_in_order() {
+        let old_eight = [
+            "playlist-read-private",
+            "playlist-modify-private",
+            "user-library-read",
+            "user-library-modify",
+            "user-follow-read",
+            "user-follow-modify",
+            "user-read-playback-state",
+            "user-modify-playback-state",
+        ];
+        let granted: Vec<String> = old_eight.iter().map(|&s| s.to_owned()).collect();
+        assert_eq!(
+            missing_scopes(&granted),
+            [
+                "playlist-read-collaborative",
+                "playlist-modify-public",
+                "user-read-currently-playing",
+                "user-read-playback-position",
+                "user-read-recently-played",
+                "user-top-read",
+            ]
+        );
+        let mut full: Vec<String> = SCOPES.iter().map(|&s| s.to_owned()).collect();
+        assert!(missing_scopes(&full).is_empty());
+        full.push("ugc-image-upload".into());
+        assert!(
+            missing_scopes(&full).is_empty(),
+            "an extra scope is not flagged"
+        );
+    }
+
+    #[test]
+    fn the_lacks_line_appears_exactly_when_scopes_are_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, state_root) = empty(tmp.path());
+        let state = state_root.profile("alice").unwrap();
+        state
+            .save_spotify_token(&token_with(&SCOPES[..12]))
+            .unwrap();
+        let text = run_status(&repo, &state_root, None);
+        assert!(
+            text.contains(
+                "\n    lacks user-read-recently-played, user-top-read; run `sss spotify auth \
+                 --profile alice` to sign in again\n"
+            ),
+            "{text}"
+        );
+        let json = serde_json::to_value(report(&repo, &state_root, None)).unwrap();
+        assert_eq!(
+            json["profiles"][0]["spotify_token"]["missing_scopes"],
+            serde_json::json!(["user-read-recently-played", "user-top-read"])
+        );
+
+        state.save_spotify_token(&token_with(SCOPES)).unwrap();
+        let text = run_status(&repo, &state_root, None);
+        assert!(!text.contains("lacks"), "{text}");
+        let json = serde_json::to_value(report(&repo, &state_root, None)).unwrap();
+        assert_eq!(
+            json["profiles"][0]["spotify_token"]["missing_scopes"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

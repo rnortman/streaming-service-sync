@@ -215,10 +215,20 @@ impl From<WireTrack> for FoundTrack {
     }
 }
 
+/// An artist as search and the top-items read send it.
 #[derive(Deserialize)]
-struct WireArtist {
+pub(super) struct WireArtist {
     uri: String,
     name: String,
+}
+
+impl From<WireArtist> for FoundArtist {
+    fn from(a: WireArtist) -> Self {
+        FoundArtist {
+            uri: a.uri,
+            name: a.name,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -231,10 +241,13 @@ struct WireAlbum {
     release_date: Option<String>,
 }
 
+/// One page of a list: its entries, and the address of the next page when
+/// there is one.
 #[derive(Deserialize, Default)]
-struct WirePage {
+pub(super) struct WirePage {
     #[serde(default)]
-    items: Vec<Value>,
+    pub(super) items: Vec<Value>,
+    pub(super) next: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -248,7 +261,7 @@ struct WireSearch {
 }
 
 /// The entries of `page` that parse as `T`.
-fn parsed_items<T: DeserializeOwned>(page: WirePage) -> Vec<T> {
+pub(super) fn parsed_items<T: DeserializeOwned>(page: WirePage) -> Vec<T> {
     page.items
         .into_iter()
         .filter_map(|v| serde_json::from_value(v).ok())
@@ -274,13 +287,6 @@ struct WireItemRef {
 #[derive(Deserialize)]
 struct WirePlaylistItem {
     item: Option<WireItemRef>,
-}
-
-#[derive(Deserialize)]
-struct WireItemsPage {
-    #[serde(default)]
-    items: Vec<Option<WirePlaylistItem>>,
-    next: Option<String>,
 }
 
 /// `HTTP <status>` with Spotify's `error.message` (and `error.reason`), or
@@ -481,16 +487,12 @@ impl Spotify {
     /// The `auth` failure unless the stored token was granted every scope
     /// in `scopes`; `profile` names the sign-in to run.
     pub fn require_scopes(&self, profile: &str, scopes: &[&str]) -> Result<()> {
-        let missing: Vec<&str> = scopes
-            .iter()
-            .copied()
-            .filter(|s| !self.token.scopes.iter().any(|g| g == s))
-            .collect();
+        let missing = auth::missing(scopes, &self.token.scopes);
         if !missing.is_empty() {
             fail!(
                 Kind::Auth,
                 "the Spotify token for profile {profile} was granted without {}; run \
-                 `sss spotify auth --profile {profile}` to sign in again with the playback scopes",
+                 `sss spotify auth --profile {profile}` to sign in again (see `sss status`)",
                 missing.join(", ")
             );
         }
@@ -526,10 +528,7 @@ impl Spotify {
                 .collect(),
             artists: parsed_items::<WireArtist>(wire.artists)
                 .into_iter()
-                .map(|a| FoundArtist {
-                    uri: a.uri,
-                    name: a.name,
-                })
+                .map(FoundArtist::from)
                 .collect(),
             albums: parsed_items::<WireAlbum>(wire.albums)
                 .into_iter()
@@ -570,31 +569,20 @@ impl Spotify {
     /// know is an [`ApiError`] with status 404.
     pub fn playlist_items(&mut self, playlist_id: &str) -> Result<Vec<Option<String>>> {
         let path = format!("playlists/{playlist_id}/items");
-        let limit = PLAYLIST_CHUNK.to_string();
-        let mut uris = Vec::new();
-        loop {
-            let offset = uris.len().to_string();
-            let page: WireItemsPage = self.json(&Call {
-                method: "GET",
-                path: &path,
-                query: &[
-                    ("fields", "items(item(uri)),next"),
-                    ("limit", &limit),
-                    ("offset", &offset),
-                ],
-                body: None,
-                player: false,
-            })?;
-            let got = page.items.len();
-            uris.extend(
-                page.items
-                    .into_iter()
-                    .map(|i| i.and_then(|i| i.item).and_then(|i| i.uri)),
-            );
-            if page.next.is_none() || got == 0 {
-                return Ok(uris);
-            }
-        }
+        Ok(self
+            .get_all(
+                &path,
+                &[("fields", "items(item(uri)),next")],
+                PLAYLIST_CHUNK,
+            )?
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value::<WirePlaylistItem>(v)
+                    .ok()
+                    .and_then(|i| i.item)
+                    .and_then(|i| i.uri)
+            })
+            .collect())
     }
 
     /// `POST playlists/{id}/items` in chunks of [`PLAYLIST_CHUNK`], in
@@ -667,6 +655,45 @@ impl Spotify {
             held.extend(answer);
         }
         Ok(held)
+    }
+
+    /// A `GET` of `path` with `query`, parsed as `T`.
+    pub(super) fn get<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T> {
+        self.json(&Call {
+            method: "GET",
+            path,
+            query,
+            body: None,
+            player: false,
+        })
+    }
+
+    /// `GET path` by `offset`, `chunk` entries a page, until a page has no
+    /// `next` or no entries: every page's entries in order, a `null` entry
+    /// included.
+    pub(super) fn get_all(
+        &mut self,
+        path: &str,
+        query: &[(&str, &str)],
+        chunk: usize,
+    ) -> Result<Vec<Value>> {
+        let limit = chunk.to_string();
+        let mut all = Vec::new();
+        loop {
+            let offset = all.len().to_string();
+            let mut paged = query.to_vec();
+            paged.extend([("limit", limit.as_str()), ("offset", offset.as_str())]);
+            let page: WirePage = self.get(path, &paged)?;
+            let got = page.items.len();
+            all.extend(page.items);
+            if page.next.is_none() || got == 0 {
+                return Ok(all);
+            }
+        }
     }
 
     /// Sends `call` and parses the 2xx body as `T`.
@@ -1466,18 +1493,34 @@ mod tests {
                 .path("/v1/playlists/pl1/items")
                 .query_param("offset", "100");
             then.status(200).json_body(json!({"items": [
-                {"item": {"uri": "spotify:track:last"}}, {"item": null}, {"item": {"uri": null}}
+                {"item": {"uri": "spotify:track:last"}}, null, {"item": null},
+                {"item": {"uri": null}}
             ], "next": null}));
         });
         let mut c = fresh_client(tmp.path(), &server);
         let uris = c.playlist_items("pl1").unwrap();
         p1.assert();
         p2.assert();
-        assert_eq!(uris.len(), 103);
+        assert_eq!(uris.len(), 104);
         assert_eq!(uris[99].as_deref(), Some("spotify:track:99"));
         assert_eq!(uris[100].as_deref(), Some("spotify:track:last"));
         assert_eq!(uris[101], None);
         assert_eq!(uris[102], None);
+        assert_eq!(uris[103], None);
+    }
+
+    #[test]
+    fn an_empty_page_ends_the_paging_whatever_next_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        let page = server.mock(|when, then| {
+            when.method(GET).path("/v1/playlists/pl1/items");
+            then.status(200)
+                .json_body(json!({"items": [], "next": "https://x/next"}));
+        });
+        let mut c = fresh_client(tmp.path(), &server);
+        assert!(c.playlist_items("pl1").unwrap().is_empty());
+        page.assert_calls(1);
     }
 
     fn uris(n: usize) -> Vec<String> {
@@ -1642,15 +1685,19 @@ mod tests {
         let err = c
             .require_scopes(
                 "alice",
-                &["user-read-playback-state", "user-modify-playback-state"],
+                &[
+                    "user-top-read",
+                    "user-read-playback-state",
+                    "playlist-read-collaborative",
+                ],
             )
             .unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Auth);
         assert_eq!(
             format!("{err:#}"),
-            "the Spotify token for profile alice was granted without \
-             user-modify-playback-state; run `sss spotify auth --profile alice` to sign in \
-             again with the playback scopes"
+            "the Spotify token for profile alice was granted without user-top-read, \
+             playlist-read-collaborative; run `sss spotify auth --profile alice` to sign in \
+             again (see `sss status`)"
         );
     }
 

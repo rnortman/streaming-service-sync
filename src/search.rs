@@ -64,13 +64,20 @@ pub fn search<S: BorrowMut<Spotify>>(
     Ok(SearchReport { results })
 }
 
-/// `spotify:track:… "Song" — Artist — Album (3:45)`: the id, the quoted
-/// name, then whichever of artists, album and duration the item carries.
-fn result_line(item: &Offered) -> String {
+/// `spotify:track:… "Song" — Artist, Other`: the id, the quoted name and
+/// the artists when the item names any.
+pub(crate) fn item_head(item: &Offered) -> String {
     let mut line = format!("{} {:?}", item.id, item.name);
     if !item.artists.is_empty() {
         line.push_str(&format!(" — {}", item.artists.join(", ")));
     }
+    line
+}
+
+/// `spotify:track:… "Song" — Artist — Album (3:45)`: [`item_head`], then
+/// whichever of album and duration the item carries.
+pub(crate) fn result_line(item: &Offered) -> String {
+    let mut line = item_head(item);
     if let Some(album) = &item.album {
         line.push_str(&format!(" — {album}"));
     }

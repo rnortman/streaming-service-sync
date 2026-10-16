@@ -46,7 +46,7 @@ matching protocol, so refresh any copy you keep from the binary you run.
   state directory, `~/.local/state/streaming-service-sync/NAME/`, mode
   0600, never in the data repository.
 - Every command takes `--json` and then prints one JSON document on stdout
-  (section 12). Start every session with:
+  (section 13). Start every session with:
 
 ```sh
 sss status --json
@@ -97,6 +97,11 @@ echo "$ADDRESS" | sss spotify auth --callback --profile NAME --json
 
 An address carrying `error=access_denied` means they declined; start over
 from the first command if they want to.
+
+A profile signed in by an earlier `sss` may lack scopes this one asks
+for; `sss status --json` lists them under `spotify_token.missing_scopes`,
+and a command that needs one fails with kind `auth` saying so — run the
+two steps again.
 
 ## 6. Matching
 
@@ -158,10 +163,8 @@ results' `id`s go straight into `sss match set`.
 ## 8. Playing music
 
 `sss` also controls the profile's Spotify player. It needs Spotify Premium
-on the member's account and a token signed in with the playback scopes:
-when `spotify_token.scopes` in `sss status --json` lacks
-`user-modify-playback-state`, run the sign-in of section 5 again. The
-player commands then fail with kind `auth` saying so.
+on the member's account and a token with the playback scopes; a token
+that lacks them is handled as section 5 says.
 
 ```sh
 sss devices --profile NAME --json
@@ -211,7 +214,37 @@ it may have happened — for `sss queue`, the track after the ones named
 may be queued too: run `sss player` and look before running anything
 again.
 
-## 9. The report
+## 9. Listening history, favourites and playlists
+
+```sh
+sss history --profile NAME --json
+sss top tracks --range short --profile NAME --json
+sss top artists --limit 10 --profile NAME --json
+sss playlists --profile NAME --json
+sss playlist spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --profile NAME --json
+```
+
+`sss history` lists the member's last finished plays, newest first, each
+with `played_at` and, when it was played from one, the playlist, album or
+artist under `context`. Spotify keeps only the last 50 completed tracks; a
+track playing now appears once it ends, and podcast episodes never do.
+
+`sss top tracks|artists` is Spotify's own ranking of what the member plays
+most, first place first. `--range short|medium|long` picks Spotify's
+window — about the last four weeks, about the last six months (the
+default), or several years; `--limit N` is 1 to 50 (default 50).
+
+`sss playlists` names the account under `user` and lists every playlist
+on it, the member's own and the ones they follow, each with its `owner`
+and item count `total`. A playlist whose `owner.id` differs from `user.id`
+is one shared with the member: its `id` goes to `sss play`. `sss playlist`
+takes one or more playlist URIs or open.spotify.com playlist links (not
+bare ids) and shows each one's contents in order. Spotify shows a
+playlist's items only to its owner and its collaborators, so a shared
+playlist shows its contents only if it is collaborative; any other comes
+back with `items: null` and the command still succeeds.
+
+## 10. The report
 
 ```sh
 sss report --profile NAME --json
@@ -221,7 +254,7 @@ writes `profiles/NAME/report.md` and prints its path. Read it: it says what
 was exported, how much is matched, and every item that needs a person.
 Tell the person what needs them.
 
-## 10. Push
+## 11. Push
 
 ```sh
 sss push --dry-run --profile NAME --json
@@ -243,7 +276,7 @@ repository, not a per-member setting, so do not ask each member about it;
 if a member does not want it, tell the repository's owner (the person who
 ran `sss init`), whose call it is.
 
-## 11. Re-runs and resuming
+## 12. Re-runs and resuming
 
 Every command can be stopped and run again: what was done is recorded as it
 happens, and the next run continues. Kinds `quota` and `unavailable` mean
@@ -251,7 +284,7 @@ try the same command later. A new `sss pandora export` replaces the
 normalized files; the next `sss match` searches only the items it has not
 seen, and the next push adds what is new.
 
-## 12. Reading `--json`
+## 13. Reading `--json`
 
 On success stdout is one document that starts with `"ok": true` and
 `"command"`, followed by the command's report:
@@ -301,7 +334,7 @@ about each `kind`:
 Every field of every document is in
 [the JSON output reference](https://github.com/rnortman/streaming-service-sync/blob/main/docs/json-output.md).
 
-## 13. Check with the person; never do
+## 14. Check with the person; never do
 
 Ask the person before:
 

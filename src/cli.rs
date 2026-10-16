@@ -12,6 +12,7 @@ use crate::error::{self, ExportRun, Kind};
 use crate::fail;
 use crate::guide::{self, GuideReport};
 use crate::input;
+use crate::listening::{self, HistoryReport, TopReport};
 use crate::matching::llm;
 use crate::matching::run::{
     self as matching, AnswerReport, DecisionsRefused, MatchReport, MatchSetReport, QuestionsReport,
@@ -22,6 +23,7 @@ use crate::pandora::client::Client;
 use crate::pandora::export::{self, ExportIncomplete, ExportReport, Manifest};
 use crate::pandora::model::{self, Summary};
 use crate::player::{self, Control, DevicesReport, PlayerReport, PlayerStateReport, QueueReport};
+use crate::playlists::{self, PlaylistReport, PlaylistsReport};
 use crate::profiles;
 use crate::push::{self, PushReport};
 use crate::repo::{self, Repo};
@@ -29,6 +31,7 @@ use crate::report::{self, ReportFile};
 use crate::search::{self, SearchReport};
 use crate::secrets::{StateDir, StateRoot};
 use crate::spotify;
+use crate::spotify::account::{self, TimeRange};
 use crate::spotify::ids::IdKind;
 use crate::spotify::playback::{Device, PlayerRefused, Repeat};
 use crate::status::{self, StatusReport};
@@ -125,6 +128,26 @@ pub enum Command {
     },
     /// Search Spotify for tracks, artists and albums; several queries at once
     Search(SearchArgs),
+    /// List the tracks the profile's member last finished playing, newest
+    /// first
+    History(HistoryArgs),
+    /// Show Spotify's ranking of the member's most played tracks or artists
+    Top {
+        #[arg(value_enum)]
+        kind: TopKind,
+        /// The window ranked: about four weeks, six months, or several years
+        #[arg(long, value_enum, default_value_t = Range::Medium)]
+        range: Range,
+        /// Items to list, 1 to 50
+        #[arg(long, value_name = "N", default_value_t = account::PAGE_MAX,
+              value_parser = clap::value_parser!(u32).range(1..=i64::from(account::PAGE_MAX)))]
+        limit: u32,
+    },
+    /// List the playlists on the profile's account, its own and those it
+    /// follows
+    Playlists,
+    /// Show the contents of playlists, by URI or link; several at once
+    Playlist(PlaylistArgs),
 }
 
 /// The Spotify player a command that changes playback goes to.
@@ -198,6 +221,54 @@ pub struct SearchArgs {
     #[arg(long, value_name = "N", default_value_t = spotify::client::SEARCH_LIMIT,
           value_parser = clap::value_parser!(u32).range(1..=i64::from(spotify::client::SEARCH_LIMIT)))]
     pub limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    /// Plays to list, 1 to 50
+    #[arg(long, value_name = "N", default_value_t = account::PAGE_MAX,
+          value_parser = clap::value_parser!(u32).range(1..=i64::from(account::PAGE_MAX)))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct PlaylistArgs {
+    /// Spotify playlists (spotify:playlist:<id> or an open.spotify.com
+    /// playlist address)
+    #[arg(value_name = "TARGET", required = true)]
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TopKind {
+    Tracks,
+    Artists,
+}
+
+impl From<TopKind> for account::TopKind {
+    fn from(kind: TopKind) -> Self {
+        match kind {
+            TopKind::Tracks => account::TopKind::Tracks,
+            TopKind::Artists => account::TopKind::Artists,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Range {
+    Short,
+    Medium,
+    Long,
+}
+
+impl From<Range> for TimeRange {
+    fn from(range: Range) -> Self {
+        match range {
+            Range::Short => TimeRange::Short,
+            Range::Medium => TimeRange::Medium,
+            Range::Long => TimeRange::Long,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -439,6 +510,10 @@ impl Command {
             Command::Volume { .. } => "volume",
             Command::Seek { .. } => "seek",
             Command::Search(_) => "search",
+            Command::History(_) => "history",
+            Command::Top { .. } => "top",
+            Command::Playlists => "playlists",
+            Command::Playlist(_) => "playlist",
         }
     }
 
@@ -492,6 +567,10 @@ pub enum Output {
     Player(PlayerReport),
     Queue(QueueReport),
     Search(SearchReport),
+    History(HistoryReport),
+    Top(TopReport),
+    Playlists(PlaylistsReport),
+    Playlist(PlaylistReport),
 }
 
 impl Output {
@@ -517,6 +596,10 @@ impl Output {
             Output::Player(r) => r.write_text(out),
             Output::Queue(r) => r.write_text(out),
             Output::Search(r) => r.write_text(out),
+            Output::History(r) => r.write_text(out),
+            Output::Top(r) => r.write_text(out),
+            Output::Playlists(r) => r.write_text(out),
+            Output::Playlist(r) => r.write_text(out),
         }
     }
 }
@@ -743,7 +826,6 @@ fn dispatch(
                 name,
                 config.client_id(name),
                 &repo.config_path(),
-                config.push.public_playlists,
                 &state_root.profile(name)?,
                 &spotify::auth::auth_base_from_env(),
             )?;
@@ -928,6 +1010,28 @@ fn dispatch(
             &args.queries,
             args.only.map(IdKind::from),
             args.limit,
+            || spotify_client(name, &config, &repo, state_root.profile(name)?),
+        )?)),
+        (Command::History(args), Some(name)) => Ok(Output::History(listening::history(
+            name,
+            args.limit,
+            || spotify_client(name, &config, &repo, state_root.profile(name)?),
+        )?)),
+        (Command::Top { kind, range, limit }, Some(name)) => Ok(Output::Top(listening::top(
+            name,
+            (*kind).into(),
+            (*range).into(),
+            *limit,
+            || spotify_client(name, &config, &repo, state_root.profile(name)?),
+        )?)),
+        (Command::Playlists, Some(name)) => {
+            Ok(Output::Playlists(playlists::playlists(name, || {
+                spotify_client(name, &config, &repo, state_root.profile(name)?)
+            })?))
+        }
+        (Command::Playlist(args), Some(name)) => Ok(Output::Playlist(playlists::playlist(
+            name,
+            &args.targets,
             || spotify_client(name, &config, &repo, state_root.profile(name)?),
         )?)),
         // `guide` and `init` returned above, and every other command has a
@@ -1140,7 +1244,19 @@ mod tests {
             &["search", "x", "y", "--only", "tracks", "--limit", "5"],
             "search",
         ),
+        (&["history"], "history"),
+        (&["history", "--limit", "10"], "history"),
+        (&["top", "tracks"], "top"),
+        (
+            &["top", "artists", "--range", "short", "--limit", "5"],
+            "top",
+        ),
+        (&["playlists"], "playlists"),
+        (&["playlist", PLAYLIST], "playlist"),
     ];
+
+    /// The documentation's public example playlist.
+    const PLAYLIST: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
 
     /// The documentation's public example track.
     const TRACK: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
@@ -1216,6 +1332,26 @@ mod tests {
             panic!("not search")
         };
         assert_eq!((s.only, s.limit), (Some(MatchKind::Artists), 1));
+
+        let Command::Top { kind, range, limit } = parse(&["top", "tracks"]).command else {
+            panic!("not top")
+        };
+        assert_eq!((kind, range, limit), (TopKind::Tracks, Range::Medium, 50));
+        let Command::Top { kind, range, limit } =
+            parse(&["top", "artists", "--range", "long", "--limit", "7"]).command
+        else {
+            panic!("not top")
+        };
+        assert_eq!((kind, range, limit), (TopKind::Artists, Range::Long, 7));
+        let Command::History(h) = parse(&["history"]).command else {
+            panic!("not history")
+        };
+        assert_eq!(h.limit, 50);
+        let Command::Playlist(p) = parse(&["playlist", PLAYLIST, "spotify:playlist:x"]).command
+        else {
+            panic!("not playlist")
+        };
+        assert_eq!(p.targets, [PLAYLIST, "spotify:playlist:x"]);
     }
 
     #[test]
@@ -1248,6 +1384,17 @@ mod tests {
             &["search", "x", "--limit", "11"],
             &["search", "x", "--only", "songs"],
             &["search", "x", "--device", "Firefox"],
+            &["history", "--limit", "0"],
+            &["history", "--limit", "51"],
+            &["top"],
+            &["top", "songs"],
+            &["top", "tracks", "--range", "year"],
+            &["top", "tracks", "--limit", "51"],
+            &["playlist"],
+            &["history", "--device", "Firefox"],
+            &["top", "tracks", "--device", "Firefox"],
+            &["playlists", "--device", "Firefox"],
+            &["playlist", PLAYLIST, "--device", "Firefox"],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("sss").chain(args.iter().copied())).is_err(),
@@ -1588,6 +1735,15 @@ mod tests {
             ("seek 30", Some(Kind::Config)),
             ("search x", Some(Kind::Config)),
             ("search x y --only tracks --limit 5", Some(Kind::Config)),
+            ("history", Some(Kind::Config)),
+            ("history --limit 10", Some(Kind::Config)),
+            ("top tracks", Some(Kind::Config)),
+            ("top artists --range short --limit 5", Some(Kind::Config)),
+            ("playlists", Some(Kind::Config)),
+            (
+                "playlist spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                Some(Kind::Config),
+            ),
         ];
         for (args, name) in DOCUMENTED {
             let mut full = with_repo(&repo, args);

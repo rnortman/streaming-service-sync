@@ -14,6 +14,7 @@ use crate::lazy::Lazy;
 use crate::matching::model::{self, ByKind, MatchEntry};
 use crate::pandora::model::{Normalized, Playlist, SeedKind, Station};
 use crate::repo::{self, ProfilePaths};
+use crate::spotify::auth::PLAYLIST_MODIFY_PUBLIC_SCOPE;
 use crate::spotify::client::{Spotify, http_status};
 
 /// Longest playlist name Spotify takes, in characters.
@@ -543,6 +544,7 @@ pub struct Options {
 }
 
 struct Pusher<'a> {
+    profile: String,
     ledger: Ledger,
     state_file: PathBuf,
     dry_run: bool,
@@ -566,6 +568,7 @@ pub fn push<'a>(
     let matches = model::read_all_latest(paths)?;
     let state_file = paths.spotify_state();
     let mut pusher = Pusher {
+        profile: profile.to_owned(),
         ledger: Ledger::load(&state_file)?,
         state_file: state_file.clone(),
         dry_run: options.dry_run,
@@ -761,9 +764,11 @@ impl Pusher<'_> {
     }
 
     /// Makes the client, writes `pending`, creates the playlist, writes
-    /// `created` and adds every wanted URI. A create Spotify refused, or
-    /// that was never sent, puts the key's prior entry back before the
-    /// error is returned; any other failure leaves `pending`.
+    /// `created` and adds every wanted URI. A public playlist needs a token
+    /// granted `playlist-modify-public`; without it the `auth` failure comes
+    /// before the ledger is touched. A create Spotify refused, or that was
+    /// never sent, puts the key's prior entry back before the error is
+    /// returned; any other failure leaves `pending`.
     fn create(&mut self, want: Wanted, mut report: PlaylistReport) -> Result<PlaylistReport> {
         self.note(&format!(
             "creating \"{}\" ({}) with {} tracks",
@@ -771,7 +776,10 @@ impl Pusher<'_> {
             want.key,
             want.uris.len()
         ));
-        self.client.get()?;
+        let client = self.client.get()?;
+        if self.public {
+            client.require_scopes(&self.profile, &[PLAYLIST_MODIFY_PUBLIC_SCOPE])?;
+        }
         let at = repo::now_rfc3339()?;
         let prior = self.ledger.playlists.insert(
             want.key.clone(),
@@ -1012,12 +1020,17 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(&[])
+    }
+
+    /// A fixture whose stored token was granted `scopes`.
+    fn fixture_with(scopes: &[&str]) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::repo::Repo::at(tmp.path().join("data"))
             .profile("alice")
             .unwrap();
         write_matches(&paths);
-        let state = state_with(&tmp.path().join("state"), &fresh_token(&[]));
+        let state = state_with(&tmp.path().join("state"), &fresh_token(scopes));
         Fixture {
             _tmp: tmp,
             paths,
@@ -1812,7 +1825,7 @@ mod tests {
 
     #[test]
     fn public_playlists_makes_the_created_playlists_public() {
-        let f = fixture();
+        let f = fixture_with(&[PLAYLIST_MODIFY_PUBLIC_SCOPE]);
         let create = f.server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/me/playlists")
@@ -1838,6 +1851,47 @@ mod tests {
         .unwrap();
         create.assert();
         add.assert();
+    }
+
+    #[test]
+    fn a_public_playlist_needs_a_token_granted_its_scope() {
+        let f = fixture_with(&["playlist-modify-private"]);
+        let create = f.server.mock(|when, then| {
+            when.method(POST).path("/v1/me/playlists");
+            then.status(201)
+                .json_body(json!({"id": "pl9", "snapshot_id": "snap0"}));
+        });
+        let config = PushConfig {
+            public_playlists: true,
+            ..PushConfig::default()
+        };
+        let err = f
+            .run(
+                &config,
+                Options {
+                    only: Some(Part::Stations),
+                    dry_run: false,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error::kind(&err), Kind::Auth);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("without playlist-modify-public"), "{msg}");
+        assert!(msg.contains("sss spotify auth --profile alice"), "{msg}");
+        create.assert_calls(0);
+        assert!(f.ledger().playlists.is_empty());
+
+        let dry = f
+            .run(
+                &config,
+                Options {
+                    only: Some(Part::Stations),
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+        assert!(dry.dry_run);
+        create.assert_calls(0);
     }
 
     #[test]

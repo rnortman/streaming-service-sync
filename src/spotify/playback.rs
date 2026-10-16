@@ -229,10 +229,10 @@ struct WireEpisode {
     name: String,
 }
 
-/// A playing or queued item as [`Offered`]: a track with its fields, an
-/// episode with its `id` and `name` alone; `None` when it parses as
-/// neither.
-fn item_of(v: Value) -> Option<Offered> {
+/// A playing, queued, played or listed item as [`Offered`]: a track with
+/// its fields, an episode with its `id` and `name` alone; `None` when it
+/// parses as neither.
+pub(super) fn item_of(v: Value) -> Option<Offered> {
     if v.get("type").and_then(Value::as_str) == Some("episode") {
         let e: WireEpisode = serde_json::from_value(v).ok()?;
         return Some(Offered::named(e.uri, e.name));
@@ -242,10 +242,18 @@ fn item_of(v: Value) -> Option<Offered> {
 }
 
 #[derive(Deserialize)]
-struct WireContext {
+pub(super) struct WireContext {
     #[serde(rename = "type")]
     kind: Option<String>,
     uri: Option<String>,
+}
+
+/// The context `c` names; `None` without a `uri`.
+pub(super) fn context_of(c: WireContext) -> Option<Context> {
+    Some(Context {
+        kind: c.kind.unwrap_or_default(),
+        uri: c.uri?,
+    })
 }
 
 #[derive(Deserialize)]
@@ -268,12 +276,7 @@ impl From<WirePlayer> for PlayerState {
             is_playing: w.is_playing,
             item: w.item.and_then(item_of),
             progress_ms: w.progress_ms,
-            context: w.context.and_then(|c| {
-                Some(Context {
-                    kind: c.kind.unwrap_or_default(),
-                    uri: c.uri?,
-                })
-            }),
+            context: w.context.and_then(context_of),
             shuffle: w.shuffle_state,
             repeat: Repeat::from_wire(w.repeat_state.as_deref()),
         }

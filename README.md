@@ -26,7 +26,8 @@ Early development. `sss init`, `sss pandora auth`, `sss pandora export`,
 `sss match review|questions|answer|set|reject`, `sss search`, `sss push`,
 `sss report`, `sss status`, `sss guide` and the playback commands
 (`sss devices|player|play|pause|next|previous|queue|shuffle|repeat|volume|seek`)
-work, and each also takes `--json` for one machine-readable document on
+and the listening commands (`sss history`, `sss top`, `sss playlists`,
+`sss playlist`) work, and each also takes `--json` for one machine-readable document on
 stdout (see
 [Driving `sss` from a script or an LLM](#driving-sss-from-a-script-or-an-llm)).
 See [CHANGELOG.md](CHANGELOG.md).
@@ -106,6 +107,9 @@ Then each profile signs in, in two steps:
 The token is stored, mode 0600, in the same per-profile state directory as
 the Pandora session and renewed automatically; `sss status` shows when it
 was stored and when the current access token expires.
+
+A new `sss` may ask for more permissions than the stored token has;
+`sss status` says so, and the member signs in again.
 
 ### Matching
 
@@ -197,8 +201,7 @@ The profile's Spotify player can be driven from the command line, which
 is how an agent plays music for a family member: to settle a match by ear,
 to start a station's playlist, or to queue what someone asked for. It
 needs Spotify Premium on the member's account and a sign-in with the
-playback scopes (run `sss spotify auth` again for a token made before
-them). Every command that changes playback takes `--device NAME|ID`;
+playback scopes (see [Spotify sign-in](#spotify-sign-in)). Every command that changes playback takes `--device NAME|ID`;
 without it the active player is used, else the only one open, and a
 browser at https://open.spotify.com counts. Each reports the player's
 state afterwards; a `play` that Spotify loaded but a browser kept silent
@@ -214,6 +217,21 @@ sss queue spotify:track:4uLU6hMCjMI75M1A2tKUQC # cannot be undone
 sss pause | next | previous
 sss shuffle on|off ; sss repeat off|track|context ; sss volume 40 ; sss seek 90
 ```
+
+### Listening
+
+What the member has been playing, what they play most, and the playlists
+on their account — their own and those shared with them:
+
+```sh
+sss history                                  # the last finished plays, newest first
+sss top tracks --range short                 # Spotify's ranking: short, medium or long
+sss playlists                                # every playlist, with its owner and count
+sss playlist spotify:playlist:37i9dQZF1DXcBWIGoYBM5M  # a playlist's contents
+```
+
+Spotify shows a playlist's contents only to its owner and its
+collaborators; `sss playlist` on one the member only follows says so.
 
 ### Report
 
