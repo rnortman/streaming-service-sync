@@ -6,6 +6,8 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 ### Added
 
 - **Playback control.** `sss devices`, `sss player`, `sss play`, `sss
