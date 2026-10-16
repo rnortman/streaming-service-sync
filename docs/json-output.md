@@ -27,7 +27,48 @@ Every success document starts with `"ok": true` and `"command"`, the command
 as typed (`"init"`, `"pandora auth"`, `"pandora export"`, `"pandora
 normalize"`, `"spotify auth"`, `"match"`, `"match review"`, `"match
 questions"`, `"match answer"`, `"match set"`, `"match reject"`, `"push"`,
-`"status"`, `"report"`, `"guide"`). The rest is the command's report.
+`"status"`, `"report"`, `"guide"`, `"search"`, `"devices"`, `"player"`,
+`"play"`, `"pause"`, `"next"`, `"previous"`, `"queue"`, `"shuffle"`,
+`"repeat"`, `"volume"`, `"seek"`). The rest is the command's report.
+
+### Shapes
+
+These objects appear in several documents, always with the same fields.
+
+An **Offered** is a Spotify track, artist or album: `id` (its Spotify URI,
+the value `sss match set`, `sss play`, `sss queue` and a decision take)
+and `name`; a track's adds `artists`, `album`, `album_type`,
+`release_date`, `duration_ms`, `explicit` and `isrc`, an album's
+`artists`, `album_type` and `release_date`, each only where Spotify gave
+it. A playing podcast episode has only `id` and `name`. There is no
+`score`. Match candidates (`match questions`), search results, the playing
+item and the queue are all Offered.
+
+A **Device** is a Spotify player the account has open:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | the value `--device` takes |
+| `name` | string | as the player calls itself; `--device` takes it too |
+| `type` | string | Spotify's device type: `Computer`, `Smartphone`, `Speaker`, … |
+| `is_active` | boolean | the player Spotify sends commands to by default |
+| `is_restricted` | boolean | Spotify accepts no command for it through its Web API (some speakers) |
+| `volume_percent` | number, optional | |
+
+A **PlayerState** is the player as Spotify reports it:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `device` | Device, optional | the player it is on |
+| `is_playing` | boolean | `false` when paused, or loaded but silent |
+| `item` | Offered, optional | what is playing |
+| `progress_ms` | number, optional | position in `item` |
+| `context` | Context, optional | the playlist, album or artist it plays from |
+| `shuffle` | boolean | |
+| `repeat` | `"off"` \| `"track"` \| `"context"` | |
+
+A **Context** is `{ type, uri }`: `type` is `playlist`, `album`, `artist`
+or another kind Spotify names, `uri` its Spotify URI.
 
 ### `init`
 
@@ -347,12 +388,7 @@ A **Question** is:
 | `item` | string | the Pandora id |
 | `kind` | `"track"` \| `"artist"` \| `"album"` | |
 | `pandora` | object | a track's `title`, `artist`, `album`, `duration_s`, `explicit_hint`, `flags`, `station_names`, `playlist_names`; an artist's `name`, `station_names`, `station_thumbs_up`; an album's `name`, `artist` |
-| `candidates` | [Offered] | every stored candidate, best score first |
-
-An **Offered** candidate has `id` (the Spotify URI a decision names) and
-`name`; a track's adds `artists`, `album`, `album_type`, `release_date`,
-`duration_ms`, `explicit` and `isrc`, an album's `artists`, `album_type`
-and `release_date`, each only where Spotify gave it. There is no `score`.
+| `candidates` | [Offered] | every stored candidate, best score first; Offered is under *Shapes* |
 
 ```json
 {
@@ -496,7 +532,7 @@ under `--json`, say what to look for in Spotify and how to edit
 
 | Field | Type | Meaning |
 |---|---|---|
-| `enabled` | boolean | `false` for `liked` when `[push] liked_songs` is off |
+| `enabled` | boolean | `false` for `liked` when `[push] liked_songs` is off (it is on by default) |
 | `to_save` | number | matched items not yet known to be saved |
 | `saved` | number | saved this run |
 | `skipped` | number | already saved: recorded earlier, or found in the library |
@@ -524,7 +560,7 @@ one: Spotify may have made the playlist, so the next push reports it as
     },
     "playlists": { "enabled": true, "playlists": [] },
     "collection": { "enabled": true, "to_save": 5, "saved": 5, "skipped": 0 },
-    "liked": { "enabled": false, "to_save": 0, "saved": 0, "skipped": 0 },
+    "liked": { "enabled": true, "to_save": 12, "saved": 12, "skipped": 0 },
     "thumbs_down": { "enabled": false, "playlists": [] }
   }
 }
@@ -618,6 +654,155 @@ reports where. Its match table counts the matches of each kind by method:
 }
 ```
 
+### `search`
+
+`sss search QUERY...` sends one Spotify search per query, for tracks,
+artists and albums, or for the `--only tracks|artists|albums` kind alone;
+`--limit N` (1 to 10, default 10) caps each kind's results. A blank query
+is kind `input`; a query whose request fails ends the command with that
+failure and no results. Needs no playback scope.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `results` | [Result] | one per query, in the order given |
+
+A **Result** is `{ query, tracks, artists, albums }`: the query as sent
+(trimmed) and three lists of Offered (*Shapes*) in Spotify's order; a kind
+not searched, or with no match, is `[]`.
+
+```json
+{
+  "ok": true,
+  "command": "search",
+  "results": [
+    {
+      "query": "Song Artist",
+      "tracks": [
+        { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+          "artists": ["Artist"], "album": "Album", "duration_ms": 215000 }
+      ],
+      "artists": [{ "id": "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist" }],
+      "albums": []
+    }
+  ]
+}
+```
+
+### Playback commands
+
+`devices`, `player`, `play`, `pause`, `next`, `previous`, `queue`,
+`shuffle`, `repeat`, `volume` and `seek` act on the profile's Spotify
+player. They need the token's playback scopes —
+`user-read-playback-state` for `devices` and `player`, it and
+`user-modify-playback-state` for the rest — and fail with kind `auth`
+before any request when the stored token lacks one. Every command that
+changes playback takes `--device NAME|ID`; without it the active player is
+used, else the only one Spotify accepts commands for; none, or several,
+is kind `player` (see *Details*). It then reads the player's state back,
+after a short wait, and reports it.
+
+#### `devices`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `devices` | [Device] | the open players; `[]` is a success |
+
+```json
+{
+  "ok": true,
+  "command": "devices",
+  "profile": "alice",
+  "devices": [
+    { "id": "0d1841b0976bae2a3a310dd74c0f3df354899bc8", "name": "Firefox",
+      "type": "Computer", "is_active": false, "is_restricted": false,
+      "volume_percent": 100 }
+  ]
+}
+```
+
+#### `player`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `state` | PlayerState, optional | `null` when no player is active |
+| `queue` | [Offered] | what plays next; `[]` when `state` is `null` |
+
+#### `play`, `pause`, `next`, `previous`, `shuffle`, `repeat`, `volume`, `seek`
+
+`sss play` takes any number of tracks, or one playlist, album or artist
+(URI, link or id; a bare id is a track); `--station NAME` plays the
+playlist `sss push` made for the export's station of that name;
+`--item TR:…` plays that track's stored candidates in stored order;
+with none of them it resumes. Only one of the three may be given; a
+station with no pushed playlist, an item with no stored candidates, or a
+target of the wrong type is kind `input`. `--shuffle`/`--no-shuffle` sets
+shuffle first; with `--shuffle` a playlist or album starts at a random
+track. `shuffle on|off`, `repeat off|track|context`, `volume 0..100` and
+`seek SECONDS` set what they name.
+
+Once Spotify has accepted a command that changes playback, the command
+has happened: it exits 0 even when the player cannot be read afterwards.
+`state` is then `null` and `hint` says to run `sss player`. A command
+whose failure says Spotify *may have applied it* (a skip or queue add
+that got no answer or a 5xx, which `sss` does not resend) may have
+happened too: run `sss player` to see before running it again, whatever
+the `kind`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `action` | string | the command: `play`, `pause`, … |
+| `device` | Device, optional | the player the command went to |
+| `state` | PlayerState, optional | read after the command; `null` when none is active, or when it could not be read (then `hint` says so) |
+| `hint` | string, optional | the player could not be read after the command: run `sss player`; for `play` also: Spotify loaded the music but is not playing (a browser blocking autoplay: click play once, or allow autoplay for the tab), or would not give a shuffled playlist's or album's length, so it starts at its first track |
+
+```json
+{
+  "ok": true,
+  "command": "play",
+  "profile": "alice",
+  "action": "play",
+  "device": { "id": "0d1841b0976bae2a3a310dd74c0f3df354899bc8", "name": "Firefox",
+    "type": "Computer", "is_active": false, "is_restricted": false,
+    "volume_percent": 100 },
+  "state": {
+    "device": { "id": "0d1841b0976bae2a3a310dd74c0f3df354899bc8", "name": "Firefox",
+      "type": "Computer", "is_active": true, "is_restricted": false,
+      "volume_percent": 100 },
+    "is_playing": true,
+    "item": { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+      "artists": ["Artist"], "album": "Album", "duration_ms": 215000 },
+    "progress_ms": 1200,
+    "context": null,
+    "shuffle": false,
+    "repeat": "off"
+  },
+  "hint": null
+}
+```
+
+#### `queue`
+
+`sss queue TARGET...` adds tracks (URI, link or id) to the queue, in
+order; any other target is kind `input` and nothing is queued. A queued
+track cannot be taken off the queue. When a request fails after some
+tracks were queued, the failure keeps its own `kind` and `details`, and
+`error` begins `queued N of M (<uris>), then:` naming the ones that
+landed; nothing landed gives the failure alone. When that failure says
+Spotify may have applied it, the track after the named ones may be
+queued as well.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `device` | Device, optional | the player the tracks went to |
+| `queued` | [string] | the track URIs added, in order |
+| `queue` | [Offered] | the queue afterwards, as Spotify gives it |
+| `state` | PlayerState, optional | |
+| `hint` | string, optional | the queue or the player could not be read after the tracks were added: run `sss player` |
+
 ## Error documents
 
 ```json
@@ -641,16 +826,18 @@ reports where. Its match table counts the matches of each kind by method:
 | `kind` | Meaning | What a caller does |
 |---|---|---|
 | `auth` | no stored Pandora session or Spotify token, or the service refused it or the credential given to sign in | sign in again: `sss pandora auth` with a fresh token, or `sss spotify auth` |
-| `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again |
+| `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again; a playback command whose `error` says Spotify may have applied it: run `sss player` first |
 | `quota` | Spotify's rate or quota limit, or `ccc`'s usage limit, was reached; everything done so far is recorded | run the command again later; it continues where it stopped |
 | `incomplete` | an export run ended with failed steps | look at `details.failed_steps`; the run is kept |
-| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
+| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, an unknown device, station or item), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
 | `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
+| `player` | the Spotify player cannot take the command: no player open, several open and none active, Premium missing, or Spotify refused the control | relay the message, then run again |
 | `other` | anything else: a file that cannot be read or written, unparseable data | read `error` |
 
 ### Details
 
-`pandora export` gives `details` in two cases, and `match answer` in one.
+`pandora export` gives `details` in two cases, `match answer` in one, and
+the playback commands in one.
 
 - **The run ended with failed steps** (`kind` `incomplete`):
   `{ run_id, run_dir, failed_steps: [step name], manifest }`.
@@ -704,6 +891,33 @@ reports where. Its match table counts the matches of each kind by method:
       "problems": [
         { "item": "TR:1", "problem": "item TR:1: choice \"spotify:track:z\" was not offered for it" },
         { "item": null, "problem": "decision 2 has no \"item\" string" }
+      ]
+    }
+  }
+  ```
+
+- **The player cannot take the command** (`kind` `player`): `{ reason,
+  devices: [Device] }`. `reason` is Spotify's (`NO_ACTIVE_DEVICE`,
+  `PREMIUM_REQUIRED`, `RESTRICTION_VIOLATED`, `DEVICE_NOT_CONTROLLABLE`, …)
+  or `sss`'s own `SEVERAL_DEVICES`; `devices` lists the open players when
+  `sss` refused before sending anything (no player it could use, or
+  several), and is `[]` when Spotify refused.
+
+  ```json
+  {
+    "ok": false,
+    "command": "play",
+    "kind": "player",
+    "error": "play: several Spotify players are open and none is active (Firefox, Kitchen); pass --device NAME",
+    "details": {
+      "reason": "SEVERAL_DEVICES",
+      "devices": [
+        { "id": "0d1841b0976bae2a3a310dd74c0f3df354899bc8", "name": "Firefox",
+          "type": "Computer", "is_active": false, "is_restricted": false,
+          "volume_percent": 100 },
+        { "id": "5fbb3b0e3b6c4d1e9f0a2b7c8d9e0f1a2b3c4d5e", "name": "Kitchen",
+          "type": "Speaker", "is_active": false, "is_restricted": false,
+          "volume_percent": 40 }
       ]
     }
   }

@@ -12,6 +12,9 @@ person who runs `sss`.
   to Spotify fails with an access error until it is renewed.
 - Have the Spotify login email of each family member whose account will be
   synced.
+- Playback control (`sss play` and the other player commands) needs
+  Spotify Premium on the member's own account as well; the other commands
+  do not.
 
 ## 1. Register the app
 

@@ -813,19 +813,25 @@ pub fn write(paths: &ProfilePaths, data: &Normalized) -> Result<()> {
 /// Reads the normalized files [`write`] wrote; none yet is an error naming
 /// `sss pandora export`.
 pub fn read(paths: &ProfilePaths) -> Result<Normalized> {
+    Ok(Normalized {
+        stations: read_stations(paths)?,
+        playlists: repo::read_json(&paths.playlists())?,
+        collection: repo::read_json(&paths.collection())?,
+        bookmarks: repo::read_json(&paths.bookmarks())?,
+        tracks: repo::read_json(&paths.tracks())?,
+    })
+}
+
+/// Reads the normalized stations alone; none yet is an error naming `sss
+/// pandora export`.
+pub fn read_stations(paths: &ProfilePaths) -> Result<Vec<Station>> {
     let Some(stations) = repo::read_json_opt(&paths.stations())? else {
         bail!(
             "no normalized export in {}; run `sss pandora export`",
             paths.pandora_dir().display()
         );
     };
-    Ok(Normalized {
-        stations,
-        playlists: repo::read_json(&paths.playlists())?,
-        collection: repo::read_json(&paths.collection())?,
-        bookmarks: repo::read_json(&paths.bookmarks())?,
-        tracks: repo::read_json(&paths.tracks())?,
-    })
+    Ok(stations)
 }
 
 /// What one normalization holds, counted.
@@ -1338,6 +1344,8 @@ mod tests {
         let paths = Repo::at(tmp.path()).profile("alice").unwrap();
         let err = read(&paths).unwrap_err().to_string();
         assert!(err.contains("run `sss pandora export`"), "{err}");
+        let err = read_stations(&paths).unwrap_err().to_string();
+        assert!(err.contains("run `sss pandora export`"), "{err}");
 
         let data = normalize_exchanges(&[(
             "v1/station/getStationFeedback",
@@ -1347,6 +1355,7 @@ mod tests {
         )]);
         write(&paths, &data).unwrap();
         assert_eq!(read(&paths).unwrap(), data);
+        assert_eq!(read_stations(&paths).unwrap(), data.stations);
     }
 
     #[test]

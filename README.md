@@ -23,8 +23,10 @@ you are already logged in.
 
 Early development. `sss init`, `sss pandora auth`, `sss pandora export`,
 `sss pandora normalize`, `sss spotify auth`, `sss match`,
-`sss match review|questions|answer|set|reject`, `sss push`, `sss report`,
-`sss status` and `sss guide` work, and each also takes `--json` for one machine-readable document on
+`sss match review|questions|answer|set|reject`, `sss search`, `sss push`,
+`sss report`, `sss status`, `sss guide` and the playback commands
+(`sss devices|player|play|pause|next|previous|queue|shuffle|repeat|volume|seek`)
+work, and each also takes `--json` for one machine-readable document on
 stdout (see
 [Driving `sss` from a script or an LLM](#driving-sss-from-a-script-or-an-llm)).
 See [CHANGELOG.md](CHANGELOG.md).
@@ -153,15 +155,20 @@ every problem. Either path can take over from the other.
   `sss match reject TR:…` records that an item has no Spotify counterpart.
   Neither touches the network, and a later `match` run never overrides
   them.
+- `sss search QUERY...` searches Spotify for free text, one request per
+  query (`--only tracks|artists|albums`, `--limit N` up to 10 per kind),
+  for when the stored candidates miss the right recording; each result's
+  `id` goes straight into `sss match set`.
 
 ### Push
 
 `sss push --profile NAME` sends what is matched to the member's Spotify
 account: it follows the matched artists, makes one private playlist per
 station (its matched seeds, then its thumbs-up by date) and one per
-Pandora playlist, saves the collection and bookmarks to the library, and,
-when switched on in `[push]`, saves every thumbs-up as a liked song
-(`liked_songs`) and keeps the thumbs-down in a reference playlist
+Pandora playlist, saves the collection and bookmarks to the library,
+saves every thumbs-up as a liked song (`liked_songs`, on by default in
+`[push]`; one switch for every profile in the repository) and, when
+switched on, keeps the thumbs-down in a reference playlist
 (`thumbs_down_playlist`). `playlist_prefix` goes in front of station
 playlists' names and `public_playlists = true` makes the playlists public.
 Each playlist's description ends with `sss:<key>`, so you can tell the
@@ -183,6 +190,30 @@ that stopped before recording it: the create request got no answer, or an
 answer `sss` could not read. `sss` leaves it alone and prints what to
 check in Spotify and which `state.json` entry to edit. A create Spotify
 refused leaves nothing behind and is tried again on the next push.
+
+### Playback
+
+The profile's Spotify player can be driven from the command line, which
+is how an agent plays music for a family member: to settle a match by ear,
+to start a station's playlist, or to queue what someone asked for. It
+needs Spotify Premium on the member's account and a sign-in with the
+playback scopes (run `sss spotify auth` again for a token made before
+them). Every command that changes playback takes `--device NAME|ID`;
+without it the active player is used, else the only one open, and a
+browser at https://open.spotify.com counts. Each reports the player's
+state afterwards; a `play` that Spotify loaded but a browser kept silent
+says so and how to allow autoplay.
+
+```sh
+sss devices                                  # the open players
+sss player                                   # what is playing, and the queue
+sss play spotify:track:4uLU6hMCjMI75M1A2tKUQC  # tracks, or one playlist/album/artist
+sss play --station "Music for working" --shuffle
+sss play --item TR:123                       # a track's stored candidates, in order
+sss queue spotify:track:4uLU6hMCjMI75M1A2tKUQC # cannot be undone
+sss pause | next | previous
+sss shuffle on|off ; sss repeat off|track|context ; sss volume 40 ; sss seek 90
+```
 
 ### Report
 

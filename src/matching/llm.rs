@@ -29,6 +29,7 @@ use crate::matching::normalize;
 use crate::matching::run::Item;
 use crate::repo::{self, ProfilePaths};
 use crate::spotify::ids::IdKind;
+use crate::spotify::item::Offered;
 
 /// The embedded agent definition.
 pub const DEFINITION: &str = include_str!("../../agents/music-matcher.md");
@@ -54,56 +55,6 @@ pub struct BatchItem {
     pub kind: IdKind,
     pub pandora: Value,
     pub candidates: Vec<Offered>,
-}
-
-/// A stored candidate as the prompt offers it: its URI as `id`, no score.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Offered {
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub artists: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub album: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub album_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub release_date: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub explicit: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub isrc: Option<String>,
-}
-
-impl From<&Candidate> for Offered {
-    fn from(c: &Candidate) -> Self {
-        // Exhaustive, so a new candidate field has to be offered or dropped here.
-        let Candidate {
-            uri,
-            name,
-            artists,
-            album,
-            album_type,
-            release_date,
-            duration_ms,
-            explicit,
-            isrc,
-            score: _,
-        } = c;
-        Offered {
-            id: uri.clone(),
-            name: name.clone(),
-            artists: artists.clone(),
-            album: album.clone(),
-            album_type: album_type.clone(),
-            release_date: release_date.clone(),
-            duration_ms: *duration_ms,
-            explicit: *explicit,
-            isrc: isrc.clone(),
-        }
-    }
 }
 
 impl BatchItem {
@@ -1140,6 +1091,7 @@ mod tests {
         assert!(!other.path().join("ccc").exists());
     }
 
+    // TODO(fake-ccc-etxtbsy): writing this script races other tests' spawns.
     /// A fake `ccc` in `dir`: logs its arguments, exits `which` for `which`,
     /// and on its Nth other call sleeps `sleepN` seconds when that file
     /// exists, prints `outN` and exits `exitN` (default 0).

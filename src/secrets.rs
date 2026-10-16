@@ -252,11 +252,16 @@ impl fmt::Debug for PandoraSession {
     }
 }
 
+/// Fills `bytes` from the system's randomness.
+pub(crate) fn fill_random(bytes: &mut [u8]) -> Result<()> {
+    getrandom::fill(bytes).map_err(|e| anyhow::anyhow!("reading system randomness: {e}"))
+}
+
 /// A fresh random CSRF token: 16 lowercase hex digits, the form Pandora's
 /// own `csrftoken` cookie takes.
 pub fn new_csrf_token() -> Result<String> {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("reading system randomness: {e}"))?;
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 

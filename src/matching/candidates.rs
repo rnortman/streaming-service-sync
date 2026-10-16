@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::matching::normalize;
 use crate::matching::score::{self, Decision, Scored, TrackItem};
-use crate::spotify::client::{SearchResults, Spotify};
+use crate::spotify::client::{SEARCH_LIMIT, SearchResults, Spotify};
 use crate::spotify::ids::IdKind;
 
 /// A Spotify search: up to ten results of `kind` for `q`.
@@ -15,7 +15,7 @@ pub trait Search {
 
 impl Search for Spotify {
     fn search(&mut self, q: &str, kind: IdKind) -> Result<SearchResults> {
-        Spotify::search(self, q, kind)
+        Spotify::search(self, q, &[kind], SEARCH_LIMIT)
     }
 }
 

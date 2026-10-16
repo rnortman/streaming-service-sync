@@ -58,8 +58,9 @@ impl GuideReport {
 mod tests {
     use super::*;
     use crate::error::Kind;
-    use crate::matching::llm::{self, BatchItem, Completeness, Offered};
+    use crate::matching::llm::{self, BatchItem, Completeness};
     use crate::spotify::ids::IdKind;
+    use crate::spotify::item::Offered;
     use serde_json::Value;
 
     /// The body of the `music-matcher` agent definition: everything after

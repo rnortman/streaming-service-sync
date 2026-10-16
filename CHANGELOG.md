@@ -6,6 +6,35 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Playback control.** `sss devices`, `sss player`, `sss play`, `sss
+  pause`, `sss next`, `sss previous`, `sss queue`, `sss shuffle`, `sss
+  repeat`, `sss volume` and `sss seek` drive the profile's Spotify player.
+  `sss play` takes tracks, one playlist, album or artist, a station's
+  pushed playlist (`--station NAME`) or a track's stored candidates
+  (`--item TR:…`); with `--shuffle` a playlist or album starts at a random
+  track. Each command chooses the device by one rule (`--device NAME|ID`
+  overrides it) and reports the player's state afterwards. Playback needs
+  Spotify Premium on the member's account.
+- **`sss search QUERY...`**: free-text Spotify searches, several per call,
+  each result's `id` ready for `sss match set`, `sss play` or `sss queue`.
+- Error kind **`player`**: the Spotify player cannot take the command (no
+  player open, several open and none active, Premium missing, a control
+  Spotify refused); `details` carries `reason` and the open `devices`.
+
+### Changed
+
+- Spotify sign-in asks for the playback scopes
+  (`user-read-playback-state`, `user-modify-playback-state`). Existing
+  tokens keep working for everything but playback, whose commands say to
+  sign in again.
+- `[push] liked_songs` is on by default in repositories `sss init` creates
+  from now on; an existing `config.toml` keeps its explicit setting.
+- JSON output describes a Spotify track, artist or album the same way
+  everywhere (match candidates, search results, the playing item, the
+  queue): one shape, documented in `docs/json-output.md` as `Offered`.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

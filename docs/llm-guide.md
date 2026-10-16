@@ -46,7 +46,7 @@ matching protocol, so refresh any copy you keep from the binary you run.
   state directory, `~/.local/state/streaming-service-sync/NAME/`, mode
   0600, never in the data repository.
 - Every command takes `--json` and then prints one JSON document on stdout
-  (section 11). Start every session with:
+  (section 12). Start every session with:
 
 ```sh
 sss status --json
@@ -123,6 +123,17 @@ command again; nothing done so far is lost. Either path can take over from
 the other at any time: `sss match` asks `ccc` about whatever is still open,
 and `sss match questions` lists whatever `ccc` has not settled.
 
+When the stored candidates do not hold the right recording, search for it
+and record the `id` with `sss match set` (section 7):
+
+```sh
+sss search "Panjabi MC Mundian to Bach Ke" "Daft Punk One More Time" --only tracks --profile NAME --json
+```
+
+Each query is one Spotify search; `results` holds one entry per query with
+its `tracks`, `artists` and `albums` in Spotify's order (`--limit N`, 1 to
+10, per kind). Batch every query you need into one call.
+
 ## 7. Settling leftovers
 
 ```sh
@@ -140,9 +151,67 @@ sss match reject TR:123 --profile NAME --json
 ```
 
 `match set` takes a Spotify URI, link or id; `match reject` records that
-the item has no Spotify counterpart. No later run overrides either.
+the item has no Spotify counterpart. No later run overrides either. When
+none of the listed candidates is right, `sss search` finds others; its
+results' `id`s go straight into `sss match set`.
 
-## 8. The report
+## 8. Playing music
+
+`sss` also controls the profile's Spotify player. It needs Spotify Premium
+on the member's account and a token signed in with the playback scopes:
+when `spotify_token.scopes` in `sss status --json` lacks
+`user-modify-playback-state`, run the sign-in of section 5 again. The
+player commands then fail with kind `auth` saying so.
+
+```sh
+sss devices --profile NAME --json
+sss player --profile NAME --json
+sss play spotify:track:4uLU6hMCjMI75M1A2tKUQC --profile NAME --json
+sss play --item TR:123 --profile NAME --json
+sss play --station "Music for working" --shuffle --profile NAME --json
+sss queue spotify:track:4uLU6hMCjMI75M1A2tKUQC --profile NAME --json
+sss pause --profile NAME --json
+sss next --profile NAME --json
+sss previous --profile NAME --json
+sss shuffle on --profile NAME --json
+sss repeat off --profile NAME --json
+sss volume 40 --profile NAME --json
+sss seek 90 --profile NAME --json
+```
+
+`sss devices` lists the open players; `sss player` shows what is playing
+and the queue. `sss play` takes any number of tracks, or one playlist,
+album or artist, as URIs, links or ids; with nothing named it resumes.
+`--item TR:…` plays a track's stored candidates in order, so the person can
+settle it by ear and `sss next` moves to the next candidate; record their
+choice with `sss match set`. `--station NAME` plays the Spotify playlist
+`sss push` made for a Pandora station. Every command that changes playback
+takes `--device NAME|ID`; without it the active player is used, else the
+only one open.
+
+When `play` succeeds with a `hint` that Spotify loaded the music and is
+not playing, a browser is usually blocking autoplay. Pass the hint to the
+person: click play once, or allow autoplay for the Spotify
+tab. Kind `player` means the person has something to do on the Spotify
+side — open a player, pick one with `--device`, or use a Premium account;
+relay the message, then run again.
+
+A queued track cannot be taken back. Queue only what the person named,
+with ids from `sss search` or a match document — never a guess. To find
+several tracks to queue, put every query in one `sss search` call, choose
+from its results, then queue them in one `sss queue` call.
+When `sss queue` stops partway, `error` names the tracks already queued:
+do not queue those again.
+
+A skip or a queued track cannot be undone, so never run a playback
+command again on a guess. When it succeeds but its `hint` says the
+player could not be read, it happened: run `sss player` to see the
+state. When it fails with an `error` saying Spotify may have applied it,
+it may have happened — for `sss queue`, the track after the ones named
+may be queued too: run `sss player` and look before running anything
+again.
+
+## 9. The report
 
 ```sh
 sss report --profile NAME --json
@@ -152,7 +221,7 @@ writes `profiles/NAME/report.md` and prints its path. Read it: it says what
 was exported, how much is matched, and every item that needs a person.
 Tell the person what needs them.
 
-## 9. Push
+## 10. Push
 
 ```sh
 sss push --dry-run --profile NAME --json
@@ -168,7 +237,13 @@ earlier push that stopped before recording it: `sss` leaves it alone and
 says what to look for in Spotify and which `spotify/state.json` entry to
 edit. That edit is the owner's to make by hand; tell them.
 
-## 10. Re-runs and resuming
+`[push] liked_songs` in `config.toml` is on by default: the matched thumbs
+up are saved to Liked Songs. It is one switch for every profile in the
+repository, not a per-member setting, so do not ask each member about it;
+if a member does not want it, tell the repository's owner (the person who
+ran `sss init`), whose call it is.
+
+## 11. Re-runs and resuming
 
 Every command can be stopped and run again: what was done is recorded as it
 happens, and the next run continues. Kinds `quota` and `unavailable` mean
@@ -176,7 +251,7 @@ try the same command later. A new `sss pandora export` replaces the
 normalized files; the next `sss match` searches only the items it has not
 seen, and the next push adds what is new.
 
-## 11. Reading `--json`
+## 12. Reading `--json`
 
 On success stdout is one document that starts with `"ok": true` and
 `"command"`, followed by the command's report:
@@ -210,17 +285,23 @@ about each `kind`:
 - `unavailable` — Pandora or Spotify did not answer: run it again later.
 - `quota` — a rate or usage limit: run it again later; it continues.
 - `incomplete` — an export with failed steps: export again later.
-- `input` — what you piped or passed is unusable; for `sss match answer`,
-  `details.problems` lists each problem: fix those and resubmit.
+- `input` — what you piped or passed is unusable (including a target of
+  the wrong type, or an unknown device, station or item); for `sss match
+  answer`, `details.problems` lists each problem: fix those and resubmit.
 - `config` — the setup needs fixing as the message says (the repository,
   `config.toml`, `--profile`, the Spotify app, `ccc`); tell the owner when
   it is theirs to fix.
+- `player` — the Spotify player cannot take the command: no player is
+  open, several are open and none active, the account lacks Premium, or
+  Spotify refused the control. `details.reason` carries the reason code
+  and `details.devices` the open players. Relay the message to the person,
+  then run again.
 - `other` — anything else; read `error` and tell the person.
 
 Every field of every document is in
 [the JSON output reference](https://github.com/rnortman/streaming-service-sync/blob/main/docs/json-output.md).
 
-## 12. Check with the person; never do
+## 13. Check with the person; never do
 
 Ask the person before:
 

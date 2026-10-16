@@ -21,13 +21,16 @@ use crate::pandora::auth::{self, AuthReport};
 use crate::pandora::client::Client;
 use crate::pandora::export::{self, ExportIncomplete, ExportReport, Manifest};
 use crate::pandora::model::{self, Summary};
+use crate::player::{self, Control, DevicesReport, PlayerReport, PlayerStateReport, QueueReport};
 use crate::profiles;
 use crate::push::{self, PushReport};
 use crate::repo::{self, Repo};
 use crate::report::{self, ReportFile};
+use crate::search::{self, SearchReport};
 use crate::secrets::{StateDir, StateRoot};
 use crate::spotify;
 use crate::spotify::ids::IdKind;
+use crate::spotify::playback::{Device, PlayerRefused, Repeat};
 use crate::status::{self, StatusReport};
 
 /// Export a Pandora account to a local data repository and migrate it to
@@ -77,6 +80,147 @@ pub enum Command {
         #[arg(value_enum)]
         topic: Option<guide::Topic>,
     },
+    /// List the Spotify players open on the profile's account
+    Devices,
+    /// Show what the profile's Spotify player is playing and what is queued
+    Player,
+    /// Play tracks, a playlist, album or artist, a station's playlist or a
+    /// track's stored candidates; with nothing named, resume
+    Play(PlayArgs),
+    /// Pause playback
+    Pause(DeviceArg),
+    /// Skip to the next track
+    Next(DeviceArg),
+    /// Go back to the previous track
+    Previous(DeviceArg),
+    /// Add tracks to the queue, in order; a queued track cannot be removed
+    Queue(QueueArgs),
+    /// Turn shuffle on or off
+    Shuffle {
+        #[arg(value_enum)]
+        state: OnOff,
+        #[command(flatten)]
+        device: DeviceArg,
+    },
+    /// Set the repeat mode
+    Repeat {
+        #[arg(value_enum)]
+        mode: RepeatMode,
+        #[command(flatten)]
+        device: DeviceArg,
+    },
+    /// Set the volume, 0 to 100
+    Volume {
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
+        #[command(flatten)]
+        device: DeviceArg,
+    },
+    /// Seek to a position in the playing track
+    Seek {
+        /// Whole seconds from the start of the track
+        seconds: u64,
+        #[command(flatten)]
+        device: DeviceArg,
+    },
+    /// Search Spotify for tracks, artists and albums; several queries at once
+    Search(SearchArgs),
+}
+
+/// The Spotify player a command that changes playback goes to.
+#[derive(Debug, Args)]
+pub struct DeviceArg {
+    /// The player, by name or id (see `sss devices`) [default: the active
+    /// one, else the only one open]
+    #[arg(long, value_name = "NAME|ID")]
+    pub device: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PlayArgs {
+    /// Spotify tracks (URI, link or bare id), or one playlist, album or
+    /// artist
+    #[arg(value_name = "TARGET")]
+    pub targets: Vec<String>,
+
+    /// Play the Spotify playlist `sss push` made for this station
+    #[arg(long, value_name = "NAME")]
+    pub station: Option<String>,
+
+    /// Play the stored candidates of this Pandora track (TR:…), in order
+    #[arg(long, value_name = "TR:…")]
+    pub item: Option<String>,
+
+    /// Turn shuffle on first; a playlist or album starts at a random track
+    #[arg(long, conflicts_with = "no_shuffle")]
+    pub shuffle: bool,
+
+    /// Turn shuffle off first
+    #[arg(long)]
+    pub no_shuffle: bool,
+
+    #[command(flatten)]
+    pub device: DeviceArg,
+}
+
+impl PlayArgs {
+    /// The shuffle state to set first; `None` leaves it as it is.
+    fn shuffle(&self) -> Option<bool> {
+        match (self.shuffle, self.no_shuffle) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct QueueArgs {
+    /// Spotify tracks (URI, link or bare id), in the order to queue them
+    #[arg(value_name = "TARGET", required = true)]
+    pub targets: Vec<String>,
+
+    #[command(flatten)]
+    pub device: DeviceArg,
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Free-text queries, one request each
+    #[arg(value_name = "QUERY", required = true)]
+    pub queries: Vec<String>,
+
+    /// Search only this kind of entity
+    #[arg(long, value_enum)]
+    pub only: Option<MatchKind>,
+
+    /// Results of each kind per query, 1 to 10
+    #[arg(long, value_name = "N", default_value_t = spotify::client::SEARCH_LIMIT,
+          value_parser = clap::value_parser!(u32).range(1..=i64::from(spotify::client::SEARCH_LIMIT)))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepeatMode {
+    Off,
+    Track,
+    Context,
+}
+
+impl From<RepeatMode> for Repeat {
+    fn from(mode: RepeatMode) -> Self {
+        match mode {
+            RepeatMode::Off => Repeat::Off,
+            RepeatMode::Track => Repeat::Track,
+            RepeatMode::Context => Repeat::Context,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -283,7 +427,34 @@ impl Command {
             Command::Status => "status",
             Command::Report => "report",
             Command::Guide { .. } => "guide",
+            Command::Devices => "devices",
+            Command::Player => "player",
+            Command::Play(_) => "play",
+            Command::Pause(_) => "pause",
+            Command::Next(_) => "next",
+            Command::Previous(_) => "previous",
+            Command::Queue(_) => "queue",
+            Command::Shuffle { .. } => "shuffle",
+            Command::Repeat { .. } => "repeat",
+            Command::Volume { .. } => "volume",
+            Command::Seek { .. } => "seek",
+            Command::Search(_) => "search",
         }
+    }
+
+    /// The player control of a command that is one, with its `--device`.
+    fn control(&self) -> Option<(Control, Option<&str>)> {
+        let (control, device) = match self {
+            Command::Pause(d) => (Control::Pause, d),
+            Command::Next(d) => (Control::Next, d),
+            Command::Previous(d) => (Control::Previous, d),
+            Command::Shuffle { state, device } => (Control::Shuffle(*state == OnOff::On), device),
+            Command::Repeat { mode, device } => (Control::Repeat(Repeat::from(*mode)), device),
+            Command::Volume { percent, device } => (Control::Volume(*percent), device),
+            Command::Seek { seconds, device } => (Control::Seek(*seconds), device),
+            _ => return None,
+        };
+        Some((control, device.device.as_deref()))
     }
 
     /// Whether the command acts on one profile and so needs `--profile` or a
@@ -316,6 +487,11 @@ pub enum Output {
     Report(ReportFile),
     Status(StatusReport),
     Guide(GuideReport),
+    Devices(DevicesReport),
+    PlayerState(PlayerStateReport),
+    Player(PlayerReport),
+    Queue(QueueReport),
+    Search(SearchReport),
 }
 
 impl Output {
@@ -336,6 +512,11 @@ impl Output {
             Output::Report(r) => r.write_text(out),
             Output::Status(r) => r.write_text(out),
             Output::Guide(r) => r.write_text(out),
+            Output::Devices(r) => r.write_text(out),
+            Output::PlayerState(r) => r.write_text(out),
+            Output::Player(r) => r.write_text(out),
+            Output::Queue(r) => r.write_text(out),
+            Output::Search(r) => r.write_text(out),
         }
     }
 }
@@ -360,7 +541,8 @@ struct FailureDocument<'a> {
     details: Option<Details<'a>>,
 }
 
-/// The `details` of a failed `pandora export` or a refused `match answer`.
+/// The `details` of a failed `pandora export`, a refused `match answer` or
+/// a player refusal.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Details<'a> {
@@ -376,6 +558,10 @@ enum Details<'a> {
     Stopped {
         run_id: &'a str,
         run_dir: &'a Path,
+    },
+    Player {
+        reason: &'a str,
+        devices: &'a [Device],
     },
 }
 
@@ -421,12 +607,18 @@ fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Result
             failed_steps: i.failed_steps(),
             manifest: &i.0.manifest,
         }),
-        None => err
-            .chain()
-            .find_map(|e| e.downcast_ref::<DecisionsRefused>())
-            .map(|r| Details::Refused {
-                problems: &r.problems,
-            }),
+        None => err.chain().find_map(|e| {
+            if let Some(r) = e.downcast_ref::<DecisionsRefused>() {
+                Some(Details::Refused {
+                    problems: &r.problems,
+                })
+            } else {
+                e.downcast_ref::<PlayerRefused>().map(|p| Details::Player {
+                    reason: &p.reason,
+                    devices: &p.devices,
+                })
+            }
+        }),
     };
     let mut document = FailureDocument {
         ok: false,
@@ -718,6 +910,26 @@ fn dispatch(
         (Command::Status, profile) => Ok(Output::Status(status::status(
             &repo, state_root, &config, profile,
         )?)),
+        (
+            command @ (Command::Devices
+            | Command::Player
+            | Command::Play(_)
+            | Command::Pause(_)
+            | Command::Next(_)
+            | Command::Previous(_)
+            | Command::Queue(_)
+            | Command::Shuffle { .. }
+            | Command::Repeat { .. }
+            | Command::Volume { .. }
+            | Command::Seek { .. }),
+            Some(name),
+        ) => player_command(command, name, &config, &repo, state_root),
+        (Command::Search(args), Some(name)) => Ok(Output::Search(search::search(
+            &args.queries,
+            args.only.map(IdKind::from),
+            args.limit,
+            || spotify_client(name, &config, &repo, state_root.profile(name)?),
+        )?)),
         // `guide` and `init` returned above, and every other command has a
         // profile by now: `--profile`, or the only one.
         (Command::Guide { .. } | Command::Init, _) | (_, None) => fail!(
@@ -725,6 +937,49 @@ fn dispatch(
             "`sss {}` needs --profile NAME",
             cli.command.name()
         ),
+    }
+}
+
+/// Runs a playback command for profile `name`: its arguments are resolved
+/// before the profile's Spotify client is made.
+fn player_command(
+    command: &Command,
+    name: &str,
+    config: &Config,
+    repo: &Repo,
+    state_root: &StateRoot,
+) -> Result<Output> {
+    let connect = || spotify_client(name, config, repo, state_root.profile(name)?);
+    if let Some((control, device)) = command.control() {
+        return Ok(Output::Player(player::control(
+            name, control, device, connect,
+        )?));
+    }
+    match command {
+        Command::Devices => Ok(Output::Devices(player::devices(name, connect)?)),
+        Command::Player => Ok(Output::PlayerState(player::player(name, connect)?)),
+        Command::Play(args) => {
+            let source = player::resolve_source(
+                &repo.profile(name)?,
+                &args.targets,
+                args.station.as_deref(),
+                args.item.as_deref(),
+            )?;
+            Ok(Output::Player(player::play(
+                name,
+                &source,
+                args.shuffle(),
+                args.device.device.as_deref(),
+                connect,
+            )?))
+        }
+        Command::Queue(args) => Ok(Output::Queue(player::queue(
+            name,
+            &args.targets,
+            args.device.device.as_deref(),
+            connect,
+        )?)),
+        _ => unreachable!("`{}` is not a playback command", command.name()),
     }
 }
 
@@ -866,7 +1121,29 @@ mod tests {
         (&["report"], "report"),
         (&["guide"], "guide"),
         (&["guide", "matching"], "guide"),
+        (&["devices"], "devices"),
+        (&["player"], "player"),
+        (&["play"], "play"),
+        (&["play", TRACK], "play"),
+        (&["play", "--station", "x"], "play"),
+        (&["play", "--item", "TR:1"], "play"),
+        (&["pause"], "pause"),
+        (&["next"], "next"),
+        (&["previous"], "previous"),
+        (&["queue", TRACK], "queue"),
+        (&["shuffle", "on"], "shuffle"),
+        (&["repeat", "off"], "repeat"),
+        (&["volume", "50"], "volume"),
+        (&["seek", "30"], "seek"),
+        (&["search", "x"], "search"),
+        (
+            &["search", "x", "y", "--only", "tracks", "--limit", "5"],
+            "search",
+        ),
     ];
+
+    /// The documentation's public example track.
+    const TRACK: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
 
     #[test]
     fn every_documented_command_parses() {
@@ -927,6 +1204,18 @@ mod tests {
         };
         assert_eq!(pandora_id, "TR:9");
         assert_eq!(spotify, "https://open.spotify.com/track/x");
+
+        let Command::Search(s) = parse(&["search", "a b", "c"]).command else {
+            panic!("not search")
+        };
+        assert_eq!(s.queries, ["a b", "c"]);
+        assert_eq!((s.only, s.limit), (None, 10));
+        let Command::Search(s) =
+            parse(&["search", "x", "--only", "artists", "--limit", "1"]).command
+        else {
+            panic!("not search")
+        };
+        assert_eq!((s.only, s.limit), (Some(MatchKind::Artists), 1));
     }
 
     #[test]
@@ -945,12 +1234,85 @@ mod tests {
             &["pandora"],
             &["pandora", "import", "b.json"],
             &["guide", "everything"],
+            &["volume", "101"],
+            &["volume", "-1"],
+            &["seek", "-5"],
+            &["shuffle", "maybe"],
+            &["repeat", "all"],
+            &["queue"],
+            &["play", "--shuffle", "--no-shuffle"],
+            &["devices", "--device", "Firefox"],
+            &["player", "--device", "Firefox"],
+            &["search"],
+            &["search", "x", "--limit", "0"],
+            &["search", "x", "--limit", "11"],
+            &["search", "x", "--only", "songs"],
+            &["search", "x", "--device", "Firefox"],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("sss").chain(args.iter().copied())).is_err(),
                 "{args:?} accepted"
             );
         }
+    }
+
+    #[test]
+    fn every_command_that_changes_playback_takes_a_device() {
+        let lines: &[&[&str]] = &[
+            &["play"],
+            &["play", TRACK, "--shuffle"],
+            &["pause"],
+            &["next"],
+            &["previous"],
+            &["queue", TRACK],
+            &["shuffle", "off"],
+            &["repeat", "context"],
+            &["volume", "0"],
+            &["seek", "0"],
+        ];
+        for args in lines {
+            let mut full = args.to_vec();
+            full.extend(["--device", "Kitchen"]);
+            let command = parse(&full).command;
+            let device = match &command {
+                Command::Play(p) => p.device.device.as_deref(),
+                Command::Queue(q) => q.device.device.as_deref(),
+                other => other.control().unwrap().1,
+            };
+            assert_eq!(device, Some("Kitchen"), "{full:?}");
+        }
+        let Command::Play(p) = parse(&["play", "--no-shuffle", "a", "b"]).command else {
+            panic!("not play")
+        };
+        assert_eq!((p.shuffle(), p.targets.len()), (Some(false), 2));
+        let Command::Play(p) = parse(&["play", "--station", "Jazz", "--shuffle"]).command else {
+            panic!("not play")
+        };
+        assert_eq!(
+            (p.shuffle(), p.station.as_deref()),
+            (Some(true), Some("Jazz"))
+        );
+        let Command::Play(p) = parse(&["play"]).command else {
+            panic!("not play")
+        };
+        assert_eq!(p.shuffle(), None);
+        assert_eq!(
+            parse(&["volume", "100"]).command.control().unwrap().0,
+            Control::Volume(100)
+        );
+        assert_eq!(
+            parse(&["seek", "90"]).command.control().unwrap().0,
+            Control::Seek(90)
+        );
+        assert_eq!(
+            parse(&["repeat", "track"]).command.control().unwrap().0,
+            Control::Repeat(Repeat::Track)
+        );
+        assert_eq!(
+            parse(&["shuffle", "on"]).command.control().unwrap().0,
+            Control::Shuffle(true)
+        );
+        assert!(parse(&["devices"]).command.control().is_none());
     }
 
     fn text(report: &InitReport) -> String {
@@ -1204,6 +1566,28 @@ mod tests {
             ("report", Some(Kind::Other)),
             ("guide", None),
             ("guide matching", None),
+            ("devices", Some(Kind::Config)),
+            ("player", Some(Kind::Config)),
+            ("play", Some(Kind::Config)),
+            (
+                "play spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            ("play --station x", Some(Kind::Other)),
+            ("play --item TR:1", Some(Kind::Input)),
+            ("pause", Some(Kind::Config)),
+            ("next", Some(Kind::Config)),
+            ("previous", Some(Kind::Config)),
+            (
+                "queue spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            ("shuffle on", Some(Kind::Config)),
+            ("repeat off", Some(Kind::Config)),
+            ("volume 50", Some(Kind::Config)),
+            ("seek 30", Some(Kind::Config)),
+            ("search x", Some(Kind::Config)),
+            ("search x y --only tracks --limit 5", Some(Kind::Config)),
         ];
         for (args, name) in DOCUMENTED {
             let mut full = with_repo(&repo, args);
@@ -1240,6 +1624,35 @@ mod tests {
             text,
             "{\n  \"ok\": false,\n  \"command\": \"status\",\n  \"kind\": \"other\",\n  \
              \"error\": \"writing x: disk full\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_player_refusal_writes_its_reason_and_devices() {
+        let err = anyhow::Error::new(PlayerRefused {
+            what: "play".into(),
+            status: 0,
+            reason: "SEVERAL_DEVICES".into(),
+            message: String::new(),
+            devices: vec![Device {
+                id: "d1".into(),
+                name: "Firefox".into(),
+                kind: "Computer".into(),
+                is_active: false,
+                is_restricted: false,
+                volume_percent: Some(80),
+            }],
+        })
+        .context("playing");
+        let mut out = Vec::new();
+        report_failure(&parse(&["status", "--json"]), &err, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["kind"], "player");
+        assert_eq!(
+            doc["details"],
+            serde_json::json!({"reason": "SEVERAL_DEVICES", "devices": [
+                {"id": "d1", "name": "Firefox", "type": "Computer", "is_active": false,
+                 "is_restricted": false, "volume_percent": 80}]})
         );
     }
 

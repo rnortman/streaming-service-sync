@@ -32,7 +32,7 @@ timeout_s = 900
 
 [push]
 playlist_prefix = ""
-liked_songs = false
+liked_songs = true
 thumbs_down_playlist = false
 public_playlists = false
 linked_playlists = false  # also push Pandora-made playlists (Personalized, SharedListening, Curated, …)
@@ -91,16 +91,29 @@ impl Default for MatcherConfig {
 }
 
 /// The `[push]` table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {
     pub playlist_prefix: String,
+    /// Save matched thumbed-up tracks to Liked Songs; on by default.
     pub liked_songs: bool,
     pub thumbs_down_playlist: bool,
     pub public_playlists: bool,
     /// Push playlists Pandora made (any `linked_type` but `StationThumbs`
     /// and `MyThumbsUp`) as well as the member's own.
     pub linked_playlists: bool,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            playlist_prefix: String::new(),
+            liked_songs: true,
+            thumbs_down_playlist: false,
+            public_playlists: false,
+            linked_playlists: false,
+        }
+    }
 }
 
 /// One `[profiles.<name>]` table: per-profile overrides.
@@ -187,7 +200,14 @@ mod tests {
         assert_eq!(c.matcher.batch_size, 25);
         assert_eq!(c.matcher.max_format_retries, 3);
         assert_eq!(c.matcher.timeout_s, 900);
-        assert!(!c.push.liked_songs && !c.push.thumbs_down_playlist && !c.push.public_playlists);
+        assert!(c.push.liked_songs);
+        assert!(!c.push.thumbs_down_playlist && !c.push.public_playlists);
+    }
+
+    #[test]
+    fn liked_songs_can_be_turned_off() {
+        let c = Config::parse("[push]\nliked_songs = false\n").unwrap();
+        assert!(!c.push.liked_songs);
     }
 
     #[test]

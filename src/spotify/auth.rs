@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::error::{Kind, WithKind};
 use crate::fail;
 use crate::http;
 use crate::input::read_value;
-use crate::secrets::StateDir;
+use crate::secrets::{self, StateDir};
 
 /// The live accounts origin, home of `/authorize` and `/api/token`.
 pub const DEFAULT_AUTH_BASE_URL: &str = "https://accounts.spotify.com";
@@ -38,7 +38,15 @@ pub const SCOPES: &[&str] = &[
     "user-library-modify",
     "user-follow-read",
     "user-follow-modify",
+    PLAYBACK_READ_SCOPE,
+    PLAYBACK_MODIFY_SCOPE,
 ];
+
+/// The scope that reads the player's devices, state and queue.
+pub const PLAYBACK_READ_SCOPE: &str = "user-read-playback-state";
+
+/// The scope that controls playback: play, pause, skip, queue, shuffle.
+pub const PLAYBACK_MODIFY_SCOPE: &str = "user-modify-playback-state";
 
 /// The extra scope asked for when `[push] public_playlists = true`.
 pub const PUBLIC_PLAYLISTS_SCOPE: &str = "playlist-modify-public";
@@ -70,7 +78,7 @@ pub fn auth_base_from_env() -> String {
 /// `len` random bytes, base64url without padding.
 fn random_base64(len: usize) -> Result<String> {
     let mut bytes = vec![0u8; len];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow!("reading system randomness: {e}"))?;
+    secrets::fill_random(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -565,6 +573,16 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         assert_eq!(pairs, want);
+    }
+
+    #[test]
+    fn every_sign_in_asks_for_the_playback_scopes() {
+        for scope in ["user-read-playback-state", "user-modify-playback-state"] {
+            assert!(SCOPES.contains(&scope), "{scope}");
+            assert!(scopes(false).iter().any(|s| s == scope), "{scope}");
+            let url = authorize_url("https://accounts.example", &pending()).unwrap();
+            assert!(url.contains(scope), "{url}");
+        }
     }
 
     #[test]

@@ -853,12 +853,10 @@ mod tests {
     use crate::matching::model::{Confidence, Method, Status};
     use crate::pandora::model::{Album, Artist, Bookmark, Feedback, Playlist, Seed};
     use crate::secrets::StateDir;
-    use crate::spotify::auth::Token;
-    use crate::spotify::client::Timing;
     use crate::spotify::ids::IdKind;
+    use crate::spotify::test_support::{FAST, fresh_token, state_with};
     use httpmock::prelude::*;
     use serde_json::json;
-    use std::time::Duration;
 
     fn thumb(track: &str, positive: bool, created: Option<&str>) -> Feedback {
         Feedback {
@@ -1019,15 +1017,7 @@ mod tests {
             .profile("alice")
             .unwrap();
         write_matches(&paths);
-        let state = StateDir::under(&tmp.path().join("state"), "alice").unwrap();
-        state
-            .save_spotify_token(&Token {
-                access_token: "access-secret".into(),
-                refresh_token: "refresh-secret".into(),
-                expires_at: "2099-01-01T00:00:00Z".into(),
-                scopes: Vec::new(),
-            })
-            .unwrap();
+        let state = state_with(&tmp.path().join("state"), &fresh_token(&[]));
         Fixture {
             _tmp: tmp,
             paths,
@@ -1035,12 +1025,6 @@ mod tests {
             server: MockServer::start(),
         }
     }
-
-    const FAST: Timing = Timing {
-        min_interval: Duration::ZERO,
-        first_backoff: Duration::from_millis(1),
-        retry_after_unit: Duration::from_millis(1),
-    };
 
     impl Fixture {
         fn run(&self, config: &PushConfig, options: Options) -> Result<PushReport> {
@@ -1290,22 +1274,22 @@ mod tests {
     #[test]
     fn switched_off_parts_do_nothing() {
         let f = fixture();
-        let report = f
-            .run(
-                &PushConfig::default(),
-                Options {
-                    only: Some(Part::Liked),
-                    dry_run: false,
-                },
-            )
-            .unwrap();
+        let off = PushConfig {
+            liked_songs: false,
+            ..PushConfig::default()
+        };
+        let liked = Options {
+            only: Some(Part::Liked),
+            dry_run: false,
+        };
+        let report = f.run(&off, liked).unwrap();
         assert_eq!(report.parts.liked, Some(LibraryPart::default()));
         assert!(report.parts.stations.is_none());
         let report = f.only(Part::ThumbsDown).unwrap();
         let down = report.parts.thumbs_down.unwrap();
         assert!(!down.enabled && down.playlists.is_empty());
         let mut text = Vec::new();
-        f.only(Part::Liked).unwrap().write_text(&mut text).unwrap();
+        f.run(&off, liked).unwrap().write_text(&mut text).unwrap();
         assert!(
             String::from_utf8(text)
                 .unwrap()

@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::matching::run::DecisionsRefused;
 use crate::pandora::client::SessionRejected;
 use crate::pandora::export::{ExportIncomplete, ExportStopped};
+use crate::spotify::playback::PlayerRefused;
 
 /// Declares [`Kind`] and [`Kind::ALL`] from one list of variants, so `ALL`
 /// cannot miss one.
@@ -44,6 +45,10 @@ kinds! {
     /// The data repository, its configuration or the environment is not
     /// usable as it stands.
     Config,
+    /// The Spotify player cannot take the command as things stand: no
+    /// player is open, several are open and none active, the account lacks
+    /// Premium, or Spotify refused the control; the message says which.
+    Player,
     /// Anything else: I/O, parsing, a failed write.
     Other,
 }
@@ -132,6 +137,8 @@ fn carried_kind(err: &anyhow::Error) -> Option<Kind> {
             return Some(Kind::Incomplete);
         } else if e.is::<DecisionsRefused>() {
             return Some(Kind::Input);
+        } else if e.is::<PlayerRefused>() {
+            return Some(Kind::Player);
         } else if let Some(stopped) = e.downcast_ref::<ExportStopped>() {
             // Its own place in the chain stands for the outermost error of
             // `source`, which the chain therefore never yields.
@@ -190,6 +197,7 @@ mod tests {
                 "incomplete",
                 "input",
                 "config",
+                "player",
                 "other"
             ]
         );
@@ -259,6 +267,20 @@ mod tests {
             "answering: 1 problem with the decisions; nothing was recorded: \
              decision 1 has no \"item\" string"
         );
+    }
+
+    #[test]
+    fn a_player_refusal_is_player_through_contexts() {
+        let err = anyhow::Error::new(PlayerRefused {
+            what: "PUT me/player/play".into(),
+            status: 403,
+            reason: "PREMIUM_REQUIRED".into(),
+            message: "Premium required".into(),
+            devices: Vec::new(),
+        })
+        .context("playing");
+        assert_eq!(kind(&err), Kind::Player);
+        assert_eq!(serde_json::to_string(&Kind::Player).unwrap(), "\"player\"");
     }
 
     #[test]

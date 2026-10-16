@@ -1,6 +1,7 @@
 //! Spotify ids: a URI (`spotify:track:<id>`), an open.spotify.com address
-//! or a bare id parsed into a typed id, and the agreement between a Pandora
-//! id's prefix and the Spotify type it may be matched to.
+//! or a bare id parsed into a typed id or a playback target, and the
+//! agreement between a Pandora id's prefix and the Spotify type it may be
+//! matched to.
 
 use std::fmt;
 
@@ -117,11 +118,12 @@ fn is_base62_id(id: &str) -> bool {
 const FORMS: &str = "give a Spotify URI (spotify:track:<id>), an https://open.spotify.com/track/<id> \
                      address or a bare 22-character id";
 
-/// Parses `text` as a URI, an open.spotify.com address (an `intl-xx` path
-/// segment and any query allowed) or a bare id. A bare id has no kind.
-pub fn parse(text: &str) -> Result<(Option<IdKind>, String)> {
+/// Splits `text`, a URI, an open.spotify.com address (an `intl-xx` path
+/// segment and any query allowed) or a bare id, into its type segment
+/// (none for a bare id) and its base-62 id.
+fn split(text: &str) -> Result<(Option<String>, String)> {
     let text = text.trim();
-    let (kind, id) = if let Some(rest) = text.strip_prefix("spotify:") {
+    let (segment, id) = if let Some(rest) = text.strip_prefix("spotify:") {
         let Some((kind, id)) = rest.split_once(':') else {
             fail!(Kind::Input, "{text:?} is not a Spotify URI; {FORMS}");
         };
@@ -154,7 +156,19 @@ pub fn parse(text: &str) -> Result<(Option<IdKind>, String)> {
     } else {
         (None, text.to_owned())
     };
-    let kind = match kind {
+    if !is_base62_id(&id) {
+        fail!(Kind::Input, "{text:?} does not carry a Spotify id; {FORMS}");
+    }
+    Ok((segment, id))
+}
+
+/// Parses `text` as a URI, an open.spotify.com address (an `intl-xx` path
+/// segment and any query allowed) or a bare id of a track, artist or
+/// album. A bare id has no kind.
+pub fn parse(text: &str) -> Result<(Option<IdKind>, String)> {
+    let (segment, id) = split(text)?;
+    let text = text.trim();
+    let kind = match segment {
         None => None,
         Some(segment) => match IdKind::from_segment(&segment) {
             Some(k) => Some(k),
@@ -164,10 +178,79 @@ pub fn parse(text: &str) -> Result<(Option<IdKind>, String)> {
             ),
         },
     };
-    if !is_base62_id(&id) {
-        fail!(Kind::Input, "{text:?} does not carry a Spotify id; {FORMS}");
-    }
     Ok((kind, id))
+}
+
+/// The kinds of Spotify context playback can start: the type segment of
+/// their URIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKind {
+    Album,
+    Artist,
+    Playlist,
+}
+
+impl ContextKind {
+    /// `album`, `artist`, `playlist`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextKind::Album => "album",
+            ContextKind::Artist => "artist",
+            ContextKind::Playlist => "playlist",
+        }
+    }
+
+    /// `spotify:<kind>:<id>`.
+    pub fn uri(self, id: &str) -> String {
+        format!("spotify:{self}:{id}")
+    }
+}
+
+impl fmt::Display for ContextKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Something to play or queue: a track, or a context playback starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Track(String),
+    Context { kind: ContextKind, id: String },
+}
+
+impl Target {
+    /// `spotify:<segment>:<id>`.
+    pub fn uri(&self) -> String {
+        match self {
+            Target::Track(id) => format!("spotify:track:{id}"),
+            Target::Context { kind, id } => kind.uri(id),
+        }
+    }
+}
+
+/// Parses `text` (any form [`parse`] takes) as a track, album, artist or
+/// playlist; a bare id is a track.
+pub fn parse_target(text: &str) -> Result<Target> {
+    let (segment, id) = split(text)?;
+    let context = |kind| {
+        Ok(Target::Context {
+            kind,
+            id: id.clone(),
+        })
+    };
+    match segment.as_deref() {
+        None | Some("track") => Ok(Target::Track(id)),
+        Some("album") => context(ContextKind::Album),
+        Some("artist") => context(ContextKind::Artist),
+        Some("playlist") => context(ContextKind::Playlist),
+        Some(other) => fail!(
+            Kind::Input,
+            "{:?} names a Spotify {other}; only tracks, albums, artists and playlists can be \
+             played",
+            text.trim()
+        ),
+    }
 }
 
 /// Parses `text` (as [`parse`]) as the Spotify counterpart of `pandora_id`:
@@ -261,6 +344,71 @@ mod tests {
         for not_an_item in ["ST:1", "TR:", "tr:1", "TR1"] {
             let err = parse_for(not_an_item, ID).unwrap_err();
             assert_eq!(crate::error::kind(&err), Kind::Input, "{not_an_item}");
+        }
+    }
+
+    #[test]
+    fn targets_parse_from_every_form() {
+        for text in [
+            format!("spotify:track:{ID}"),
+            format!("https://open.spotify.com/track/{ID}?si=abc"),
+            format!(" {ID} "),
+        ] {
+            let target = parse_target(&text).unwrap();
+            assert_eq!(target, Target::Track(ID.into()), "{text}");
+            assert_eq!(target.uri(), format!("spotify:track:{ID}"));
+        }
+        for (text, kind) in [
+            (
+                format!("https://open.spotify.com/playlist/{ID}"),
+                ContextKind::Playlist,
+            ),
+            (format!("spotify:playlist:{ID}"), ContextKind::Playlist),
+            (
+                format!("https://open.spotify.com/intl-de/album/{ID}"),
+                ContextKind::Album,
+            ),
+            (format!("spotify:album:{ID}"), ContextKind::Album),
+            (
+                format!("https://open.spotify.com/artist/{ID}"),
+                ContextKind::Artist,
+            ),
+            (format!("spotify:artist:{ID}"), ContextKind::Artist),
+        ] {
+            let target = parse_target(&text).unwrap();
+            assert_eq!(
+                target,
+                Target::Context {
+                    kind,
+                    id: ID.into()
+                },
+                "{text}"
+            );
+            assert_eq!(target.uri(), format!("spotify:{kind}:{ID}"));
+        }
+    }
+
+    #[test]
+    fn targets_that_cannot_be_played_are_input() {
+        for (text, needle) in [
+            (
+                format!("spotify:show:{ID}"),
+                "names a Spotify show; only tracks",
+            ),
+            (
+                format!("https://open.spotify.com/episode/{ID}"),
+                "names a Spotify episode",
+            ),
+            (format!("spotify:user:{ID}"), "names a Spotify user"),
+            ("spotify:track:x".to_owned(), "does not carry a Spotify id"),
+            (
+                format!("https://example.com/track/{ID}"),
+                "open.spotify.com",
+            ),
+        ] {
+            let err = parse_target(&text).unwrap_err();
+            assert_eq!(crate::error::kind(&err), Kind::Input, "{text}");
+            assert!(format!("{err:#}").contains(needle), "{text}: {err:#}");
         }
     }
 

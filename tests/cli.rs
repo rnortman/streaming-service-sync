@@ -1515,7 +1515,7 @@ fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
         .code(0);
     std::fs::write(
         Path::new(repo).join("config.toml"),
-        "[spotify]\nclient_id = \"test-client-id\"\n",
+        "[spotify]\nclient_id = \"test-client-id\"\n[push]\nliked_songs = false\n",
     )
     .expect("write config");
 
@@ -1776,4 +1776,319 @@ fn guide_prints_with_no_data_repository() {
         std::fs::read(docs.join("matching-protocol.md")).expect("protocol")
     );
     assert!(!tmp.path().join("nowhere").exists());
+}
+
+/// The documentation's public example tracks.
+const TRACK_A: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
+const TRACK_B: &str = "spotify:track:1301WleyT98MSxVHPZCA6M";
+
+/// Every scope a playback command needs.
+const PLAYBACK_SCOPES: &[&str] = &["user-read-playback-state", "user-modify-playback-state"];
+
+/// An initialized repository under `tmp` with a client id and profile
+/// alice's Spotify token granted `scopes`; returns the repository path.
+fn repo_with_spotify_token(tmp: &Path, scopes: &[&str]) -> String {
+    let repo = tmp.join("data");
+    let repo = repo.to_str().expect("utf-8 path").to_owned();
+    sss(tmp).args(["--repo", &repo, "init"]).assert().code(0);
+    std::fs::write(
+        Path::new(&repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+    let state_dir = tmp.join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z", "scopes": scopes}})
+        .to_string(),
+    )
+    .expect("write token");
+    repo
+}
+
+/// Runs `sss --repo repo --profile alice <args> --json` against the mock
+/// Spotify API at `server`: its exit code and its JSON document.
+fn spotify_json(
+    tmp: &Path,
+    server: &httpmock::MockServer,
+    repo: &str,
+    args: &[&str],
+) -> (i32, serde_json::Value) {
+    let out = sss(tmp)
+        .env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+        .args(["--repo", repo, "--profile", "alice"])
+        .args(args)
+        .arg("--json")
+        .output()
+        .expect("sss runs");
+    (
+        out.status.code().expect("exit code"),
+        json_document(&out.stdout),
+    )
+}
+
+/// `GET me/player/devices` answers with Firefox, open and inactive.
+fn one_inactive_firefox(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/player/devices");
+        then.status(200).json_body(serde_json::json!({"devices": [
+            {"id": "dev-firefox", "name": "Firefox", "type": "Computer",
+             "is_active": false, "is_restricted": false, "volume_percent": 100}]}));
+    })
+}
+
+/// `GET me/player` answers Firefox playing `TRACK_A`.
+fn playing_on_firefox(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/me/player");
+        then.status(200).json_body(serde_json::json!({
+            "device": {"id": "dev-firefox", "name": "Firefox", "type": "Computer",
+                       "is_active": true, "is_restricted": false, "volume_percent": 100},
+            "is_playing": true, "progress_ms": 1000, "shuffle_state": false,
+            "repeat_state": "off", "context": null,
+            "item": {"type": "track", "uri": TRACK_A, "name": "Song",
+                     "artists": [{"name": "Artist"}], "duration_ms": 215000}}));
+    })
+}
+
+#[test]
+fn play_sends_the_tracks_to_the_only_open_player_and_reports_the_state() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYBACK_SCOPES);
+    let devices = one_inactive_firefox(&server);
+    let play = server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path("/v1/me/player/play")
+            .query_param("device_id", "dev-firefox")
+            .header("authorization", "Bearer access-secret")
+            .json_body(serde_json::json!({"uris": [TRACK_A]}));
+        then.status(204);
+    });
+    let state = playing_on_firefox(&server);
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["play", TRACK_A]);
+    assert_eq!(code, 0, "{doc}");
+    devices.assert_calls(1);
+    play.assert_calls(1);
+    state.assert_calls(1);
+    assert_eq!(doc["command"], "play");
+    assert_eq!(doc["device"]["name"], "Firefox");
+    assert_eq!(doc["state"]["is_playing"], true);
+    assert_eq!(doc["state"]["device"]["name"], "Firefox");
+    assert_eq!(doc["state"]["item"]["id"], TRACK_A);
+    assert_eq!(doc["hint"], serde_json::Value::Null);
+}
+
+#[test]
+fn playback_without_the_playback_scopes_is_kind_auth_before_any_request() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), &["user-library-modify"]);
+    let any = server.mock(|_, then| {
+        then.status(500);
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["play", TRACK_A]);
+    assert_eq!(code, 1);
+    any.assert_calls(0);
+    assert_eq!(doc["kind"], "auth");
+    let error = doc["error"].as_str().expect("error");
+    assert!(error.contains("user-modify-playback-state"), "{error}");
+    assert!(
+        error.contains("sss spotify auth --profile alice"),
+        "{error}"
+    );
+}
+
+#[test]
+fn play_with_no_player_open_is_kind_player() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYBACK_SCOPES);
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/player/devices");
+        then.status(200)
+            .json_body(serde_json::json!({"devices": []}));
+    });
+    let play = server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path("/v1/me/player/play");
+        then.status(204);
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["play"]);
+    assert_eq!(code, 1);
+    play.assert_calls(0);
+    assert_eq!(doc["kind"], "player");
+    assert_eq!(
+        doc["details"],
+        serde_json::json!({"reason": "NO_ACTIVE_DEVICE", "devices": []})
+    );
+}
+
+#[test]
+fn a_queue_stopped_partway_names_what_landed() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYBACK_SCOPES);
+    one_inactive_firefox(&server);
+    let first = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/me/player/queue")
+            .query_param("uri", TRACK_A);
+        then.status(200).body("snapshot1");
+    });
+    let second = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/me/player/queue")
+            .query_param("uri", TRACK_B);
+        then.status(503);
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["queue", TRACK_A, TRACK_B]);
+    assert_eq!(code, 1);
+    first.assert_calls(1);
+    second.assert_calls(1);
+    assert_eq!(doc["kind"], "unavailable");
+    let error = doc["error"].as_str().expect("error");
+    assert!(
+        error.starts_with(&format!("queued 1 of 2 ({TRACK_A}), then:")),
+        "{error}"
+    );
+}
+
+#[test]
+fn search_sends_one_request_per_query() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Search needs no playback scope.
+    let repo = repo_with_spotify_token(tmp.path(), &[]);
+    let found = |q: &'static str, uri: &'static str| {
+        server.mock(move |when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/search")
+                .query_param("q", q)
+                .query_param("type", "track")
+                .query_param("limit", "10");
+            then.status(200)
+                .json_body(serde_json::json!({"tracks": {"items": [
+                {"uri": uri, "name": q, "artists": [{"name": "Artist"}]}]}}));
+        })
+    };
+    let x = found("x", TRACK_A);
+    let y = found("y", TRACK_B);
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["search", "x", "y", "--only", "tracks"],
+    );
+    assert_eq!(code, 0, "{doc}");
+    x.assert_calls(1);
+    y.assert_calls(1);
+    assert_eq!(doc["command"], "search");
+    let results = doc["results"].as_array().expect("results");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["query"], "x");
+    assert_eq!(results[0]["tracks"][0]["id"], TRACK_A);
+    assert_eq!(results[1]["tracks"][0]["id"], TRACK_B);
+    assert_eq!(results[1]["artists"], serde_json::json!([]));
+}
+
+/// The push fixture's export (station ST:1, "Station") and a ledger that
+/// records its playlist `pl1`.
+fn station_with_playlist(repo: &str) {
+    write_export(repo, &[("TR:1", "First", true)]);
+    let spotify = Path::new(repo).join("profiles/alice/spotify");
+    std::fs::create_dir_all(&spotify).expect("spotify dir");
+    std::fs::write(
+        spotify.join("state.json"),
+        serde_json::json!({"playlists": {"ST:1": {"status": "created", "spotify_id": "pl1"}}})
+            .to_string(),
+    )
+    .expect("write ledger");
+}
+
+/// A `PUT me/player/play` mock that answers 204 and keeps the body it got.
+fn recording_play(
+    server: &httpmock::MockServer,
+) -> (
+    httpmock::Mock<'_>,
+    std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+) {
+    let body = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = body.clone();
+    let mock = server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path("/v1/me/player/play")
+            .is_true(move |req| {
+                *seen.lock().expect("lock") = serde_json::from_slice(req.body_ref()).ok();
+                true
+            });
+        then.status(204);
+    });
+    (mock, body)
+}
+
+#[test]
+fn play_station_plays_its_pushed_playlist() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYBACK_SCOPES);
+    station_with_playlist(&repo);
+    one_inactive_firefox(&server);
+    playing_on_firefox(&server);
+    let (play, body) = recording_play(&server);
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["play", "--station", "station"],
+    );
+    assert_eq!(code, 0, "{doc}");
+    play.assert_calls(1);
+    assert_eq!(
+        body.lock().expect("lock").take(),
+        Some(serde_json::json!({"context_uri": "spotify:playlist:pl1"}))
+    );
+}
+
+#[test]
+fn play_station_shuffled_starts_at_a_random_track() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), PLAYBACK_SCOPES);
+    station_with_playlist(&repo);
+    one_inactive_firefox(&server);
+    playing_on_firefox(&server);
+    let count = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/playlists/pl1/items")
+            .query_param("fields", "total")
+            .query_param("limit", "1");
+        then.status(200).json_body(serde_json::json!({"total": 40}));
+    });
+    let shuffle = server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path("/v1/me/player/shuffle")
+            .query_param("state", "true");
+        then.status(200).body("snapshot1");
+    });
+    let (play, body) = recording_play(&server);
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["play", "--station", "Station", "--shuffle"],
+    );
+    assert_eq!(code, 0, "{doc}");
+    count.assert_calls(1);
+    shuffle.assert_calls(1);
+    play.assert_calls(1);
+    let body = body.lock().expect("lock").take().expect("play body");
+    assert_eq!(body["context_uri"], "spotify:playlist:pl1");
+    let position = body["offset"]["position"].as_u64().expect("position");
+    assert!(position < 40, "{body}");
 }

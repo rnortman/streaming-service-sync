@@ -1,8 +1,9 @@
 //! The Spotify Web API client: a bearer token kept fresh through the token
 //! endpoint and saved before any request uses it, paced requests, retries
 //! on 429, 5xx and transport failures, a quota stop, failures classified
-//! into kinds, and the six requests matching and push use, each parsed into
-//! a lenient type of its own.
+//! into kinds, and the six requests matching, push and `sss search` use,
+//! each parsed into a lenient type of its own. The player endpoints are in
+//! [`super::playback`].
 
 use std::fmt;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use crate::http::{self, Pacer, Reply};
 use crate::secrets::StateDir;
 use crate::spotify::auth::{self, SETUP_DOC, Token};
 use crate::spotify::ids::IdKind;
+use crate::spotify::playback::PlayerRefused;
 
 /// The live Web API base.
 pub const DEFAULT_API_BASE_URL: &str = "https://api.spotify.com/v1";
@@ -39,7 +41,8 @@ pub const MAX_RETRY_AFTER_S: u64 = 60;
 /// before the next request.
 pub const REFRESH_MARGIN_S: i64 = 60;
 
-/// Results asked of one search.
+/// Results asked of one search by matching, and the most `sss search`
+/// may ask: the development-mode API refuses a larger `limit`.
 pub const SEARCH_LIMIT: u32 = 10;
 
 /// URIs per `me/library` request.
@@ -58,15 +61,19 @@ pub struct Timing {
     pub first_backoff: Duration,
     /// How long one second of `Retry-After` is.
     pub retry_after_unit: Duration,
+    /// Wait after a player command before reading the player's state, which
+    /// can still be the old one right after the write.
+    pub settle: Duration,
 }
 
 impl Timing {
     /// At most 2 requests/s; outage backoff 1 s, 2 s, 4 s, 8 s;
-    /// `Retry-After` taken at its word.
+    /// `Retry-After` taken at its word; 1 s for the player to settle.
     pub const LIVE: Timing = Timing {
         min_interval: Duration::from_millis(500),
         first_backoff: Duration::from_secs(1),
         retry_after_unit: Duration::from_secs(1),
+        settle: Duration::from_secs(1),
     };
 }
 
@@ -178,8 +185,9 @@ struct WireExternalIds {
     isrc: Option<String>,
 }
 
+/// A track as search, the player and the queue send it.
 #[derive(Deserialize)]
-struct WireTrack {
+pub(super) struct WireTrack {
     uri: String,
     name: String,
     #[serde(default)]
@@ -188,6 +196,23 @@ struct WireTrack {
     duration_ms: Option<u64>,
     explicit: Option<bool>,
     external_ids: Option<WireExternalIds>,
+}
+
+impl From<WireTrack> for FoundTrack {
+    fn from(t: WireTrack) -> Self {
+        let album = t.album;
+        FoundTrack {
+            uri: t.uri,
+            name: t.name,
+            artists: names(t.artists),
+            album_type: album.as_ref().and_then(|a| a.album_type.clone()),
+            release_date: album.as_ref().and_then(|a| a.release_date.clone()),
+            album: album.and_then(|a| a.name),
+            duration_ms: t.duration_ms,
+            explicit: t.explicit,
+            isrc: t.external_ids.and_then(|e| e.isrc),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -286,6 +311,27 @@ fn mentions_quota(body: &str) -> bool {
     })
 }
 
+/// The refusal a player endpoint answered with: Spotify's player error
+/// object carries `error.reason`; the plain error object does not, and
+/// gives `None`.
+fn player_refusal(what: &str, status: u16, body: &str) -> Option<PlayerRefused> {
+    let v = serde_json::from_str::<Value>(body).ok()?;
+    let text = |k: &str| {
+        v.pointer(&format!("/error/{k}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    Some(PlayerRefused {
+        what: what.to_owned(),
+        status,
+        reason: text("reason")?,
+        message: text("message").unwrap_or_default(),
+        devices: Vec::new(),
+    })
+}
+
 /// The outage retries of one request — no response, a 5xx, or a token
 /// renewal that got no answer — over [`MAX_TRIES`] with doubling backoff.
 struct Outages {
@@ -313,26 +359,37 @@ impl Outages {
 }
 
 /// A request to send.
-struct Call<'a> {
-    method: &'a str,
-    path: &'a str,
-    query: &'a [(&'a str, &'a str)],
-    body: Option<&'a Value>,
+pub(super) struct Call<'a> {
+    pub(super) method: &'a str,
+    pub(super) path: &'a str,
+    pub(super) query: &'a [(&'a str, &'a str)],
+    pub(super) body: Option<&'a Value>,
+    /// A player endpoint: a 403 or other 4xx whose body carries
+    /// `error.reason` is a [`PlayerRefused`].
+    pub(super) player: bool,
 }
 
 impl Call<'_> {
     /// Whether the request may be resent after no response or a 5xx.
-    /// A `POST` (a playlist create or an items add) is not: Spotify may
-    /// have applied it, and a second one would make a second playlist or
-    /// add the items twice.
+    /// A `POST` (a playlist create, an items add, a skip or a queue add)
+    /// is not: Spotify may have applied it, and a second one would make a
+    /// second playlist, add the items twice, skip twice or queue twice.
     fn resendable(&self) -> bool {
         self.method != "POST"
     }
-}
 
-/// The end of the message for a request that got no answer and is not
-/// resent.
-const NOT_RESENT: &str = "not resent, since Spotify may have applied it; re-run";
+    /// The end of the message for a request that got no answer, or a 5xx,
+    /// and is not resent. A player command cannot be undone, so its
+    /// message says to check before running it again.
+    fn not_resent(&self) -> &'static str {
+        if self.player {
+            "not resent, since Spotify may have applied it; run `sss player` to see whether it \
+             did before running the command again"
+        } else {
+            "not resent, since Spotify may have applied it; re-run"
+        }
+    }
+}
 
 /// A paced Spotify Web API client for one profile.
 pub struct Spotify {
@@ -346,9 +403,10 @@ pub struct Spotify {
     timing: Timing,
     pacer: Pacer,
     requests: u32,
+    settles: u32,
     /// Receives each warning line; [`http::print_warning`] writes it to
     /// stderr.
-    warn: fn(&str),
+    pub(crate) warn: fn(&str),
 }
 
 impl Spotify {
@@ -381,6 +439,7 @@ impl Spotify {
             timing,
             pacer: Pacer::new(timing.min_interval),
             requests: 0,
+            settles: 0,
             warn: http::print_warning,
         })
     }
@@ -402,11 +461,53 @@ impl Spotify {
         self.requests
     }
 
-    /// `GET search`: up to [`SEARCH_LIMIT`] results of `kind` for `q`.
-    pub fn search(&mut self, q: &str, kind: IdKind) -> Result<SearchResults> {
-        let limit = SEARCH_LIMIT.to_string();
+    /// Waits `Timing::settle`, so that a state read after a player command
+    /// sees the command's effect.
+    pub fn settle(&mut self) {
+        self.settles += 1;
+        std::thread::sleep(self.timing.settle);
+    }
+
+    /// Writes `line` where the client's own warnings go.
+    pub fn warning(&self, line: &str) {
+        (self.warn)(line);
+    }
+
+    /// How many times [`Spotify::settle`] has waited.
+    pub fn settles(&self) -> u32 {
+        self.settles
+    }
+
+    /// The `auth` failure unless the stored token was granted every scope
+    /// in `scopes`; `profile` names the sign-in to run.
+    pub fn require_scopes(&self, profile: &str, scopes: &[&str]) -> Result<()> {
+        let missing: Vec<&str> = scopes
+            .iter()
+            .copied()
+            .filter(|s| !self.token.scopes.iter().any(|g| g == s))
+            .collect();
+        if !missing.is_empty() {
+            fail!(
+                Kind::Auth,
+                "the Spotify token for profile {profile} was granted without {}; run \
+                 `sss spotify auth --profile {profile}` to sign in again with the playback scopes",
+                missing.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// `GET search`: up to `limit` results of each of `kinds` for `q`, in
+    /// one request.
+    pub fn search(&mut self, q: &str, kinds: &[IdKind], limit: u32) -> Result<SearchResults> {
+        let limit = limit.to_string();
+        let types = kinds
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let market = self.market.clone();
-        let mut query = vec![("q", q), ("type", kind.as_str()), ("limit", &limit)];
+        let mut query = vec![("q", q), ("type", types.as_str()), ("limit", &limit)];
         // With no `market`, Spotify uses the country of the user's token.
         if !market.is_empty() {
             query.push(("market", &market));
@@ -416,24 +517,12 @@ impl Spotify {
             path: "search",
             query: &query,
             body: None,
+            player: false,
         })?;
         Ok(SearchResults {
             tracks: parsed_items::<WireTrack>(wire.tracks)
                 .into_iter()
-                .map(|t| {
-                    let album = t.album;
-                    FoundTrack {
-                        uri: t.uri,
-                        name: t.name,
-                        artists: names(t.artists),
-                        album_type: album.as_ref().and_then(|a| a.album_type.clone()),
-                        release_date: album.as_ref().and_then(|a| a.release_date.clone()),
-                        album: album.and_then(|a| a.name),
-                        duration_ms: t.duration_ms,
-                        explicit: t.explicit,
-                        isrc: t.external_ids.and_then(|e| e.isrc),
-                    }
-                })
+                .map(FoundTrack::from)
                 .collect(),
             artists: parsed_items::<WireArtist>(wire.artists)
                 .into_iter()
@@ -468,6 +557,7 @@ impl Spotify {
             path: "me/playlists",
             query: &[],
             body: Some(&body),
+            player: false,
         })?;
         Ok(CreatedPlaylist {
             id: wire.id,
@@ -493,6 +583,7 @@ impl Spotify {
                     ("offset", &offset),
                 ],
                 body: None,
+                player: false,
             })?;
             let got = page.items.len();
             uris.extend(
@@ -523,6 +614,7 @@ impl Spotify {
                 path: &path,
                 query: &[],
                 body: Some(&body),
+                player: false,
             })?;
             added(chunk, wire.snapshot_id.as_deref())?;
         }
@@ -545,6 +637,7 @@ impl Spotify {
                 path: "me/library",
                 query: &[("uris", &joined)],
                 body: Some(&body),
+                player: false,
             })?;
             saved(chunk)?;
         }
@@ -562,6 +655,7 @@ impl Spotify {
                 path: "me/library/contains",
                 query: &[("uris", &joined)],
                 body: None,
+                player: false,
             })?;
             if answer.len() != chunk.len() {
                 return Err(anyhow!(
@@ -576,14 +670,26 @@ impl Spotify {
     }
 
     /// Sends `call` and parses the 2xx body as `T`.
-    fn json<T: DeserializeOwned>(&mut self, call: &Call<'_>) -> Result<T> {
+    pub(super) fn json<T: DeserializeOwned>(&mut self, call: &Call<'_>) -> Result<T> {
         let body = self.call(call)?;
         serde_json::from_str(&body)
             .with_context(|| format!("{} {}: parsing the response", call.method, call.path))
     }
 
+    /// Sends `call`: `None` when the 2xx body is empty (a 204, or a 200
+    /// with no body), else the body parsed as `T`.
+    pub(super) fn json_opt<T: DeserializeOwned>(&mut self, call: &Call<'_>) -> Result<Option<T>> {
+        let body = self.call(call)?;
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&body)
+            .map(Some)
+            .with_context(|| format!("{} {}: parsing the response", call.method, call.path))
+    }
+
     /// Sends `call` with the retry policy and returns the 2xx body.
-    fn call(&mut self, call: &Call<'_>) -> Result<String> {
+    pub(super) fn call(&mut self, call: &Call<'_>) -> Result<String> {
         let what = format!("{} {}", call.method, call.path);
         let mut renewed_after_401 = false;
         let mut renew_now = false;
@@ -613,7 +719,7 @@ impl Spotify {
                 Err(e) => {
                     if !call.resendable() {
                         return Err(e).with_kind(Kind::Unavailable, || {
-                            format!("{what}: no response; {NOT_RESENT}")
+                            format!("{what}: no response; {}", call.not_resent())
                         });
                     }
                     if outages.retry(self.warn, &what, &format!("no response ({e:#})")) {
@@ -637,13 +743,20 @@ impl Spotify {
                     "{what}: Spotify refused the access token ({}); run `sss spotify auth`",
                     describe(status, &answer.body)
                 ),
-                403 => fail!(
-                    Kind::Config,
-                    "{what}: Spotify refused access ({}): the member may not be on the app's \
-                     user allowlist, a scope may be missing, or the app owner's Premium may \
-                     have lapsed (see {SETUP_DOC})",
-                    describe(status, &answer.body)
-                ),
+                403 => {
+                    if call.player
+                        && let Some(refused) = player_refusal(&what, status, &answer.body)
+                    {
+                        return Err(anyhow::Error::new(refused));
+                    }
+                    fail!(
+                        Kind::Config,
+                        "{what}: Spotify refused access ({}): the member may not be on the app's \
+                         user allowlist, a scope may be missing, or the app owner's Premium may \
+                         have lapsed (see {SETUP_DOC})",
+                        describe(status, &answer.body)
+                    )
+                }
                 429 => {
                     rate_tries += 1;
                     let wait = answer
@@ -675,7 +788,7 @@ impl Spotify {
                 500..=599 => {
                     let detail = describe(status, &answer.body);
                     if !call.resendable() {
-                        fail!(Kind::Unavailable, "{what}: {detail}; {NOT_RESENT}");
+                        fail!(Kind::Unavailable, "{what}: {detail}; {}", call.not_resent());
                     }
                     if !outages.retry(self.warn, &what, &detail) {
                         fail!(
@@ -685,6 +798,11 @@ impl Spotify {
                     }
                 }
                 _ => {
+                    if call.player
+                        && let Some(refused) = player_refusal(&what, status, &answer.body)
+                    {
+                        return Err(anyhow::Error::new(refused));
+                    }
                     return Err(anyhow::Error::new(ApiError {
                         status,
                         detail: format!("{what}: {}", describe(status, &answer.body)),
@@ -733,11 +851,14 @@ impl Spotify {
         for (k, v) in call.query {
             request = request.query(k, v);
         }
+        // A bodyless write still carries `Content-Length: 0`, which some
+        // front ends require of a `PUT` or `POST`.
         let result = match call.body {
             Some(body) => request
                 .set("Content-Type", "application/json")
                 .send_string(&body.to_string()),
-            None => request.call(),
+            None if call.method == "GET" => request.call(),
+            None => request.send_bytes(&[]),
         };
         http::read(result)
     }
@@ -746,23 +867,12 @@ impl Spotify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spotify::test_support::{FAST, in_seconds, state_with};
     use httpmock::prelude::*;
     use std::path::Path;
     use std::time::Instant;
 
-    const FAST: Timing = Timing {
-        min_interval: Duration::ZERO,
-        first_backoff: Duration::from_millis(1),
-        retry_after_unit: Duration::from_millis(1),
-    };
-
     fn quiet(_: &str) {}
-
-    fn in_seconds(s: i64) -> String {
-        (OffsetDateTime::now_utc() + time::Duration::seconds(s))
-            .format(&Rfc3339)
-            .unwrap()
-    }
 
     fn token(access: &str, expires_in: i64) -> Token {
         Token {
@@ -771,12 +881,6 @@ mod tests {
             expires_at: in_seconds(expires_in),
             scopes: vec!["user-library-read".into()],
         }
-    }
-
-    fn state_with(tmp: &Path, token: &Token) -> StateDir {
-        let state = StateDir::under(tmp, "alice").unwrap();
-        state.save_spotify_token(token).unwrap();
-        state
     }
 
     fn client(state: StateDir, server: &MockServer, timing: Timing) -> Spotify {
@@ -855,7 +959,9 @@ mod tests {
             ]}, "unknown": 1}));
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let found = c.search("isrc:USRC17607839", IdKind::Track).unwrap();
+        let found = c
+            .search("isrc:USRC17607839", &[IdKind::Track], SEARCH_LIMIT)
+            .unwrap();
         mock.assert();
         assert_eq!(
             found.tracks,
@@ -911,14 +1017,18 @@ mod tests {
         let mut c = fresh_client(tmp.path(), &server);
         c.market = "US".into();
         assert_eq!(
-            c.search("Band", IdKind::Artist).unwrap().artists,
+            c.search("Band", &[IdKind::Artist], SEARCH_LIMIT)
+                .unwrap()
+                .artists,
             [FoundArtist {
                 uri: "spotify:artist:a".into(),
                 name: "Band".into()
             }]
         );
         assert_eq!(
-            c.search("LP Band", IdKind::Album).unwrap().albums,
+            c.search("LP Band", &[IdKind::Album], SEARCH_LIMIT)
+                .unwrap()
+                .albums,
             [FoundAlbum {
                 uri: "spotify:album:b".into(),
                 name: "LP".into(),
@@ -945,7 +1055,7 @@ mod tests {
         );
         let start = Instant::now();
         for _ in 0..3 {
-            c.search("x", IdKind::Track).unwrap();
+            c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         }
         assert!(start.elapsed() >= Duration::from_millis(120));
     }
@@ -973,7 +1083,7 @@ mod tests {
             then.status(200).json_body(json!({}));
         });
         let mut c = client(state.clone(), &server, FAST);
-        c.search("x", IdKind::Track).unwrap();
+        c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         renew.assert();
         api.assert();
         let stored = state.load_spotify_token().unwrap().unwrap().token;
@@ -999,7 +1109,7 @@ mod tests {
                 &server,
                 FAST,
             );
-            c.search("x", IdKind::Track).unwrap();
+            c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
             renew.assert_calls(usize::from(renewed));
         }
     }
@@ -1015,7 +1125,7 @@ mod tests {
         });
         let api = search_ok(&server);
         let mut c = client(state_with(tmp.path(), &token("old", -1)), &server, FAST);
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Auth);
         api.assert_calls(0);
     }
@@ -1038,7 +1148,7 @@ mod tests {
         let state = state_with(tmp.path(), &token("old", -1));
         let mut first = client(state.clone(), &server, FAST);
         let mut second = client(state.clone(), &server, FAST);
-        first.search("x", IdKind::Track).unwrap();
+        first.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         rotate.assert_calls(1);
         rotate.delete();
         // The refresh token both started with is spent now.
@@ -1047,7 +1157,7 @@ mod tests {
             then.status(400)
                 .json_body(json!({"error": "invalid_grant"}));
         });
-        second.search("x", IdKind::Track).unwrap();
+        second.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         refused.assert_calls(0);
         api.assert_calls(2);
         let stored = state.load_spotify_token().unwrap().unwrap().token;
@@ -1073,7 +1183,7 @@ mod tests {
         let api = search_ok(&server);
         let state = state_with(tmp.path(), &token("old", -1));
         let mut c = client(state.clone(), &server, FAST);
-        c.search("x", IdKind::Track).unwrap();
+        c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         busy_once.assert_calls(1);
         renew.assert_calls(1);
         api.assert_calls(1);
@@ -1088,7 +1198,7 @@ mod tests {
         let api = search_ok(&server);
         let tmp = tempfile::tempdir().unwrap();
         let mut c = client(state_with(tmp.path(), &token("old", -1)), &server, FAST);
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Unavailable);
         assert!(
             format!("{err:#}").starts_with("GET search: no token renewal after 5 tries: "),
@@ -1111,7 +1221,7 @@ mod tests {
         let mut c = client(state.clone(), &server, FAST);
         std::fs::remove_file(state.spotify_token_path()).unwrap();
         std::fs::create_dir_all(state.spotify_token_path().join("x")).unwrap();
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Other);
         assert!(format!("{err:#}").contains("spotify-token.json"), "{err:#}");
         api.assert_calls(0);
@@ -1140,7 +1250,7 @@ mod tests {
             );
         });
         let mut c = fresh_client(tmp.path(), &server);
-        c.search("x", IdKind::Track).unwrap();
+        c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         refused.assert_calls(1);
         renew.assert_calls(1);
         ok.assert_calls(1);
@@ -1157,7 +1267,7 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Auth);
         assert_eq!(
             format!("{err:#}"),
@@ -1176,7 +1286,7 @@ mod tests {
             then.status(429).header("Retry-After", "1");
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.search("a", IdKind::Track).unwrap_err();
+        let err = c.search("a", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         limited.assert_calls(MAX_TRIES as usize);
         assert_eq!(crate::error::kind(&err), Kind::Quota);
 
@@ -1193,7 +1303,7 @@ mod tests {
             when.method(GET).path("/v1/search").query_param("q", "b");
             then.status(200).json_body(json!({}));
         });
-        c.search("b", IdKind::Track).unwrap();
+        c.search("b", &[IdKind::Track], SEARCH_LIMIT).unwrap();
         first.assert_calls(1);
         ok.assert();
     }
@@ -1212,7 +1322,7 @@ mod tests {
                 .json_body(json!({"error": {"status": 429, "message": "Daily quota exceeded"}}));
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.search("a", IdKind::Track).unwrap_err();
+        let err = c.search("a", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Quota);
         assert_eq!(
             format!("{err:#}"),
@@ -1220,7 +1330,7 @@ mod tests {
              far is recorded — re-run later (Retry-After 3600 s)"
         );
         long.assert_calls(1);
-        let err = c.search("b", IdKind::Track).unwrap_err();
+        let err = c.search("b", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Quota);
         assert!(
             format!("{err:#}").contains("Daily quota exceeded"),
@@ -1238,7 +1348,7 @@ mod tests {
             then.status(503).body("<html>busy</html>");
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         mock.assert_calls(MAX_TRIES as usize);
         assert_eq!(crate::error::kind(&err), Kind::Unavailable);
         assert_eq!(
@@ -1250,7 +1360,7 @@ mod tests {
         let state = state_with(tmp.path(), &token("access-secret", 3600));
         let mut c = Spotify::new(state, "id", "", "http://127.0.0.1:1", "http://b", FAST).unwrap();
         c.warn = quiet;
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Unavailable);
         assert!(
             format!("{err:#}").starts_with("GET search: no response after 5 tries: "),
@@ -1304,7 +1414,7 @@ mod tests {
             format!("{err:#}"),
             "GET playlists/gone/items: HTTP 404: Resource not found"
         );
-        let err = c.search("x", IdKind::Track).unwrap_err();
+        let err = c.search("x", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
         assert_eq!(format!("{err:#}"), "GET search: HTTP 400: \"bad market\"");
         assert_eq!(http_status(&err), Some(400));
         assert_eq!(http_status(&anyhow!("plain")), None);
@@ -1517,6 +1627,111 @@ mod tests {
             format!("{err:#}").contains("1 answers for 2 URIs"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn require_scopes_names_what_the_token_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        let mut granted = token("access-secret", 3600);
+        granted.scopes.push("user-read-playback-state".into());
+        let c = client(state_with(tmp.path(), &granted), &server, FAST);
+        c.require_scopes("alice", &["user-read-playback-state"])
+            .unwrap();
+        c.require_scopes("alice", &[]).unwrap();
+        let err = c
+            .require_scopes(
+                "alice",
+                &["user-read-playback-state", "user-modify-playback-state"],
+            )
+            .unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Auth);
+        assert_eq!(
+            format!("{err:#}"),
+            "the Spotify token for profile alice was granted without \
+             user-modify-playback-state; run `sss spotify auth --profile alice` to sign in \
+             again with the playback scopes"
+        );
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Doc {
+        a: u32,
+    }
+
+    #[test]
+    fn json_opt_is_none_on_an_empty_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        for (path, status, body) in [("/v1/e204", 204, ""), ("/v1/e200", 200, " \n")] {
+            server.mock(|when, then| {
+                when.method(GET).path(path);
+                then.status(status).body(body);
+            });
+        }
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/doc");
+            then.status(200).json_body(json!({"a": 1}));
+        });
+        let mut c = fresh_client(tmp.path(), &server);
+        let get = |path| Call {
+            method: "GET",
+            path,
+            query: &[],
+            body: None,
+            player: false,
+        };
+        assert_eq!(c.json_opt::<Doc>(&get("e204")).unwrap(), None);
+        assert_eq!(c.json_opt::<Doc>(&get("e200")).unwrap(), None);
+        assert_eq!(c.json_opt::<Doc>(&get("doc")).unwrap(), Some(Doc { a: 1 }));
+    }
+
+    #[test]
+    fn a_search_of_several_kinds_is_one_request_with_its_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/search")
+                .query_param("type", "track,artist,album")
+                .query_param("limit", "3");
+            then.status(200).json_body(json!({
+                "tracks": {"items": [{"uri": "spotify:track:t", "name": "Song"}]},
+                "artists": {"items": [{"uri": "spotify:artist:a", "name": "Band"}]},
+                "albums": {"items": [{"uri": "spotify:album:b", "name": "LP"}]}
+            }));
+        });
+        let mut c = fresh_client(tmp.path(), &server);
+        let found = c.search("x", &IdKind::ALL, 3).unwrap();
+        mock.assert();
+        assert_eq!(
+            (found.tracks.len(), found.artists.len(), found.albums.len()),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_reason_on_a_refused_search_keeps_its_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/search").query_param("q", "a");
+            then.status(403).json_body(
+                json!({"error": {"status": 403, "message": "m", "reason": "PREMIUM_REQUIRED"}}),
+            );
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/search").query_param("q", "b");
+            then.status(404).json_body(
+                json!({"error": {"status": 404, "message": "m", "reason": "NO_ACTIVE_DEVICE"}}),
+            );
+        });
+        let mut c = fresh_client(tmp.path(), &server);
+        let err = c.search("a", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Config);
+        let err = c.search("b", &[IdKind::Track], SEARCH_LIMIT).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Other);
+        assert_eq!(http_status(&err), Some(404));
     }
 
     #[test]
