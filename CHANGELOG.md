@@ -6,6 +6,8 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
 Every profile should sign in to Spotify once more: `sss` now asks for the
 full set of permissions ("scopes") it can use for music, so no later
 feature needs another sign-in. Old tokens keep working for everything they
