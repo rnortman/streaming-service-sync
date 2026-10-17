@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::pandora::client::{self, endpoint};
-use crate::pandora::export::{self, MANIFEST_FILE};
+use crate::pandora::export;
 use crate::repo::{self, ProfilePaths};
+use crate::spotify::ids::item_id_type as id_type;
 
 /// One recording, the unit of matching. Filled from every source record
 /// that names it: feedback records, track seeds and catalog annotations.
@@ -351,14 +352,6 @@ fn annotations(body: &Value) -> Vec<(&str, &Value)> {
         .filter(|(k, v)| v.is_object() && id_type(k).is_some())
         .map(|(k, v)| (k.as_str(), v))
         .collect()
-}
-
-/// `TR` for `TR:123`: two uppercase letters, a colon and a non-empty
-/// rest.
-pub(crate) fn id_type(id: &str) -> Option<&str> {
-    let (kind, rest) = id.split_once(':')?;
-    (kind.len() == 2 && kind.bytes().all(|b| b.is_ascii_uppercase()) && !rest.is_empty())
-        .then_some(kind)
 }
 
 /// A station as the run assembles it.
@@ -781,7 +774,7 @@ pub fn normalize_run(dir: &Path) -> Result<Normalized> {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name == MANIFEST_FILE || !name.ends_with(".json") {
+        if name == repo::MANIFEST_FILE || !name.ends_with(".json") {
             continue;
         }
         if let Some(n) = sequence(name) {
@@ -810,28 +803,20 @@ pub fn write(paths: &ProfilePaths, data: &Normalized) -> Result<()> {
     repo::write_json(&paths.tracks(), &data.tracks)
 }
 
-/// Reads the normalized files [`write`] wrote; none yet is an error naming
-/// `sss pandora export`.
-pub fn read(paths: &ProfilePaths) -> Result<Normalized> {
-    Ok(Normalized {
-        stations: read_stations(paths)?,
+/// Reads the normalized files [`write`] wrote; `None` when there is no
+/// `stations.json` (the profile has no Pandora export), an error when it is
+/// there and another file is missing or unreadable.
+pub fn read_opt(paths: &ProfilePaths) -> Result<Option<Normalized>> {
+    let Some(stations) = repo::read_json_opt(&paths.stations())? else {
+        return Ok(None);
+    };
+    Ok(Some(Normalized {
+        stations,
         playlists: repo::read_json(&paths.playlists())?,
         collection: repo::read_json(&paths.collection())?,
         bookmarks: repo::read_json(&paths.bookmarks())?,
         tracks: repo::read_json(&paths.tracks())?,
-    })
-}
-
-/// Reads the normalized stations alone; none yet is an error naming `sss
-/// pandora export`.
-pub fn read_stations(paths: &ProfilePaths) -> Result<Vec<Station>> {
-    let Some(stations) = repo::read_json_opt(&paths.stations())? else {
-        bail!(
-            "no normalized export in {}; run `sss pandora export`",
-            paths.pandora_dir().display()
-        );
-    };
-    Ok(stations)
+    }))
 }
 
 /// What one normalization holds, counted.
@@ -1311,7 +1296,7 @@ mod tests {
         ] {
             let dir = paths.raw_run_dir(id);
             write_run(&dir, &stations(station));
-            repo::write_json(&dir.join(MANIFEST_FILE), &manifest(id, complete)).unwrap();
+            repo::write_json(&dir.join(repo::MANIFEST_FILE), &manifest(id, complete)).unwrap();
         }
         // A run that never ended has no manifest.
         write_run(
@@ -1339,13 +1324,10 @@ mod tests {
     }
 
     #[test]
-    fn read_returns_what_write_wrote_and_without_an_export_says_to_export() {
+    fn read_returns_what_write_wrote_and_none_without_an_export() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Repo::at(tmp.path()).profile("alice").unwrap();
-        let err = read(&paths).unwrap_err().to_string();
-        assert!(err.contains("run `sss pandora export`"), "{err}");
-        let err = read_stations(&paths).unwrap_err().to_string();
-        assert!(err.contains("run `sss pandora export`"), "{err}");
+        assert_eq!(read_opt(&paths).unwrap(), None);
 
         let data = normalize_exchanges(&[(
             "v1/station/getStationFeedback",
@@ -1354,8 +1336,9 @@ mod tests {
             json!({"total": 1, "feedback": [fb("f1", "TR:1", None)]}),
         )]);
         write(&paths, &data).unwrap();
-        assert_eq!(read(&paths).unwrap(), data);
-        assert_eq!(read_stations(&paths).unwrap(), data.stations);
+        assert_eq!(read_opt(&paths).unwrap(), Some(data));
+        fs::remove_file(paths.tracks()).unwrap();
+        assert!(read_opt(&paths).is_err());
     }
 
     #[test]
@@ -1438,9 +1421,6 @@ mod tests {
 
     #[test]
     fn helpers() {
-        assert_eq!(id_type("TR:12"), Some("TR"));
-        assert_eq!(id_type("tr:12"), None);
-        assert_eq!(id_type("TR:"), None);
         assert_eq!(sequence("0012-v1-station.json"), Some(12));
         assert_eq!(
             time_text(&json!({"t": 1_600_000_000}), "t").as_deref(),

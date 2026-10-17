@@ -7,7 +7,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -245,12 +245,7 @@ impl Client {
                 }
             };
             self.requests += 1;
-            let parsed: Option<Value> = serde_json::from_str(&text).ok();
-            let response = match parsed {
-                Some(_) => RawValue::from_string(text.trim().to_owned()),
-                None => serde_json::value::to_raw_value(&text),
-            }
-            .context("storing the response")?;
+            let (parsed, response) = http::stored_body(&text)?;
             record(&Exchange {
                 at,
                 path: path.to_owned(),

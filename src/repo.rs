@@ -174,6 +174,51 @@ impl ProfilePaths {
         self.raw_dir().join(run_id)
     }
 
+    pub fn youtube_dir(&self) -> PathBuf {
+        self.dir.join("youtube")
+    }
+
+    /// Directory holding every Takeout import run.
+    pub fn youtube_raw_dir(&self) -> PathBuf {
+        self.youtube_dir().join("raw")
+    }
+
+    /// Directory of one import run's archive copies and manifest.
+    pub fn youtube_raw_run_dir(&self, run_id: &str) -> PathBuf {
+        self.youtube_raw_dir().join(run_id)
+    }
+
+    /// Directory of the YouTube Data API response cache.
+    pub fn youtube_api_dir(&self) -> PathBuf {
+        self.youtube_dir().join("api")
+    }
+
+    pub fn youtube_history(&self) -> PathBuf {
+        self.youtube_dir().join("history.json")
+    }
+
+    pub fn youtube_videos(&self) -> PathBuf {
+        self.youtube_dir().join("videos.json")
+    }
+
+    pub fn youtube_playlists(&self) -> PathBuf {
+        self.youtube_dir().join("playlists.json")
+    }
+
+    pub fn youtube_subscriptions(&self) -> PathBuf {
+        self.youtube_dir().join("subscriptions.json")
+    }
+
+    pub fn youtube_library(&self) -> PathBuf {
+        self.youtube_dir().join("library.json")
+    }
+
+    /// The import runs the normalized files are built from, oldest archive
+    /// first.
+    pub fn youtube_runs(&self) -> PathBuf {
+        self.youtube_dir().join("runs.json")
+    }
+
     pub fn stations(&self) -> PathBuf {
         self.pandora_dir().join("stations.json")
     }
@@ -288,6 +333,80 @@ pub fn now_rfc3339() -> Result<String> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("formatting the current time")
+}
+
+/// A run id from the current UTC time, `YYYYMMDDTHHMMSSZ`.
+pub fn run_id_now() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+/// Creates a new, empty run directory in `raw` named after `base` (with
+/// `-2`, `-3`, … appended when that name is taken) and returns its id and
+/// path.
+pub fn create_run_dir(raw: &Path, base: &str) -> Result<(String, PathBuf)> {
+    fs::create_dir_all(raw).with_context(|| format!("creating {}", raw.display()))?;
+    for n in 1u32.. {
+        let id = if n == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}-{n}")
+        };
+        let dir = raw.join(&id);
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok((id, dir)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
+    unreachable!("some suffix is always free")
+}
+
+/// The file in a run directory that records how the run ended; a run
+/// without one never ended.
+pub const MANIFEST_FILE: &str = "manifest.json";
+
+/// The manifest of the run in `dir`, `None` when it has none.
+pub fn read_manifest<M: DeserializeOwned>(dir: &Path) -> Result<Option<M>> {
+    read_json_opt(&dir.join(MANIFEST_FILE))
+}
+
+/// The run ids in `raw`, oldest first: by timestamp, then by the `-N`
+/// suffix a second run in the same second gets.
+pub fn run_ids(raw: &Path) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(raw) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", raw.display())),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", raw.display()))?;
+        if entry.file_type()?.is_dir()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            ids.push(name.to_owned());
+        }
+    }
+    ids.sort_by_key(|id| run_order(id));
+    Ok(ids)
+}
+
+fn run_order(id: &str) -> (String, u64) {
+    if let Some((base, n)) = id.rsplit_once('-')
+        && let Ok(n) = n.parse::<u64>()
+    {
+        return (base.to_owned(), n);
+    }
+    (id.to_owned(), 1)
 }
 
 /// The repository's JSON form of `value`: two-space indented, one trailing
@@ -495,6 +614,27 @@ mod tests {
             Path::new("/r/profiles/alice/pandora/raw/run1")
         );
         assert_eq!(
+            p.youtube_raw_run_dir("run1"),
+            Path::new("/r/profiles/alice/youtube/raw/run1")
+        );
+        assert_eq!(
+            p.youtube_api_dir(),
+            Path::new("/r/profiles/alice/youtube/api")
+        );
+        for (path, name) in [
+            (p.youtube_history(), "history"),
+            (p.youtube_videos(), "videos"),
+            (p.youtube_playlists(), "playlists"),
+            (p.youtube_subscriptions(), "subscriptions"),
+            (p.youtube_library(), "library"),
+            (p.youtube_runs(), "runs"),
+        ] {
+            assert_eq!(
+                path,
+                Path::new(&format!("/r/profiles/alice/youtube/{name}.json"))
+            );
+        }
+        assert_eq!(
             p.track_matches(),
             Path::new("/r/profiles/alice/matches/tracks.jsonl")
         );
@@ -508,6 +648,29 @@ mod tests {
         );
         assert_eq!(p.report(), Path::new("/r/profiles/alice/report.md"));
         assert!(repo.profile("../etc").is_err());
+    }
+
+    #[test]
+    fn a_taken_run_id_gets_a_suffix_and_runs_list_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        assert!(run_ids(&raw).unwrap().is_empty());
+        let (a, dir_a) = create_run_dir(&raw, "20261013T000000Z").unwrap();
+        let (b, dir_b) = create_run_dir(&raw, "20261013T000000Z").unwrap();
+        assert_eq!(a, "20261013T000000Z");
+        assert_eq!(b, "20261013T000000Z-2");
+        assert!(dir_a.is_dir() && dir_b.is_dir());
+        fs::write(raw.join("stray-file"), "").unwrap();
+        assert_eq!(run_ids(&raw).unwrap(), [a, b]);
+    }
+
+    #[test]
+    fn run_ids_and_their_order() {
+        let id = run_id_now();
+        assert_eq!(id.len(), 16, "{id}");
+        assert!(id.ends_with('Z') && id.as_bytes()[8] == b'T', "{id}");
+        assert_eq!(run_order("20261013T000000Z-10").1, 10);
+        assert_eq!(run_order("20261013T000000Z").1, 1);
     }
 
     #[test]

@@ -20,5 +20,7 @@ pub mod repo;
 pub mod report;
 pub mod search;
 pub mod secrets;
+pub mod source;
 pub mod spotify;
 pub mod status;
+pub mod youtube;

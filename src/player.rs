@@ -15,10 +15,11 @@ use serde::Serialize;
 use crate::error::{self, Kind};
 use crate::fail;
 use crate::matching::model::{self as matches, MatchEntry};
-use crate::pandora::model::{self, Station};
+use crate::pandora::model::Station;
 use crate::push::{self, Ledger, PlaylistEntry};
 use crate::repo::ProfilePaths;
 use crate::secrets;
+use crate::source::Exports;
 use crate::spotify::auth::{PLAYBACK_MODIFY_SCOPE, PLAYBACK_READ_SCOPE};
 use crate::spotify::client::Spotify;
 use crate::spotify::ids::{self, ContextKind, IdKind, Target};
@@ -74,6 +75,7 @@ impl PlaySource {
 /// and `--item`, resolved against the profile's files without contacting
 /// Spotify.
 pub fn resolve_source(
+    profile: &str,
     paths: &ProfilePaths,
     targets: &[String],
     station: Option<&str>,
@@ -87,7 +89,13 @@ pub fn resolve_source(
         );
     }
     if let Some(name) = station {
-        let stations = model::read_stations(paths)?;
+        let Some(export) = Exports::load_opt(paths)?.pandora else {
+            fail!(
+                Kind::Config,
+                "no Pandora export for profile {profile}; run `sss pandora export`"
+            );
+        };
+        let stations = export.stations;
         let ledger = Ledger::load(&paths.spotify_state())?;
         let id = station_playlist(&stations, &ledger, name)?;
         return Ok(PlaySource::Context {
@@ -185,10 +193,10 @@ pub fn station_playlist(stations: &[Station], ledger: &Ledger, name: &str) -> Re
 /// The stored candidates of track `item`, in stored order.
 pub fn item_uris(entries: &BTreeMap<String, MatchEntry>, item: &str) -> Result<Vec<String>> {
     let item = item.trim();
-    if IdKind::of_pandora_id(item) != Some(IdKind::Track) {
+    if IdKind::of_item_id(item) != Some(IdKind::Track) {
         fail!(
             Kind::Input,
-            "{item:?} is not a Pandora track id (TR:…); --item plays a track's stored candidates"
+            "{item:?} is not a track item id (TR:…, YV:…); --item plays a track's stored candidates"
         );
     }
     let Some(entry) = entries.get(item) else {
@@ -923,7 +931,7 @@ mod tests {
 
     fn entry(id: &str, uris: &[&str]) -> MatchEntry {
         MatchEntry {
-            pandora_id: id.into(),
+            item_id: id.into(),
             status: Status::Ambiguous,
             spotify_uri: None,
             method: None,
@@ -951,7 +959,8 @@ mod tests {
         for (item, text) in [
             ("TR:2", "TR:2 has no stored candidates"),
             ("TR:3", "TR:3 has no match entry; run `sss match` first"),
-            ("AR:1", "\"AR:1\" is not a Pandora track id"),
+            ("AR:1", "\"AR:1\" is not a track item id"),
+            ("YC:UC1", "\"YC:UC1\" is not a track item id"),
         ] {
             let err = item_uris(&entries, item).unwrap_err();
             assert_eq!(error::kind(&err), Kind::Input, "{item}");
@@ -997,17 +1006,20 @@ mod tests {
             (&targets[..], None, Some("TR:1")),
             (&[][..], Some("Jazz"), Some("TR:1")),
         ] {
-            let err = resolve_source(&paths, t, station, item).unwrap_err();
+            let err = resolve_source("alice", &paths, t, station, item).unwrap_err();
             assert_eq!(error::kind(&err), Kind::Input);
             assert!(format!("{err:#}").contains("only one of them"));
         }
         // No export: the station cannot be looked up.
-        let err = resolve_source(&paths, &[], Some("Jazz"), None).unwrap_err();
-        assert_eq!(error::kind(&err), Kind::Other);
-        assert!(format!("{err:#}").contains("run `sss pandora export`"));
+        let err = resolve_source("alice", &paths, &[], Some("Jazz"), None).unwrap_err();
+        assert_eq!(error::kind(&err), Kind::Config);
+        assert_eq!(
+            err.to_string(),
+            "no Pandora export for profile alice; run `sss pandora export`"
+        );
         crate::matching::model::append(&paths.track_matches(), &entry("TR:1", &[TRACK])).unwrap();
         assert_eq!(
-            resolve_source(&paths, &[], None, Some("TR:1")).unwrap(),
+            resolve_source("alice", &paths, &[], None, Some("TR:1")).unwrap(),
             PlaySource::Tracks(vec![TRACK.into()])
         );
     }

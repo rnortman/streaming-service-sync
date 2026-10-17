@@ -28,8 +28,10 @@ use crate::matching::model::{Candidate, Confidence};
 use crate::matching::normalize;
 use crate::matching::run::Item;
 use crate::repo::{self, ProfilePaths};
+use crate::source::Source;
 use crate::spotify::ids::IdKind;
 use crate::spotify::item::Offered;
+use crate::youtube::select::extra_key;
 
 /// The embedded agent definition.
 pub const DEFINITION: &str = include_str!("../../agents/music-matcher.md");
@@ -50,48 +52,73 @@ pub fn ccc_program() -> OsString {
 /// One item of a batch, as the prompt shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BatchItem {
-    /// The Pandora id; a decision names it.
+    /// The item id; a decision names it.
     pub item: String,
     pub kind: IdKind,
-    pub pandora: Value,
+    /// The source the record comes from.
+    pub source: Source,
+    /// What the source knows of the item.
+    pub record: Value,
     pub candidates: Vec<Offered>,
 }
 
 impl BatchItem {
-    /// The batch form of `item` with `candidates`: a track's title, artist,
-    /// album, duration, explicit hint, title flags, stations and playlists;
-    /// an artist's name, the stations it seeds and up to five thumbed-up
-    /// titles from them; an album's name and artist.
+    /// The batch form of `item` with `candidates`. A Pandora record holds a
+    /// track's title, artist, album, duration, explicit hint, title flags,
+    /// stations and playlists; an artist's name, the stations it seeds and
+    /// up to five thumbed-up titles from them; an album's name and artist.
+    /// A YouTube record holds a track's title, artist, album, duration,
+    /// title flags, the video's own title, channel, kind and plays, and its
+    /// playlists; an artist's name, its channel's name and up to five
+    /// titles played most from it.
     pub fn new(kind: IdKind, item: &Item, candidates: &[Candidate]) -> Self {
-        let pandora = match kind {
-            IdKind::Track => {
-                let flags = item
-                    .name
-                    .as_deref()
-                    .map(|t| normalize::title(t).flags)
-                    .unwrap_or_default();
-                json!({
-                    "title": item.name,
-                    "artist": item.artist,
-                    "album": item.album,
-                    "duration_s": item.duration_s,
-                    "explicit_hint": item.explicit_hint,
-                    "flags": flags,
-                    "station_names": item.stations,
-                    "playlist_names": item.playlists,
-                })
-            }
-            IdKind::Artist => json!({
+        let flags = || {
+            item.name
+                .as_deref()
+                .map(|t| normalize::title(t).flags)
+                .unwrap_or_default()
+        };
+        let extra = |key: &str| item.extra.get(key).cloned().unwrap_or(Value::Null);
+        let record = match (item.source, kind) {
+            (Source::Pandora, IdKind::Track) => json!({
+                "title": item.name,
+                "artist": item.artist,
+                "album": item.album,
+                "duration_s": item.duration_s,
+                "explicit_hint": item.explicit_hint,
+                "flags": flags(),
+                "station_names": item.stations,
+                "playlist_names": item.playlists,
+            }),
+            (Source::Pandora, IdKind::Artist) => json!({
                 "name": item.name,
                 "station_names": item.stations,
                 "station_thumbs_up": item.context_titles,
             }),
-            IdKind::Album => json!({"name": item.name, "artist": item.artist}),
+            (Source::Youtube, IdKind::Track) => json!({
+                "title": item.name,
+                "artist": item.artist,
+                "album": item.album,
+                "duration_s": item.duration_s,
+                "flags": flags(),
+                "youtube_title": extra(extra_key::YOUTUBE_TITLE),
+                "channel": extra(extra_key::CHANNEL),
+                "kind": extra(extra_key::KIND),
+                "plays": extra(extra_key::PLAYS),
+                "playlist_names": item.playlists,
+            }),
+            (Source::Youtube, IdKind::Artist) => json!({
+                "name": item.name,
+                "channel": extra(extra_key::CHANNEL),
+                "most_played_titles": item.context_titles,
+            }),
+            (_, IdKind::Album) => json!({"name": item.name, "artist": item.artist}),
         };
         BatchItem {
-            item: item.pandora_id.clone(),
+            item: item.item_id.clone(),
             kind,
-            pandora,
+            source: item.source,
+            record,
             candidates: candidates.iter().map(Offered::from).collect(),
         }
     }
@@ -138,7 +165,7 @@ pub trait Matcher {
 pub fn render_prompt(kind: IdKind, batch: &[BatchItem]) -> Result<String> {
     let items = serde_json::to_string_pretty(batch).context("rendering the batch")?;
     Ok(format!(
-        "Match these {n} Pandora {noun} to the Spotify candidates offered for each.\n\
+        "Match these {n} {noun} to the Spotify candidates offered for each.\n\
          Reply with only the JSON object \
          {{\"decisions\":[{{\"item\":\"…\",\"choice\":\"<candidate id>\"|null,\
          \"confidence\":\"{confidence}\",\"reason\":\"…\"}}]}}, \
@@ -776,7 +803,7 @@ mod tests {
     use super::*;
     use crate::error;
     use crate::repo::Repo;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     fn candidate(uri: &str) -> Candidate {
         Candidate {
@@ -791,13 +818,12 @@ mod tests {
 
     fn track_item(id: &str) -> Item {
         Item {
-            pandora_id: id.into(),
             name: Some("Song (Live)".into()),
             artist: Some("The Band".into()),
             duration_s: Some(200),
             stations: vec!["Station".into()],
             playlists: vec!["Mix".into()],
-            ..Item::default()
+            ..Item::new(Source::Pandora, id)
         }
     }
 
@@ -817,10 +843,11 @@ mod tests {
     fn a_batch_item_carries_the_record_and_unscored_candidates() {
         let item = &batch(&["TR:1"])[0];
         assert_eq!(item.item, "TR:1");
-        assert_eq!(item.pandora["title"], "Song (Live)");
-        assert_eq!(item.pandora["flags"], json!(["live"]));
-        assert_eq!(item.pandora["station_names"], json!(["Station"]));
-        assert_eq!(item.pandora["playlist_names"], json!(["Mix"]));
+        assert_eq!(item.source, Source::Pandora);
+        assert_eq!(item.record["title"], "Song (Live)");
+        assert_eq!(item.record["flags"], json!(["live"]));
+        assert_eq!(item.record["station_names"], json!(["Station"]));
+        assert_eq!(item.record["playlist_names"], json!(["Mix"]));
         assert_eq!(
             serde_json::to_value(&item.candidates[0]).unwrap(),
             json!({"id": "spotify:track:a", "name": "Song", "artists": ["The Band"],
@@ -829,22 +856,18 @@ mod tests {
         );
 
         let artist = Item {
-            pandora_id: "AR:1".into(),
             name: Some("Someone".into()),
             stations: vec!["Station".into()],
             context_titles: vec!["Hit".into()],
-            ..Item::default()
+            ..Item::new(Source::Pandora, "AR:1")
         };
         let item = BatchItem::new(IdKind::Artist, &artist, &[]);
         assert_eq!(
-            item.pandora,
+            item.record,
             json!({"name": "Someone", "station_names": ["Station"], "station_thumbs_up": ["Hit"]})
         );
         let prompt = render_prompt(IdKind::Artist, &[item]).unwrap();
-        assert!(
-            prompt.starts_with("Match these 1 Pandora artists"),
-            "{prompt}"
-        );
+        assert!(prompt.starts_with("Match these 1 artists"), "{prompt}");
         assert!(prompt.contains("\"item\": \"AR:1\""), "{prompt}");
     }
 
@@ -1014,15 +1037,86 @@ mod tests {
         assert_eq!(item.kind, IdKind::Track);
         let json = serde_json::to_string(item).unwrap();
         assert!(
-            json.starts_with(r#"{"item":"TR:1","kind":"track","pandora":"#),
+            json.starts_with(r#"{"item":"TR:1","kind":"track","source":"pandora","record":"#),
             "{json}"
         );
         let prompt = render_prompt(IdKind::Track, &batch(&["TR:1", "TR:2"])).unwrap();
-        assert!(
-            prompt.starts_with("Match these 2 Pandora tracks"),
-            "{prompt}"
-        );
+        assert!(prompt.starts_with("Match these 2 tracks"), "{prompt}");
         assert!(prompt.contains("\"kind\": \"track\""), "{prompt}");
+    }
+
+    #[test]
+    fn a_batch_mixing_sources_has_one_source_free_header() {
+        let video = Item {
+            source: Source::Youtube,
+            ..track_item("YV:dQw4w9WgXcQ")
+        };
+        let mixed = [
+            batch(&["TR:1"]).remove(0),
+            BatchItem::new(IdKind::Track, &video, &[candidate("spotify:track:a")]),
+        ];
+        let prompt = render_prompt(IdKind::Track, &mixed).unwrap();
+        let header = prompt.lines().next().unwrap();
+        assert_eq!(
+            header,
+            "Match these 2 tracks to the Spotify candidates offered for each."
+        );
+        assert!(!prompt.contains("Pandora"), "{prompt}");
+        let items = prompt.split_once("Items:\n").unwrap().1;
+        let items: Value = serde_json::from_str(items).unwrap();
+        assert_eq!(items[0]["item"], "TR:1");
+        assert_eq!(items[0]["source"], "pandora");
+        assert_eq!(items[1]["item"], "YV:dQw4w9WgXcQ");
+        assert_eq!(items[1]["source"], "youtube");
+    }
+
+    #[test]
+    fn a_youtube_record_carries_the_video_and_channel() {
+        let video = Item {
+            name: Some("Other Song (Live)".into()),
+            artist: Some("Artist".into()),
+            playlists: vec!["Road Trip".into()],
+            extra: json!({
+                "youtube_title": "Artist - Other Song (Live)",
+                "channel": "ArtistVEVO",
+                "kind": "music_video",
+                "plays": 14,
+                "liked": false,
+                "in_library": false,
+            }),
+            ..Item::new(Source::Youtube, "YV:abcDEF12345")
+        };
+        let item = BatchItem::new(IdKind::Track, &video, &[]);
+        assert_eq!(
+            item.record,
+            json!({
+                "title": "Other Song (Live)",
+                "artist": "Artist",
+                "album": null,
+                "duration_s": null,
+                "flags": ["live"],
+                "youtube_title": "Artist - Other Song (Live)",
+                "channel": "ArtistVEVO",
+                "kind": "music_video",
+                "plays": 14,
+                "playlist_names": ["Road Trip"],
+            })
+        );
+
+        let channel = Item {
+            name: Some("Artist".into()),
+            context_titles: vec!["Other Song".into()],
+            extra: json!({"channel": "ArtistVEVO"}),
+            ..Item::new(Source::Youtube, "YC:UCabc")
+        };
+        assert_eq!(
+            BatchItem::new(IdKind::Artist, &channel, &[]).record,
+            json!({
+                "name": "Artist",
+                "channel": "ArtistVEVO",
+                "most_played_titles": ["Other Song"],
+            })
+        );
     }
 
     #[test]
@@ -1091,16 +1185,35 @@ mod tests {
         assert!(!other.path().join("ccc").exists());
     }
 
-    // TODO(fake-ccc-etxtbsy): writing this script races other tests' spawns.
+    /// Writes `script` to `path` as an executable through a child `sh`, so
+    /// this process never holds a write descriptor on it: a test thread
+    /// forking meanwhile would inherit one, and exec'ing the script would
+    /// then fail with ETXTBSY.
+    fn write_script(path: &Path, script: &str) {
+        use std::io::Write;
+        let mut sh = Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(sh.wait().unwrap().success(), "writing {}", path.display());
+    }
+
     /// A fake `ccc` in `dir`: logs its arguments, exits `which` for `which`,
     /// and on its Nth other call sleeps `sleepN` seconds when that file
     /// exists, prints `outN` and exits `exitN` (default 0).
     fn fake_ccc(dir: &Path, which: i32) -> OsString {
         let path = dir.join("ccc");
         let d = dir.display();
-        fs::write(
+        write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >> '{d}/argv'\n\
                  if [ \"$1\" = which ]; then echo 'no definition for agent type' >&2; exit {which}; fi\n\
@@ -1110,9 +1223,7 @@ mod tests {
                  cat \"{d}/out$n\" 2>/dev/null\n\
                  exit $(cat \"{d}/exit$n\" 2>/dev/null || echo 0)\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path.into_os_string()
     }
 

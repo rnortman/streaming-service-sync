@@ -1,8 +1,9 @@
-//! Per-profile credentials — the Pandora session, the Spotify token and a
-//! Spotify sign-in in progress — under
-//! `$XDG_STATE_HOME/streaming-service-sync/<profile>/`.
-//! The directory is mode 0700 and every file in it 0600; nothing here is
-//! ever written inside the data repository.
+//! Credentials: per profile the Pandora session, the Spotify token and a
+//! Spotify sign-in in progress, under
+//! `$XDG_STATE_HOME/streaming-service-sync/<profile>/`, and the owner's
+//! YouTube Data API key at the state root itself.
+//! Every directory written is mode 0700 and every file in it 0600; nothing
+//! here is ever written inside the data repository.
 
 use std::fmt;
 use std::fs;
@@ -26,6 +27,9 @@ pub const SPOTIFY_TOKEN_FILE: &str = "spotify-token.json";
 
 /// File name of a Spotify sign-in between its two steps.
 pub const SPOTIFY_PENDING_FILE: &str = "spotify-auth-pending.json";
+
+/// File name of the stored YouTube Data API key, at the state root.
+pub const YOUTUBE_API_KEY_FILE: &str = "youtube-api-key.json";
 
 /// Every credential file a profile's state directory can hold; a directory
 /// under the state root holding at least one of them is a profile.
@@ -55,6 +59,30 @@ impl StateRoot {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn youtube_api_key_path(&self) -> PathBuf {
+        self.root.join(YOUTUBE_API_KEY_FILE)
+    }
+
+    /// The stored YouTube Data API key, `None` when there is none.
+    pub fn load_youtube_api_key(&self) -> Result<Option<YoutubeApiKey>> {
+        repo::read_json_opt(&self.youtube_api_key_path())
+    }
+
+    /// Replaces the stored YouTube Data API key, stamped with the current
+    /// time.
+    pub fn save_youtube_api_key(&self, key: &str) -> Result<YoutubeApiKey> {
+        let stored = YoutubeApiKey {
+            key: key.to_owned(),
+            stored_at: repo::now_rfc3339()?,
+        };
+        write_private(
+            &self.root,
+            &self.youtube_api_key_path(),
+            repo::to_json(&stored)?.as_bytes(),
+        )?;
+        Ok(stored)
     }
 
     /// The state directory of `profile`. The name is validated.
@@ -188,18 +216,40 @@ impl StateDir {
         }
     }
 
-    /// Atomically replaces `path` (inside this directory) with a 0600 file,
-    /// creating the directory 0700 first. An existing directory's mode is
-    /// tightened to 0700.
+    /// Atomically replaces `path` (inside this directory) with a 0600 file.
     fn write_private(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)
-            .with_context(|| format!("creating {}", self.dir.display()))?;
-        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {}", self.dir.display()))?;
-        repo::write_atomic_private(path, contents)
+        write_private(&self.dir, path, contents)
+    }
+}
+
+/// Atomically replaces `path` (inside `dir`) with a 0600 file, creating
+/// `dir` 0700 first. An existing `dir`'s mode is tightened to 0700.
+fn write_private(dir: &Path, path: &Path, contents: &[u8]) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting {}", dir.display()))?;
+    repo::write_atomic_private(path, contents)
+}
+
+/// The owner's YouTube Data API key, shared by every profile. `Debug` never
+/// shows the key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YoutubeApiKey {
+    pub key: String,
+    /// When the key was stored, RFC 3339 UTC.
+    pub stored_at: String,
+}
+
+impl fmt::Debug for YoutubeApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("YoutubeApiKey")
+            .field("key", &"<redacted>")
+            .field("stored_at", &self.stored_at)
+            .finish()
     }
 }
 
@@ -428,6 +478,26 @@ mod tests {
         assert!(StateRoot::at(tmp.path()).profiles().unwrap().is_empty());
         state.delete_spotify_pending().unwrap();
         assert!(!state.spotify_pending_path().exists());
+    }
+
+    #[test]
+    fn the_youtube_api_key_is_private_redacted_and_no_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = StateRoot::at(tmp.path().join("state"));
+        assert_eq!(root.load_youtube_api_key().unwrap(), None);
+        let stored = root.save_youtube_api_key("AIza-test-key-value").unwrap();
+        assert_eq!(stored.key, "AIza-test-key-value");
+        assert_eq!(root.load_youtube_api_key().unwrap(), Some(stored.clone()));
+        assert_eq!(mode(&root.youtube_api_key_path()), 0o600);
+        assert_eq!(mode(root.root()), 0o700);
+        assert!(root.profiles().unwrap().is_empty());
+
+        let text = format!("{stored:?}");
+        assert!(!text.contains("AIza-test-key-value"), "{text}");
+        assert!(text.contains(&stored.stored_at), "{text}");
+
+        let replaced = root.save_youtube_api_key("AIza-second").unwrap();
+        assert_eq!(root.load_youtube_api_key().unwrap(), Some(replaced));
     }
 
     #[test]

@@ -241,6 +241,197 @@ step, says why.
 The `run <id>: <dir>` line and the per-step ledger lines that `export`
 prints as it goes are on stderr under `--json`.
 
+### `youtube import`
+
+`sss youtube import DIR` files an extracted Google Takeout archive as a new
+raw run and, when the run is complete, normalizes (`youtube normalize`,
+below). A success document means the run is complete: the history was
+read and no step failed. A run that cannot copy a file or write its
+manifest is removed again, and the error names it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | the profile imported into |
+| `run_id` | string | the new run |
+| `run_dir` | path | `profiles/<name>/youtube/raw/<run-id>/` |
+| `manifest` | ImportManifest | the run's `manifest.json`, below |
+| `normalized` | object | the `youtube normalize` report (without `ok`/`command`) |
+
+An **ImportManifest** is:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `run_id` | string | the run |
+| `started`, `finished` | RFC 3339 UTC | when the run started and ended |
+| `source_dir` | path | the directory imported from |
+| `files` | [{ `path`, `bytes`, `sha256` }] | every file copied, by its path in the run (`takeout/history/watch-history.json`, `takeout/playlists/…`, `takeout/subscriptions/subscriptions.csv`, `takeout/music (library and uploads)/…`), its size and SHA-256 |
+| `steps` | object | one ImportStep per name: `history`, `playlists`, `subscriptions`, `library` |
+| `complete` | bool | `true` when `history` is `ok` and no step `failed` |
+
+An **ImportStep** is `{ "status": "ok" | "missing" | "failed", "count":
+number, "skipped": number, "error": string }`: `missing` means the archive
+had no such file, `failed` that it was there and did not parse (`error`,
+present only then, says why); `count` is the records parsed and `skipped`
+the rows dropped for a malformed id or time.
+
+```json
+{
+  "ok": true,
+  "command": "youtube import",
+  "profile": "alice",
+  "run_id": "20261017T120000Z",
+  "run_dir": "/srv/music-data/profiles/alice/youtube/raw/20261017T120000Z",
+  "manifest": {
+    "run_id": "20261017T120000Z",
+    "started": "2026-10-17T12:00:00Z",
+    "finished": "2026-10-17T12:00:01Z",
+    "source_dir": "/home/alice/Downloads/takeout",
+    "files": [
+      { "path": "takeout/history/watch-history.json", "bytes": 1024, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }
+    ],
+    "steps": {
+      "history": { "status": "ok", "count": 3, "skipped": 0 },
+      "playlists": { "status": "missing", "count": 0, "skipped": 0 },
+      "subscriptions": { "status": "missing", "count": 0, "skipped": 0 },
+      "library": { "status": "missing", "count": 0, "skipped": 0 }
+    },
+    "complete": true
+  },
+  "normalized": {
+    "run_id": "20261017T120000Z",
+    "history_runs": ["20261017T120000Z"],
+    "records": 3,
+    "plays": 3,
+    "removed_plays": 0,
+    "videos": 2,
+    "songs": 2,
+    "music_videos": 0,
+    "unknown": 0,
+    "playlists": 0,
+    "subscriptions": 0,
+    "artist_channels": 0,
+    "library_songs": 0,
+    "liked": 0
+  }
+}
+```
+
+The files found, the `run <id>: <dir>` line, warnings (a playlist with no
+items file, playlists whose titles share one items file name, a history in
+which no entry begins with `Watched `, as in a localized archive) and the
+ledger lines are on stderr.
+
+### `youtube normalize`
+
+Re-derives `profiles/<name>/youtube/{history,videos,playlists,subscriptions,library}.json`
+from the copies of every complete import run, without reading the archive
+again: the history is the union of every run's, the catalogue comes from
+the newest archive (the run whose newest history entry is latest). A
+profile with no complete run fails with kind `other`; a complete run whose
+copies no longer parse fails with kind `config` and leaves the files as
+they were.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `run_id` | string | the run the playlists, subscriptions and library come from |
+| `history_runs` | [string] | every run the history is the union of, oldest archive first |
+| `records` | number | entries in `history.json`, of every kind (ads, posts, surveys included) |
+| `plays` | number | entries that name a video and are not ads |
+| `removed_plays` | number | of those, plays whose title and channel Takeout withheld (a removed or private video) and no run supplied |
+| `videos` | number | entries in `videos.json`: every video history, a playlist or the library names |
+| `songs`, `music_videos`, `unknown` | number | videos of each kind (the rest are `video`) |
+| `playlists` | number | playlists |
+| `subscriptions` | number | subscribed channels |
+| `artist_channels` | number | of those, the ones classified `artist` |
+| `library_songs` | number | songs in the music library |
+| `liked` | number | liked videos (from a `Liked videos` or `Liked Music` playlist, when the archive has one) |
+
+```json
+{
+  "ok": true,
+  "command": "youtube normalize",
+  "run_id": "20261017T120000Z",
+  "history_runs": ["20261017T120000Z"],
+  "records": 3,
+  "plays": 3,
+  "removed_plays": 0,
+  "videos": 2,
+  "songs": 2,
+  "music_videos": 0,
+  "unknown": 0,
+  "playlists": 0,
+  "subscriptions": 0,
+  "artist_channels": 0,
+  "library_songs": 0,
+  "liked": 0
+}
+```
+
+### `youtube api-key`
+
+`sss youtube api-key [--from-file FILE]` reads the YouTube Data API key
+from stdin (up to an empty line) or a file, checks it with one
+`videos.list` request for a public video, and stores it. It needs no
+profile: the key is shared by every profile. A key Google refuses as
+invalid fails with kind `input`, a project without YouTube Data API v3
+enabled with kind `config`, a spent quota with kind `quota`; nothing is
+stored then.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `stored_at` | RFC 3339 UTC | when the key was stored |
+| `key_path` | path | `youtube-api-key.json` at the state root |
+
+The key itself never appears in the document.
+
+```json
+{
+  "ok": true,
+  "command": "youtube api-key",
+  "stored_at": "2026-10-17T12:30:00Z",
+  "key_path": "/home/alice/.local/state/streaming-service-sync/youtube-api-key.json"
+}
+```
+
+### `youtube enrich`
+
+`sss youtube enrich [--limit N]` asks the YouTube Data API about every
+video in `videos.json` it has not answered yet (at most N with `--limit`),
+50 ids per request, each response written to
+`profiles/<name>/youtube/api/NNNN-videos-list.json` before it is read, and
+then normalizes as `youtube normalize` does. No stored key fails with kind
+`auth`; a profile with no YouTube export with kind `config`. A spent
+quota fails with kind `quota`: the responses fetched before it are kept
+and normalized, and a re-run asks only for the rest.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | the profile enriched |
+| `requested` | number | video ids asked about this run |
+| `found` | number | of those, the ones the API returned |
+| `unavailable` | number | of those, the ones it did not (removed or private; `available: false` in `videos.json`) |
+| `remaining` | number | videos still never asked about, left by `--limit` |
+| `normalized` | object | the `youtube normalize` report (without `ok`/`command`) |
+
+```json
+{
+  "ok": true,
+  "command": "youtube enrich",
+  "profile": "alice",
+  "requested": 2,
+  "found": 1,
+  "unavailable": 1,
+  "remaining": 0,
+  "normalized": {
+    "run_id": "20261017T120000Z",
+    "…": "as in youtube normalize"
+  }
+}
+```
+
+The `asking the YouTube Data API about …` line is on stderr under
+`--json`.
+
 ### `spotify auth`
 
 Without `--callback` (the first step):
@@ -294,7 +485,9 @@ each decision to `profiles/<name>/matches/{tracks,artists,albums}.jsonl`
 as it is made. Items left `ambiguous`, by this run or an earlier one, and
 `llm_failed` ones then go to the LLM in batches, from their stored
 candidates; with `--no-llm` they are left as they are. `--limit N` bounds
-the items taken this run, searched or sent to the LLM. Progress lines
+the items taken this run, searched or sent to the LLM; `--source pandora`
+or `--source youtube` takes only that source's items (`TR:`/`AR:`/`CO:`/
+`AL:`, or `YV:`/`YC:`). Progress lines
 (`track TR:1 "Song" by Artist: matched (isrc)`, `asking the LLM about 25
 tracks...`) go to stderr. `ccc` that cannot be run or cannot resolve the
 agent fails the command with kind `config` before any Spotify request;
@@ -315,8 +508,8 @@ A **Kind** is:
 | `by_status` | object | count per status decided: `matched`, `unmatched`, `ambiguous`, `llm_failed` |
 | `by_method` | object | count per method of the matches: `isrc`, `exact`, `llm` (`manual` and `external` decisions are not made by `match`) |
 | `llm_batches` | number | LLM batches run (0 with `--no-llm`) |
-| `llm_failed_ids` | [string] | Pandora ids left `llm_failed` |
-| `unmatched_ids` | [string] | Pandora ids decided `unmatched` |
+| `llm_failed_ids` | [string] | item ids left `llm_failed` |
+| `unmatched_ids` | [string] | item ids decided `unmatched` |
 
 A run that hits Spotify's quota fails with kind `quota`; the decisions
 made before it are kept and the next run continues after them.
@@ -349,13 +542,13 @@ Every item (of the `--only` kind) whose latest entry is `unmatched`,
 
 | Field | Type | Meaning |
 |---|---|---|
-| `items` | [Item] | in kind order (tracks, artists, albums), then Pandora id |
+| `items` | [Item] | in kind order (tracks, artists, albums), then item id |
 
 An **Item** is:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `pandora_id` | string | `TR:…`, `AR:…`/`CO:…` or `AL:…` |
+| `item_id` | string | `TR:…`, `AR:…`/`CO:…` or `AL:…` from Pandora; `YV:…` (a video, a track) or `YC:…` (a channel, an artist) from YouTube |
 | `kind` | `"track"` \| `"artist"` \| `"album"` | |
 | `title` | string, optional | the track title, or the artist's or album's name |
 | `artist` | string, optional | the artist of a track or album |
@@ -376,7 +569,7 @@ where Spotify gave them, an album's `artists`, `album_type` and
   "command": "match review",
   "items": [
     {
-      "pandora_id": "TR:123",
+      "item_id": "TR:123",
       "kind": "track",
       "title": "Song",
       "artist": "Artist",
@@ -403,16 +596,17 @@ form is JSON.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `items` | [Question] | in kind order (tracks, artists, albums), then Pandora id; `--only` keeps one kind, `--limit N` the first N |
+| `items` | [Question] | in kind order (tracks, artists, albums), then item id; `--only` keeps one kind, `--limit N` the first N |
 | `remaining` | number | open items of the selected kinds `--limit` left out; 0 without it |
 
 A **Question** is:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `item` | string | the Pandora id |
+| `item` | string | the item id |
 | `kind` | `"track"` \| `"artist"` \| `"album"` | |
-| `pandora` | object | a track's `title`, `artist`, `album`, `duration_s`, `explicit_hint`, `flags`, `station_names`, `playlist_names`; an artist's `name`, `station_names`, `station_thumbs_up`; an album's `name`, `artist` |
+| `source` | `"pandora"` \| `"youtube"` | the source the record comes from |
+| `record` | object | what the source knows; from Pandora a track's `title`, `artist`, `album`, `duration_s`, `explicit_hint`, `flags`, `station_names`, `playlist_names`, an artist's `name`, `station_names`, `station_thumbs_up`, an album's `name`, `artist`; from YouTube a track's `title`, `artist`, `album`, `duration_s`, `flags`, `youtube_title`, `channel`, `kind`, `plays`, `playlist_names`, an artist's `name`, `channel`, `most_played_titles` (`sss guide matching` describes each field) |
 | `candidates` | [Offered] | every stored candidate, best score first; Offered is under *Shapes* |
 
 ```json
@@ -423,7 +617,8 @@ A **Question** is:
     {
       "item": "TR:123",
       "kind": "track",
-      "pandora": { "title": "Song", "artist": "Artist", "album": "Album",
+      "source": "pandora",
+      "record": { "title": "Song", "artist": "Artist", "album": "Album",
         "duration_s": 215, "explicit_hint": false, "flags": [],
         "station_names": ["Artist Radio"], "playlist_names": [] },
       "candidates": [
@@ -448,7 +643,7 @@ refuses the whole document with kind `input` and nothing recorded (see
 | Field | Type | Meaning |
 |---|---|---|
 | `recorded` | [Recorded] | the decisions recorded, in document order |
-| `not_recorded` | [string] | the Pandora ids of the valid decisions `--limit` left out, in order |
+| `not_recorded` | [string] | the item ids of the valid decisions `--limit` left out, in order |
 
 A **Recorded** is `{ item, status, spotify_uri, confidence }`: `status`
 `matched` with the chosen URI, or `unmatched` with `spotify_uri` `null`
@@ -471,11 +666,11 @@ stopped at; the decisions before it are recorded.
 
 ### `match set` and `match reject`
 
-`sss match set <pandora-id> <spotify>` takes a Spotify URI
+`sss match set <item-id> <spotify>` takes a Spotify URI
 (`spotify:track:<id>`), an `https://open.spotify.com/track/<id>` address or
-a bare id; its type must be the one the Pandora id's prefix calls for
-(`TR:` a track, `AR:`/`CO:` an artist, `AL:` an album), else kind `input`.
-`sss match reject <pandora-id>` records that the item has no Spotify
+a bare id; its type must be the one the item id's prefix calls for
+(`TR:` and `YV:` a track, `AR:`, `CO:` and `YC:` an artist, `AL:` an
+album), else kind `input`. `sss match reject <item-id>` records that the item has no Spotify
 counterpart. Neither makes a network request. Their entries have method
 `manual`; the other methods an entry can carry are `isrc`, `exact`, `llm`
 (`sss match`) and `external` (`sss match answer`).
@@ -484,12 +679,15 @@ counterpart. Neither makes a network request. Their entries have method
 |---|---|---|
 | `entry` | object | the match entry appended, as in the `matches/*.jsonl` files |
 
+A match file line names its item as `item_id`; lines written by `sss`
+0.4 and earlier name it `pandora_id`, and both are read.
+
 ```json
 {
   "ok": true,
   "command": "match set",
   "entry": {
-    "pandora_id": "TR:123",
+    "item_id": "TR:123",
     "status": "matched",
     "spotify_uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
     "method": "manual",
@@ -506,10 +704,13 @@ counterpart. Neither makes a network request. Their entries have method
 ### `push`
 
 `sss push` sends the profile's matched items to its Spotify account, in
-this order: artist follows, station playlists, Pandora playlists, the
-collection and bookmarks, liked songs, the thumbs-down reference playlist.
-`--only artists|stations|playlists|collection|liked|thumbs-down` runs that
-one part and nothing else. `--dry-run` computes the same plan and makes no
+this order: artist follows (Pandora seeds and collection, YouTube artist
+channels), station playlists, Pandora and YouTube playlists, the
+collection and bookmarks with the YouTube library songs, liked songs, the
+YouTube "most played" playlist, the thumbs-down reference playlist.
+`--only artists|stations|playlists|collection|liked|most-played|thumbs-down`
+runs that one part and nothing else; `--source pandora|youtube` plans only
+what that source contributes. `--dry-run` computes the same plan and makes no
 Spotify request at all; it needs no token. Every write is recorded in
 `profiles/<name>/spotify/state.json` as it lands, so a second push adds
 only what is missing. Progress lines go to stderr.
@@ -518,34 +719,35 @@ only what is missing. Progress lines go to stderr.
 |---|---|---|
 | `profile` | string | the profile pushed |
 | `dry_run` | boolean | `true`: the plan, nothing sent |
-| `parts` | object | one key per part run: `artists`, `stations`, `playlists`, `collection`, `liked`, `thumbs_down`; a part `--only` left out is absent |
+| `parts` | object | one key per part run: `artists`, `stations`, `playlists`, `collection`, `liked`, `most_played`, `thumbs_down`; a part `--only` left out is absent |
 
 `parts.artists` is:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `to_follow` | number | matched artists (seeds and collection) not yet known to be followed |
+| `to_follow` | number | matched artists (seeds, collection, YouTube artist channels) not yet known to be followed |
 | `followed` | number | followed this run |
 | `skipped` | number | already followed: recorded earlier, or found followed |
 
-`parts.stations`, `parts.playlists` and `parts.thumbs_down` are:
+`parts.stations`, `parts.playlists`, `parts.most_played` and
+`parts.thumbs_down` are:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `enabled` | boolean | `false` when the part's `[push]` switch is off (`thumbs_down_playlist`); `playlists` is then empty |
+| `enabled` | boolean | `false` when the part's switch is off (`[push] thumbs_down_playlist`, `[youtube] most_played = 0`); `playlists` is then empty |
 | `playlists` | [Playlist] | one per Spotify playlist the part makes or fills |
 
 A **Playlist** is:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `key` | string | its key in `state.json`: `ST:…` (or `station:<id>`) for a station, `PL:…` for a Pandora playlist, `thumbs-down` |
+| `key` | string | its key in `state.json`: `ST:…` (or `station:<id>`) for a station, `PL:…` for a Pandora playlist, `YP:PL…` for a YouTube playlist, `youtube:most-played`, `thumbs-down` |
 | `name` | string | the Spotify playlist's name |
 | `action` | `"create"` \| `"update"` \| `"skip"` \| `"pending"` | made now; items missing from one made earlier; nothing to add; left alone (below) |
 | `to_add` | number | matched tracks to add |
 | `added` | number | added this run (0 in a dry run) |
 | `at` | string, optional | a `pending` entry's time |
-| `repeats` | number, optional | tracks the Pandora playlist repeats; Spotify gets each once |
+| `repeats` | number, optional | tracks the source playlist repeats; Spotify gets each once |
 | `spotify_id` | string, optional | the Spotify playlist's id, once it exists |
 
 `pending` means an earlier push may have made the playlist without
@@ -586,6 +788,7 @@ one: Spotify may have made the playlist, so the next push reports it as
     "playlists": { "enabled": true, "playlists": [] },
     "collection": { "enabled": true, "to_save": 5, "saved": 5, "skipped": 0 },
     "liked": { "enabled": true, "to_save": 12, "saved": 12, "skipped": 0 },
+    "most_played": { "enabled": true, "playlists": [] },
     "thumbs_down": { "enabled": false, "playlists": [] }
   }
 }
@@ -596,6 +799,7 @@ one: Spotify may have made the playlist, so the next push reports it as
 | Field | Type | Meaning |
 |---|---|---|
 | `profiles` | [Profile] | every known profile, or the one named by `--profile`; `[]` when there are none |
+| `youtube_api_key` | object, optional | `{ stored_at }` of the stored YouTube Data API key; never the key |
 
 A **Profile** is:
 
@@ -606,7 +810,11 @@ A **Profile** is:
 | `spotify_token` | object, optional | `{ stored_at, expires_at, scopes, missing_scopes }` of the stored Spotify token; never its values. `missing_scopes` lists the scopes this `sss` signs in with that the token was not granted — `[]` when none; a command that needs one fails with kind `auth` until the member runs `sss spotify auth` again |
 | `export.latest_run` | object, optional | `{ run_id, manifest }` of the newest run; `manifest` is `null` for a run that did not finish |
 | `export.latest_complete_run` | string, optional | the newest run whose manifest says `complete` |
-| `matches.tracks`, `matches.artists`, `matches.albums` | object | the count of each match status, over the latest entry per Pandora id |
+| `youtube.latest_run` | object, optional | `{ run_id, manifest }` of the newest `youtube import` run; `manifest` (an ImportManifest, as in `youtube import`) is `null` for a run that did not finish |
+| `youtube.latest_complete_run` | string, optional | the newest import run whose manifest says `complete` |
+| `youtube.videos`, `youtube.enriched`, `youtube.unknown` | number | videos in `videos.json`; of those, the ones the YouTube Data API has been asked about, and the ones of kind `unknown` |
+| `youtube.liked` | number | liked videos in `library.json`; 0 when the archive held no liked list (the text form says "no likes in this archive") |
+| `matches.tracks`, `matches.artists`, `matches.albums` | object | the count of each match status, over the latest entry per item id |
 
 ```json
 {
@@ -633,13 +841,22 @@ A **Profile** is:
         },
         "latest_complete_run": "20261013T180500Z"
       },
+      "youtube": {
+        "latest_run": null,
+        "latest_complete_run": null,
+        "videos": 0,
+        "enriched": 0,
+        "unknown": 0,
+        "liked": 0
+      },
       "matches": {
         "tracks": {},
         "artists": {},
         "albums": {}
       }
     }
-  ]
+  ],
+  "youtube_api_key": null
 }
 ```
 
@@ -663,9 +880,9 @@ Needs no data repository or profile and reads nothing.
 
 ### `report`
 
-Writes `profiles/<name>/report.md` from the normalized export, the match
-entries and `spotify/state.json`, without contacting any service, and
-reports where. Its match table counts the matches of each kind by method:
+Writes `profiles/<name>/report.md` from the normalized exports of both
+sources, the match entries and `spotify/state.json`, without contacting
+any service, and reports where. Its match table counts the matches of each kind by method:
 `isrc`, `exact`, `llm`, `manual` and `external`.
 
 | Field | Type | Meaning |
@@ -887,7 +1104,7 @@ after a short wait, and reports it.
 `sss play` takes any number of tracks, or one playlist, album or artist
 (URI, link or id; a bare id is a track); `--station NAME` plays the
 playlist `sss push` made for the export's station of that name;
-`--item TR:…` plays that track's stored candidates in stored order;
+`--item TR:…` (or `YV:…`) plays that track's stored candidates in stored order;
 with none of them it resumes. Only one of the three may be given; a
 station with no pushed playlist, an item with no stored candidates, or a
 target of the wrong type is kind `input`. `--shuffle`/`--no-shuffle` sets
@@ -981,16 +1198,16 @@ queued as well.
 | `auth` | no stored Pandora session or Spotify token, or the service refused it or the credential given to sign in | sign in again: `sss pandora auth` with a fresh token, or `sss spotify auth` |
 | `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again; a playback command whose `error` says Spotify may have applied it: run `sss player` first |
 | `quota` | Spotify's rate or quota limit, or `ccc`'s usage limit, was reached; everything done so far is recorded | run the command again later; it continues where it stopped |
-| `incomplete` | an export run ended with failed steps | look at `details.failed_steps`; the run is kept |
-| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, a `playlist` target that is not a playlist URI or link, an unknown device, station or item), or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
-| `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
+| `incomplete` | an export run ended with failed steps, or a `youtube import` run with failed steps or without the history | look at `details.failed_steps` and `details.manifest`; the run is kept |
+| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, a `playlist` target that is not a playlist URI or link, an unknown device, station or item), a `youtube import` directory that is not one, holds no Takeout files, holds the history only as HTML or one file twice, or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
+| `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, the profile has no export (`match`, `push`, `report`) or no Pandora export (`play --station`), or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
 | `player` | the Spotify player cannot take the command: no player open, several open and none active, Premium missing, or Spotify refused the control | relay the message, then run again |
 | `other` | anything else: a file that cannot be read or written, unparseable data | read `error` |
 
 ### Details
 
-`pandora export` gives `details` in two cases, `match answer` in one, and
-the playback commands in one.
+`pandora export` gives `details` in two cases, `youtube import` and `match
+answer` in one each, and the playback commands in one.
 
 - **The run ended with failed steps** (`kind` `incomplete`):
   `{ run_id, run_dir, failed_steps: [step name], manifest }`.
@@ -1009,6 +1226,12 @@ the playback commands in one.
     }
   }
   ```
+
+- **A `youtube import` run is not complete** (`kind` `incomplete`): the
+  same `{ run_id, run_dir, failed_steps, manifest }`, with an
+  ImportManifest. `failed_steps` is empty when the run is incomplete only
+  because the archive had no history; `manifest.steps.history.status` is
+  then `missing`.
 
 - **The run stopped part-way** (Pandora rejected the session, stopped
   answering, or a file could not be written): `{ run_id, run_dir }`, with
@@ -1031,7 +1254,7 @@ the playback commands in one.
 
 - **`match answer` refused the decisions document** (`kind` `input`):
   `{ problems: [{ item, problem }] }`, one per problem in document order;
-  `item` is the Pandora id concerned, `null` for the document as a whole,
+  `item` is the item id concerned, `null` for the document as a whole,
   and `problem` is the line as it appears in `error`. Nothing was recorded.
 
   ```json

@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::config::{self, Config};
-use crate::error::{self, ExportRun, Kind};
+use crate::error::{self, Kind, RunFailure};
 use crate::fail;
 use crate::guide::{self, GuideReport};
 use crate::input;
@@ -30,11 +30,16 @@ use crate::repo::{self, Repo};
 use crate::report::{self, ReportFile};
 use crate::search::{self, SearchReport};
 use crate::secrets::{StateDir, StateRoot};
+use crate::source::{Exports, Source};
 use crate::spotify;
 use crate::spotify::account::{self, TimeRange};
 use crate::spotify::ids::IdKind;
 use crate::spotify::playback::{Device, PlayerRefused, Repeat};
 use crate::status::{self, StatusReport};
+use crate::youtube::api as youtube_api;
+use crate::youtube::enrich::{self, ApiKeyReport, EnrichReport};
+use crate::youtube::model as youtube_model;
+use crate::youtube::takeout::{self, ImportIncomplete, ImportReport};
 
 /// Export a Pandora account to a local data repository and migrate it to
 /// Spotify.
@@ -66,6 +71,9 @@ pub enum Command {
     /// Pandora: session, export, normalization
     #[command(subcommand)]
     Pandora(PandoraCommand),
+    /// YouTube and YouTube Music: Google Takeout import
+    #[command(subcommand)]
+    Youtube(YoutubeCommand),
     /// Spotify: authorization
     #[command(subcommand)]
     Spotify(SpotifyCommand),
@@ -170,8 +178,8 @@ pub struct PlayArgs {
     #[arg(long, value_name = "NAME")]
     pub station: Option<String>,
 
-    /// Play the stored candidates of this Pandora track (TR:…), in order
-    #[arg(long, value_name = "TR:…")]
+    /// Play the stored candidates of this track item (TR:… or YV:…), in order
+    #[arg(long, value_name = "ITEM")]
     pub item: Option<String>,
 
     /// Turn shuffle on first; a playlist or album starts at a random track
@@ -310,6 +318,33 @@ pub enum PandoraCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum YoutubeCommand {
+    /// File an extracted Google Takeout archive as a new raw run; normalize
+    /// if complete
+    Import {
+        /// The directory the Takeout archive was extracted into
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
+    /// Re-derive the normalized files from every complete raw run
+    Normalize,
+    /// Verify and store the YouTube Data API key (pasted up to an empty
+    /// line, or --from-file); shared by every profile
+    ApiKey {
+        /// Read the key from a file instead of prompting: every line,
+        /// trimmed, joined
+        #[arg(long, value_name = "FILE")]
+        from_file: Option<PathBuf>,
+    },
+    /// Fetch Data API metadata for every video without it, then normalize
+    Enrich {
+        /// Ask about at most N videos this run
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SpotifyCommand {
     /// Authorize the profile's Spotify account: print the address to open,
     /// then, with --callback, take back the address the browser landed on
@@ -338,6 +373,10 @@ pub struct MatchArgs {
     /// Decide at most N items this run, then stop
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
+
+    /// Match only the items of this import source
+    #[arg(long, value_enum)]
+    pub source: Option<Source>,
 
     #[command(subcommand)]
     pub command: Option<MatchCommand>,
@@ -391,15 +430,15 @@ pub enum MatchCommand {
     },
     /// Record a manual match
     Set {
-        /// Pandora id (TR:…, AR:…, AL:…)
-        pandora_id: String,
+        /// Item id (TR:…, AR:…, CO:…, AL:…, YV:…, YC:…)
+        item_id: String,
         /// Spotify URL or URI
         spotify: String,
     },
     /// Record that an item has no Spotify counterpart
     Reject {
-        /// Pandora id (TR:…, AR:…, AL:…)
-        pandora_id: String,
+        /// Item id (TR:…, AR:…, CO:…, AL:…, YV:…, YC:…)
+        item_id: String,
     },
 }
 
@@ -412,6 +451,10 @@ pub struct PushArgs {
     /// Push only this part
     #[arg(long, value_enum)]
     pub only: Option<PushPart>,
+
+    /// Push only what this import source contributes
+    #[arg(long, value_enum)]
+    pub source: Option<Source>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -421,6 +464,7 @@ pub enum PushPart {
     Playlists,
     Collection,
     Liked,
+    MostPlayed,
     ThumbsDown,
 }
 
@@ -432,6 +476,7 @@ impl From<PushPart> for push::Part {
             PushPart::Playlists => push::Part::Playlists,
             PushPart::Collection => push::Part::Collection,
             PushPart::Liked => push::Part::Liked,
+            PushPart::MostPlayed => push::Part::MostPlayed,
             PushPart::ThumbsDown => push::Part::ThumbsDown,
         }
     }
@@ -457,7 +502,10 @@ config.toml                      settings (see the comments in it)
 profiles/<name>/
   pandora/raw/<run-id>/          every Pandora response, verbatim, plus manifest.json
   pandora/*.json                 normalized stations, playlists, collection, bookmarks, tracks
-  matches/*.jsonl                Pandora -> Spotify matches; the latest entry per id wins
+  youtube/raw/<run-id>/          every Google Takeout file read, verbatim, plus manifest.json
+  youtube/*.json                 normalized history, videos, playlists, subscriptions, library
+  youtube/api/NNNN-*.json        every YouTube Data API response, verbatim (`sss youtube enrich`)
+  matches/*.jsonl                Pandora and YouTube -> Spotify matches; the latest entry per id wins
   matches/llm/<session>.json     the full exchange of every LLM matching batch
   spotify/state.json             what has been created or saved on Spotify
   report.md                      the human-readable summary
@@ -472,6 +520,10 @@ impl Command {
             Command::Pandora(PandoraCommand::Auth { .. }) => "pandora auth",
             Command::Pandora(PandoraCommand::Export) => "pandora export",
             Command::Pandora(PandoraCommand::Normalize) => "pandora normalize",
+            Command::Youtube(YoutubeCommand::Import { .. }) => "youtube import",
+            Command::Youtube(YoutubeCommand::Normalize) => "youtube normalize",
+            Command::Youtube(YoutubeCommand::ApiKey { .. }) => "youtube api-key",
+            Command::Youtube(YoutubeCommand::Enrich { .. }) => "youtube enrich",
             Command::Spotify(SpotifyCommand::Auth { .. }) => "spotify auth",
             Command::Match(MatchArgs { command: None, .. }) => "match",
             Command::Match(MatchArgs {
@@ -534,11 +586,14 @@ impl Command {
 
     /// Whether the command acts on one profile and so needs `--profile` or a
     /// single known profile. `status` covers every profile when none is
-    /// named; `init` and `guide` act on none.
+    /// named; `init`, `guide` and `youtube api-key` act on none.
     fn needs_profile(&self) -> bool {
         !matches!(
             self,
-            Command::Init | Command::Status | Command::Guide { .. }
+            Command::Init
+                | Command::Status
+                | Command::Guide { .. }
+                | Command::Youtube(YoutubeCommand::ApiKey { .. })
         )
     }
 }
@@ -551,6 +606,10 @@ pub enum Output {
     PandoraAuth(AuthReport),
     PandoraExport(Box<ExportReport>),
     PandoraNormalize(Summary),
+    YoutubeImport(Box<ImportReport>),
+    YoutubeNormalize(youtube_model::Summary),
+    YoutubeApiKey(ApiKeyReport),
+    YoutubeEnrich(Box<EnrichReport>),
     SpotifyAuthStart(spotify::auth::AuthStartReport),
     SpotifyAuth(spotify::auth::AuthReport),
     Match(MatchReport),
@@ -580,6 +639,10 @@ impl Output {
             Output::PandoraAuth(r) => r.write_text(out),
             Output::PandoraExport(r) => r.write_text(out),
             Output::PandoraNormalize(r) => r.write_text(out),
+            Output::YoutubeImport(r) => r.write_text(out),
+            Output::YoutubeNormalize(r) => r.write_text(out),
+            Output::YoutubeApiKey(r) => r.write_text(out),
+            Output::YoutubeEnrich(r) => r.write_text(out),
             Output::SpotifyAuthStart(r) => r.write_text(out),
             Output::SpotifyAuth(r) => r.write_text(out),
             Output::Match(r) => r.write_text(out),
@@ -638,6 +701,12 @@ enum Details<'a> {
         failed_steps: Vec<&'static str>,
         manifest: &'a Manifest,
     },
+    ImportIncomplete {
+        run_id: &'a str,
+        run_dir: &'a Path,
+        failed_steps: Vec<&'static str>,
+        manifest: &'a takeout::Manifest,
+    },
     Stopped {
         run_id: &'a str,
         run_dir: &'a Path,
@@ -679,16 +748,22 @@ fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Result
     if !cli.json {
         return Ok(());
     }
-    let details = match error::export_run(err) {
-        Some(ExportRun::Stopped(s)) => Some(Details::Stopped {
+    let details = match error::run_failure(err) {
+        Some(RunFailure::Stopped(s)) => Some(Details::Stopped {
             run_id: &s.run_id,
             run_dir: &s.run_dir,
         }),
-        Some(ExportRun::Incomplete(i)) => Some(Details::Incomplete {
+        Some(RunFailure::Incomplete(i)) => Some(Details::Incomplete {
             run_id: &i.0.manifest.run_id,
             run_dir: &i.0.run_dir,
             failed_steps: i.failed_steps(),
             manifest: &i.0.manifest,
+        }),
+        Some(RunFailure::ImportIncomplete(i)) => Some(Details::ImportIncomplete {
+            run_id: &i.manifest.run_id,
+            run_dir: &i.run_dir,
+            failed_steps: i.failed_steps(),
+            manifest: &i.manifest,
         }),
         None => err.chain().find_map(|e| {
             if let Some(r) = e.downcast_ref::<DecisionsRefused>() {
@@ -816,6 +891,48 @@ fn dispatch(
         (Command::Pandora(PandoraCommand::Normalize), Some(name)) => Ok(Output::PandoraNormalize(
             model::normalize(&repo.profile(name)?)?,
         )),
+        (Command::Youtube(YoutubeCommand::Import { dir }), Some(name)) => {
+            let paths = repo.profile(name)?;
+            let imported = takeout::import(&paths, dir, err)?;
+            if !imported.manifest.complete {
+                return Err(anyhow::Error::new(ImportIncomplete {
+                    run_dir: imported.run_dir,
+                    manifest: imported.manifest,
+                }));
+            }
+            let normalized = youtube_model::normalize(&paths)?;
+            Ok(Output::YoutubeImport(Box::new(ImportReport {
+                profile: name.to_owned(),
+                run_id: imported.manifest.run_id.clone(),
+                run_dir: imported.run_dir,
+                manifest: imported.manifest,
+                normalized,
+            })))
+        }
+        (Command::Youtube(YoutubeCommand::Normalize), Some(name)) => Ok(Output::YoutubeNormalize(
+            youtube_model::normalize(&repo.profile(name)?)?,
+        )),
+        (Command::Youtube(YoutubeCommand::ApiKey { from_file }), _) => {
+            let key = input::read_value(from_file.as_deref(), input, err, enrich::PROMPT, "key")?;
+            let _ = writeln!(err, "Verifying the key with the YouTube Data API...");
+            Ok(Output::YoutubeApiKey(enrich::verify_and_store(
+                state_root,
+                &key,
+                youtube_api::Client::from_env,
+            )?))
+        }
+        (Command::Youtube(YoutubeCommand::Enrich { limit }), Some(name)) => {
+            let key = enrich::stored_key(state_root)?;
+            let mut client = youtube_api::Client::from_env(&key);
+            let progress: &mut dyn Write = if cli.json { err } else { out };
+            Ok(Output::YoutubeEnrich(Box::new(enrich::enrich(
+                name,
+                &repo.profile(name)?,
+                &mut client,
+                *limit,
+                progress,
+            )?)))
+        }
         (
             Command::Spotify(SpotifyCommand::Auth {
                 callback: false, ..
@@ -852,11 +969,15 @@ fn dispatch(
                 no_llm,
                 only,
                 limit,
+                source,
             }),
             Some(name),
         ) => {
             let paths = repo.profile(name)?;
-            let items = matching::select(&model::read(&paths)?, &config.push);
+            let mut items = matching::select(&Exports::load(name, &paths)?, &config);
+            if let Some(source) = source {
+                matching::retain_source(&mut items, *source);
+            }
             let state = state_root.profile(name)?;
             let connect = || spotify_client(name, &config, &repo, state);
             let options = matching::Options {
@@ -893,7 +1014,7 @@ fn dispatch(
             Some(name),
         ) => {
             let paths = repo.profile(name)?;
-            let items = matching::select(&model::read(&paths)?, &config.push);
+            let items = matching::select(&Exports::load(name, &paths)?, &config);
             Ok(Output::MatchReview(matching::review(
                 &crate::matching::model::read_all_latest(&paths)?,
                 &items,
@@ -908,7 +1029,7 @@ fn dispatch(
             Some(name),
         ) => {
             let paths = repo.profile(name)?;
-            let items = matching::select(&model::read(&paths)?, &config.push);
+            let items = matching::select(&Exports::load(name, &paths)?, &config);
             Ok(Output::MatchQuestions(matching::questions(
                 &crate::matching::model::read_all_latest(&paths)?,
                 &items,
@@ -926,39 +1047,45 @@ fn dispatch(
             let text =
                 input::read_value(from_file.as_deref(), input, err, ANSWER_PROMPT, "decisions")?;
             let paths = repo.profile(name)?;
-            let items = matching::select(&model::read(&paths)?, &config.push);
+            let items = matching::select(&Exports::load(name, &paths)?, &config);
             Ok(Output::MatchAnswer(matching::answer(
                 &paths, &items, &text, *limit,
             )?))
         }
         (
             Command::Match(MatchArgs {
-                command:
-                    Some(MatchCommand::Set {
-                        pandora_id,
-                        spotify,
-                    }),
+                command: Some(MatchCommand::Set { item_id, spotify }),
                 ..
             }),
             Some(name),
         ) => Ok(Output::MatchSet(matching::set(
             &repo.profile(name)?,
-            pandora_id,
+            item_id,
             spotify,
         )?)),
         (
             Command::Match(MatchArgs {
-                command: Some(MatchCommand::Reject { pandora_id }),
+                command: Some(MatchCommand::Reject { item_id }),
                 ..
             }),
             Some(name),
         ) => Ok(Output::MatchSet(matching::reject(
             &repo.profile(name)?,
-            pandora_id,
+            item_id,
         )?)),
-        (Command::Push(PushArgs { dry_run, only }), Some(name)) => {
+        (
+            Command::Push(PushArgs {
+                dry_run,
+                only,
+                source,
+            }),
+            Some(name),
+        ) => {
             let paths = repo.profile(name)?;
-            let export = model::read(&paths)?;
+            let mut exports = Exports::load(name, &paths)?;
+            if let Some(source) = source {
+                exports.retain_source(*source);
+            }
             let state = state_root.profile(name)?;
             let (config, repo) = (&config, &repo);
             let connect = move || spotify_client(name, config, repo, state);
@@ -969,8 +1096,8 @@ fn dispatch(
             let report = push::push(
                 name,
                 &paths,
-                &export,
-                &config.push,
+                &exports,
+                config,
                 options,
                 Box::new(connect),
                 &mut *err,
@@ -987,7 +1114,7 @@ fn dispatch(
         (Command::Report, Some(name)) => Ok(Output::Report(report::report(
             name,
             &repo.profile(name)?,
-            &config.push,
+            &config,
         )?)),
         (Command::Status, profile) => Ok(Output::Status(status::status(
             &repo, state_root, &config, profile,
@@ -1064,6 +1191,7 @@ fn player_command(
         Command::Player => Ok(Output::PlayerState(player::player(name, connect)?)),
         Command::Play(args) => {
             let source = player::resolve_source(
+                name,
                 &repo.profile(name)?,
                 &args.targets,
                 args.station.as_deref(),
@@ -1194,6 +1322,10 @@ mod tests {
         (&["pandora", "auth", "--from-file", "f"], "pandora auth"),
         (&["pandora", "export"], "pandora export"),
         (&["pandora", "normalize"], "pandora normalize"),
+        (&["youtube", "import", "d"], "youtube import"),
+        (&["youtube", "normalize"], "youtube normalize"),
+        (&["youtube", "api-key"], "youtube api-key"),
+        (&["youtube", "enrich"], "youtube enrich"),
         (&["spotify", "auth"], "spotify auth"),
         (&["spotify", "auth", "--callback"], "spotify auth"),
         (
@@ -1308,17 +1440,13 @@ mod tests {
         assert_eq!(only, Some(MatchKind::Artists));
 
         let Command::Match(MatchArgs {
-            command:
-                Some(MatchCommand::Set {
-                    pandora_id,
-                    spotify,
-                }),
+            command: Some(MatchCommand::Set { item_id, spotify }),
             ..
         }) = parse(&["match", "set", "TR:9", "https://open.spotify.com/track/x"]).command
         else {
             panic!("not match set")
         };
-        assert_eq!(pandora_id, "TR:9");
+        assert_eq!(item_id, "TR:9");
         assert_eq!(spotify, "https://open.spotify.com/track/x");
 
         let Command::Search(s) = parse(&["search", "a b", "c"]).command else {
@@ -1595,14 +1723,14 @@ mod tests {
             "{}",
             ran.error()
         );
-        assert_eq!(ran.kind(), Kind::Other);
+        assert_eq!(ran.kind(), Kind::Config);
         let ran = run_args(&["report", "--profile", "alice"]);
         assert!(
             ran.error().contains("run `sss pandora export`"),
             "{}",
             ran.error()
         );
-        assert_eq!(ran.kind(), Kind::Other);
+        assert_eq!(ran.kind(), Kind::Config);
         assert_eq!(ran.err, "", "an explicit profile is not announced");
 
         // One profile, known only from a session in the state root: the
@@ -1616,7 +1744,7 @@ mod tests {
         std::fs::create_dir_all(state_root.root().join("ccc/agents")).unwrap();
         let ran = run_args(&["report"]);
         assert!(
-            ran.error().contains("profiles/alice/pandora"),
+            ran.error().contains("no export for profile alice"),
             "{}",
             ran.error()
         );
@@ -1639,7 +1767,7 @@ mod tests {
         assert!(
             run_args(&["report", "--profile", "bob"])
                 .error()
-                .contains("profiles/bob/pandora")
+                .contains("no export for profile bob")
         );
     }
 
@@ -1691,26 +1819,34 @@ mod tests {
             ("pandora auth --from-file f", Some(Kind::Other)),
             ("pandora export", Some(Kind::Auth)),
             ("pandora normalize", Some(Kind::Other)),
+            ("youtube import d", Some(Kind::Input)),
+            ("youtube normalize", Some(Kind::Other)),
+            ("youtube api-key", Some(Kind::Input)),
+            ("youtube api-key --from-file f", Some(Kind::Other)),
+            ("youtube enrich", Some(Kind::Auth)),
             ("spotify auth", Some(Kind::Config)),
             ("spotify auth --callback", Some(Kind::Auth)),
             ("spotify auth --callback --from-file f", Some(Kind::Auth)),
-            ("match", Some(Kind::Other)),
-            ("match --no-llm --only artists", Some(Kind::Other)),
-            ("match --no-llm --limit 5", Some(Kind::Other)),
-            ("match review", Some(Kind::Other)),
-            ("match review --only tracks", Some(Kind::Other)),
-            ("match questions", Some(Kind::Other)),
-            ("match questions --only tracks --limit 5", Some(Kind::Other)),
+            ("match", Some(Kind::Config)),
+            ("match --no-llm --only artists", Some(Kind::Config)),
+            ("match --no-llm --limit 5", Some(Kind::Config)),
+            ("match review", Some(Kind::Config)),
+            ("match review --only tracks", Some(Kind::Config)),
+            ("match questions", Some(Kind::Config)),
+            (
+                "match questions --only tracks --limit 5",
+                Some(Kind::Config),
+            ),
             ("match answer", Some(Kind::Input)),
             ("match answer --from-file f --limit 1", Some(Kind::Other)),
             ("match set TR:1 spotify:track:x", Some(Kind::Input)),
             ("match reject TR:1", None),
-            ("push", Some(Kind::Other)),
-            ("push --dry-run --only liked", Some(Kind::Other)),
-            ("push --only artists", Some(Kind::Other)),
-            ("push --only thumbs-down", Some(Kind::Other)),
+            ("push", Some(Kind::Config)),
+            ("push --dry-run --only liked", Some(Kind::Config)),
+            ("push --only artists", Some(Kind::Config)),
+            ("push --only thumbs-down", Some(Kind::Config)),
             ("status", None),
-            ("report", Some(Kind::Other)),
+            ("report", Some(Kind::Config)),
             ("guide", None),
             ("guide matching", None),
             ("devices", Some(Kind::Config)),
@@ -1720,7 +1856,7 @@ mod tests {
                 "play spotify:track:4uLU6hMCjMI75M1A2tKUQC",
                 Some(Kind::Config),
             ),
-            ("play --station x", Some(Kind::Other)),
+            ("play --station x", Some(Kind::Config)),
             ("play --item TR:1", Some(Kind::Input)),
             ("pause", Some(Kind::Config)),
             ("next", Some(Kind::Config)),
@@ -1922,12 +2058,15 @@ mod tests {
         ran.result.as_ref().unwrap();
         assert_eq!(
             ran.document(),
-            serde_json::json!({"ok": true, "command": "status", "profiles": []})
+            serde_json::json!({
+                "ok": true, "command": "status", "profiles": [], "youtube_api_key": null
+            })
         );
         let ran = exec(&with_repo(&repo, &["status"]), &state_root, "");
         assert_eq!(
             ran.out,
-            "no profiles yet; run `sss pandora auth --profile NAME` first\n"
+            "no profiles yet; run `sss pandora auth --profile NAME` or `sss youtube import \
+             --profile NAME DIR` first\n"
         );
     }
 
@@ -2071,7 +2210,7 @@ mod tests {
         crate::matching::model::append(
             &paths.track_matches(),
             &MatchEntry {
-                pandora_id: "TR:1".into(),
+                item_id: "TR:1".into(),
                 status: Status::Ambiguous,
                 spotify_uri: None,
                 method: None,

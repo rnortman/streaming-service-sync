@@ -1,6 +1,6 @@
 //! Match entries and the `matches/*.jsonl` files that hold them.
 //!
-//! Each file is append-only; the latest entry per `pandora_id` is the
+//! Each file is append-only; the latest entry per `item_id` is the
 //! current decision for that item.
 
 use std::collections::BTreeMap;
@@ -167,7 +167,10 @@ pub struct Candidate {
 /// One line of a `matches/*.jsonl` file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchEntry {
-    pub pandora_id: String,
+    /// The source item id (`TR:…`, `YV:…`, …); files written before YouTube
+    /// items existed call it `pandora_id`.
+    #[serde(alias = "pandora_id")]
+    pub item_id: String,
     pub status: Status,
     #[serde(default)]
     pub spotify_uri: Option<String>,
@@ -191,9 +194,9 @@ pub struct MatchEntry {
 
 impl MatchEntry {
     /// A hand-set match: `matched`, method `manual`, confidence `high`.
-    pub fn manual_set(pandora_id: &str, spotify_uri: &str, decided_at: String) -> Self {
+    pub fn manual_set(item_id: &str, spotify_uri: &str, decided_at: String) -> Self {
         MatchEntry {
-            pandora_id: pandora_id.to_owned(),
+            item_id: item_id.to_owned(),
             status: Status::Matched,
             spotify_uri: Some(spotify_uri.to_owned()),
             method: Some(Method::Manual),
@@ -207,9 +210,9 @@ impl MatchEntry {
     }
 
     /// A hand rejection: `rejected`, method `manual`.
-    pub fn manual_reject(pandora_id: &str, decided_at: String) -> Self {
+    pub fn manual_reject(item_id: &str, decided_at: String) -> Self {
         MatchEntry {
-            pandora_id: pandora_id.to_owned(),
+            item_id: item_id.to_owned(),
             status: Status::Rejected,
             spotify_uri: None,
             method: Some(Method::Manual),
@@ -246,13 +249,13 @@ impl MatchEntry {
     }
 }
 
-/// The latest entry per `pandora_id` in the match file at `path`; an absent
+/// The latest entry per `item_id` in the match file at `path`; an absent
 /// file holds none.
 pub fn read_latest(path: &Path) -> Result<BTreeMap<String, MatchEntry>> {
-    repo::read_jsonl_latest(path, |e: &MatchEntry| e.pandora_id.clone())
+    repo::read_jsonl_latest(path, |e: &MatchEntry| e.item_id.clone())
 }
 
-/// The latest entry per `pandora_id` of every kind's match file.
+/// The latest entry per `item_id` of every kind's match file.
 pub fn read_all_latest(paths: &ProfilePaths) -> Result<ByKind<BTreeMap<String, MatchEntry>>> {
     let mut all = ByKind::default();
     for kind in IdKind::ALL {
@@ -274,7 +277,7 @@ mod tests {
 
     fn entry(id: &str, status: Status, method: Option<Method>) -> MatchEntry {
         MatchEntry {
-            pandora_id: id.into(),
+            item_id: id.into(),
             status,
             spotify_uri: None,
             method,
@@ -290,7 +293,7 @@ mod tests {
     #[test]
     fn an_entry_serializes_in_the_documented_shape() {
         let e = MatchEntry {
-            pandora_id: "TR:1".into(),
+            item_id: "TR:1".into(),
             status: Status::Matched,
             spotify_uri: Some("spotify:track:a".into()),
             method: Some(Method::Isrc),
@@ -316,7 +319,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "pandora_id": "TR:1", "status": "matched",
+                "item_id": "TR:1", "status": "matched",
                 "spotify_uri": "spotify:track:a", "method": "isrc",
                 "confidence": "high",
                 "candidates": [{"uri": "spotify:track:a", "name": "Song",
@@ -456,6 +459,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.status, Status::Rejected);
+        assert_eq!(e.item_id, "AR:1");
         assert!(e.candidates.is_empty());
+    }
+
+    #[test]
+    fn a_file_mixing_both_keys_reads_latest_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracks.jsonl");
+        std::fs::write(
+            &path,
+            "{\"pandora_id\":\"TR:1\",\"status\":\"ambiguous\",\"decided_at\":\"x\"}\n",
+        )
+        .unwrap();
+        append(&path, &entry("TR:1", Status::Unmatched, None)).unwrap();
+        append(&path, &entry("YV:dQw4w9WgXcQ", Status::Ambiguous, None)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"item_id\"").count(), 2, "{text}");
+        let latest = read_latest(&path).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest["TR:1"].status, Status::Unmatched);
+        assert_eq!(latest["YV:dQw4w9WgXcQ"].status, Status::Ambiguous);
     }
 }

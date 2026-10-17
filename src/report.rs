@@ -10,14 +10,18 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::config::PushConfig;
+use crate::config::{Config, PushConfig};
 use crate::matching::model::{self as matches, MatchEntry, Method, Status};
 use crate::matching::run::{self as matching, ReviewItem};
 use crate::pandora::export;
 use crate::pandora::model::{self, Normalized, SeedKind};
 use crate::push::{self, Ledger, Matches, NEVER_PUSHED_KINDS, Part, PlaylistEntry, Wanted};
 use crate::repo::{self, ProfilePaths};
+use crate::source::Exports;
 use crate::spotify::ids::{self, IdKind, SpotifyId};
+use crate::youtube::model as youtube_model;
+use crate::youtube::report as youtube_report;
+use crate::youtube::select as youtube_select;
 
 /// What `sss report` reports: the file it wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -32,25 +36,34 @@ impl ReportFile {
 }
 
 /// `sss report`: writes `report.md` of profile `profile` from its
-/// normalized export, its match entries and its push ledger.
-pub fn report(profile: &str, paths: &ProfilePaths, push: &PushConfig) -> Result<ReportFile> {
-    let export = model::read(paths)?;
+/// normalized exports, its match entries and its push ledger.
+pub fn report(profile: &str, paths: &ProfilePaths, config: &Config) -> Result<ReportFile> {
+    let exports = Exports::load(profile, paths)?;
     let run_id = export::latest_complete_run(paths)?.map(|m| m.run_id);
+    let youtube_runs = if exports.youtube.is_some() {
+        youtube_model::read_runs(paths)?
+    } else {
+        Vec::new()
+    };
     let matches = matches::read_all_latest(paths)?;
     let ledger = Ledger::load(&paths.spotify_state())?;
     // A track in the match set only as a thumbs-down belongs to the
     // thumbs-down section, never to the review list.
-    let reviewed = PushConfig {
-        thumbs_down_playlist: false,
-        ..push.clone()
+    let reviewed = Config {
+        push: PushConfig {
+            thumbs_down_playlist: false,
+            ..config.push.clone()
+        },
+        ..config.clone()
     };
-    let review = matching::review(&matches, &matching::select(&export, &reviewed), None);
+    let review = matching::review(&matches, &matching::select(&exports, &reviewed), None);
     let doc = Document {
         profile,
         paths,
-        push,
-        export: &export,
+        config,
+        exports: &exports,
         run_id: run_id.as_deref(),
+        youtube_runs: &youtube_runs,
         matches: &matches,
         ledger: &ledger,
         review: &review.items,
@@ -64,9 +77,12 @@ pub fn report(profile: &str, paths: &ProfilePaths, push: &PushConfig) -> Result<
 struct Document<'a> {
     profile: &'a str,
     paths: &'a ProfilePaths,
-    push: &'a PushConfig,
-    export: &'a Normalized,
+    config: &'a Config,
+    exports: &'a Exports,
+    /// The latest complete Pandora export run.
     run_id: Option<&'a str>,
+    /// The complete YouTube import runs, oldest archive first.
+    youtube_runs: &'a [String],
     matches: &'a Matches,
     ledger: &'a Ledger,
     review: &'a [ReviewItem],
@@ -74,7 +90,7 @@ struct Document<'a> {
 
 /// `text` safe to place in a Markdown line: characters Markdown would read
 /// as formatting are escaped and line breaks become spaces.
-fn md(text: &str) -> String {
+pub(crate) fn md(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -113,7 +129,7 @@ fn title_by(title: Option<&str>, artist: Option<&str>) -> String {
     text
 }
 
-fn line(out: &mut String, text: impl AsRef<str>) {
+pub(crate) fn line(out: &mut String, text: impl AsRef<str>) {
     out.push_str(text.as_ref());
     out.push('\n');
 }
@@ -121,10 +137,7 @@ fn line(out: &mut String, text: impl AsRef<str>) {
 impl Document<'_> {
     fn render(&self) -> String {
         let mut out = String::new();
-        line(
-            &mut out,
-            format!("# Pandora to Spotify: {}", md(self.profile)),
-        );
+        line(&mut out, format!("# {}: to Spotify", md(self.profile)));
         line(&mut out, "");
         line(
             &mut out,
@@ -138,19 +151,39 @@ impl Document<'_> {
             Self::thumbs_down,
             Self::without_counterpart,
             Self::not_pushed,
+            Self::youtube_not_pushed,
             Self::push_summary,
         ] {
-            line(&mut out, "");
-            section(self, &mut out);
+            // A section about a source the profile does not hold writes
+            // nothing and leaves no gap.
+            let mut text = String::new();
+            section(self, &mut text);
+            if !text.is_empty() {
+                line(&mut out, "");
+                out.push_str(&text);
+            }
         }
         out
     }
 
     fn export_summary(&self, out: &mut String) {
-        let e = self.export;
-        let s = model::summary(e, self.run_id.unwrap_or("unknown"));
         line(out, "## Export");
-        line(out, "");
+        if let Some(e) = &self.exports.pandora {
+            line(out, "");
+            line(out, "### Pandora");
+            line(out, "");
+            self.pandora_summary(e, out);
+        }
+        if let Some(e) = &self.exports.youtube {
+            line(out, "");
+            line(out, "### YouTube");
+            line(out, "");
+            youtube_report::export_summary(e, self.youtube_runs, &self.config.youtube, out);
+        }
+    }
+
+    fn pandora_summary(&self, e: &Normalized, out: &mut String) {
+        let s = model::summary(e, self.run_id.unwrap_or("unknown"));
         line(out, format!("- Latest complete export run: `{}`", s.run_id));
         let thumbprint = e.stations.iter().filter(|s| s.is_thumbprint).count();
         let shuffle = e.stations.iter().filter(|s| s.is_shuffle).count();
@@ -197,7 +230,7 @@ impl Document<'_> {
     }
 
     fn match_summary(&self, out: &mut String) {
-        let items = matching::select(self.export, self.push);
+        let items = matching::select(self.exports, self.config);
         line(out, "## Matches");
         line(out, "");
         line(
@@ -273,7 +306,7 @@ impl Document<'_> {
             let mut head = format!(
                 "- {} `{}`: {}",
                 title_by(item.title.as_deref(), item.artist.as_deref()),
-                item.pandora_id,
+                item.item_id,
                 item.status.as_str()
             );
             if let Some(c) = item.confidence {
@@ -283,8 +316,19 @@ impl Document<'_> {
             if let Some(album) = &item.album {
                 line(out, format!("  - Album: {}", md(album)));
             }
-            if let Some(track) = self.export.tracks.get(&item.pandora_id)
+            if let Some(track) = self
+                .exports
+                .pandora
+                .as_ref()
+                .and_then(|e| e.tracks.get(&item.item_id))
                 && let Some(d) = track.duration_s
+            {
+                line(out, format!("  - Length: {}:{:02}", d / 60, d % 60));
+            }
+            let video_id = youtube_select::video_id_of(&item.item_id);
+            if let Some(d) = video_id
+                .and_then(|id| self.exports.youtube.as_ref()?.videos.get(id))
+                .and_then(|v| v.duration_s)
             {
                 line(out, format!("  - Length: {}:{:02}", d / 60, d % 60));
             }
@@ -298,27 +342,33 @@ impl Document<'_> {
                 }
                 line(out, format!("  - Candidate: {text} (score {})", c.score));
             }
-            line(
-                out,
-                format!("  - {}", search_link("Search Spotify", &item.search_url)),
-            );
+            let mut links = search_link("Search Spotify", &item.search_url);
+            if let Some(id) = video_id {
+                links.push_str(&format!(
+                    " · [Watch on YouTube]({})",
+                    youtube_report::watch_url(id)
+                ));
+            }
+            line(out, format!("  - {links}"));
             line(
                 out,
                 format!(
                     "  - `sss match set --profile {p} {id} <spotify link>` or \
                      `sss match reject --profile {p} {id}`",
                     p = self.profile,
-                    id = item.pandora_id
+                    id = item.item_id
                 ),
             );
         }
     }
 
     fn thumbs_down(&self, out: &mut String) {
+        let Some(export) = &self.exports.pandora else {
+            return;
+        };
         line(out, "## Thumbs down");
         line(out, "");
-        let stations: Vec<_> = self
-            .export
+        let stations: Vec<_> = export
             .stations
             .iter()
             .filter(|s| s.feedback.iter().any(|f| !f.positive))
@@ -333,7 +383,7 @@ impl Document<'_> {
              your listening, find it with its search link, open its menu (⋯) and choose \
              \"Hide song\" where Spotify offers it, in a playlist or on a radio station.",
         );
-        if !self.push.thumbs_down_playlist {
+        if !self.config.push.thumbs_down_playlist {
             line(out, "");
             line(
                 out,
@@ -349,7 +399,7 @@ impl Document<'_> {
             line(out, "");
             for f in station.feedback.iter().filter(|f| !f.positive) {
                 let id = f.track_pandora_id.as_deref();
-                let track = id.and_then(|id| self.export.tracks.get(id));
+                let track = id.and_then(|id| export.tracks.get(id));
                 let title = track.and_then(|t| t.title.as_deref());
                 let artist = track.and_then(|t| t.artist.as_deref());
                 let mut text = format!(
@@ -369,10 +419,13 @@ impl Document<'_> {
     }
 
     fn without_counterpart(&self, out: &mut String) {
+        let Some(export) = &self.exports.pandora else {
+            return;
+        };
         line(out, "## Seeds without a Spotify counterpart");
         line(out, "");
         let mut lines = Vec::new();
-        for station in &self.export.stations {
+        for station in &export.stations {
             let station_name = md(station.name.as_deref().unwrap_or(&station.station_id));
             for seed in &station.seeds {
                 let seed_name = md(seed.name.as_deref().unwrap_or("unnamed"));
@@ -391,7 +444,7 @@ impl Document<'_> {
                         {
                             lines.push(format!(
                                 "- Artist {seed_name} `{}` (station {station_name}): {}",
-                                e.pandora_id,
+                                e.item_id,
                                 e.status.as_str()
                             ));
                         }
@@ -409,12 +462,15 @@ impl Document<'_> {
     }
 
     fn not_pushed(&self, out: &mut String) {
+        let Some(export) = &self.exports.pandora else {
+            return;
+        };
         line(out, "## Pandora playlists not pushed");
         line(out, "");
         let mut kinds: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        for p in &self.export.playlists {
+        for p in &export.playlists {
             if let Some(kind) = p.linked_type.as_deref()
-                && !push::playlist_is_pushed(p, self.push)
+                && !push::playlist_is_pushed(p, &self.config.push)
             {
                 let (playlists, tracks) = kinds.entry(kind).or_default();
                 *playlists += 1;
@@ -442,6 +498,33 @@ impl Document<'_> {
         }
     }
 
+    fn youtube_not_pushed(&self, out: &mut String) {
+        if let Some(e) = &self.exports.youtube {
+            youtube_report::not_pushed(e, self.matches, self.config, out);
+        }
+    }
+
+    /// The line under the "most played" playlist: the current top N beside
+    /// what the playlist holds.
+    fn most_played_line(&self, want: Option<&Wanted>, added: &HashSet<&str>, out: &mut String) {
+        let Some(e) = &self.exports.youtube else {
+            return;
+        };
+        let top = youtube_select::most_played(e, &self.config.youtube).len();
+        let matched = want.map_or(0, |w| w.uris.len());
+        let held = want.map_or(0, |w| {
+            w.uris.iter().filter(|u| added.contains(u.as_str())).count()
+        });
+        line(
+            out,
+            format!(
+                "  - Now the {} most played: {top} music videos, {matched} matched, {held} of \
+                 them added by sss; the playlist only grows, so it also keeps earlier entrants",
+                self.config.youtube.most_played
+            ),
+        );
+    }
+
     fn push_summary(&self, out: &mut String) {
         line(out, "## Push");
         line(out, "");
@@ -455,7 +538,7 @@ impl Document<'_> {
         }
         let wanted: BTreeMap<String, Wanted> = Part::ALL
             .into_iter()
-            .flat_map(|part| push::wanted_playlists(part, self.export, self.matches, self.push))
+            .flat_map(|part| push::wanted_playlists(part, self.exports, self.matches, self.config))
             .map(|w| (w.key.clone(), w))
             .collect();
         let mut pending = Vec::new();
@@ -491,6 +574,9 @@ impl Document<'_> {
                             items.len()
                         ),
                     );
+                    if key == youtube_select::MOST_PLAYED_KEY {
+                        self.most_played_line(want, &added, out);
+                    }
                 }
                 PlaylistEntry::Pending { name, at } => {
                     line(out, format!("- {} `{key}`: pending since {at}", md(name)));
@@ -570,6 +656,7 @@ mod tests {
     use crate::pandora::model::{Feedback, Playlist, Seed, Station, Track};
     use crate::push::LibraryEntry;
     use crate::repo::Repo;
+    use serde_json::Value;
 
     const AT: &str = "2026-10-15T00:00:00Z";
 
@@ -674,7 +761,7 @@ mod tests {
 
     fn entry(id: &str, status: Status, uri: Option<&str>) -> MatchEntry {
         MatchEntry {
-            pandora_id: id.into(),
+            item_id: id.into(),
             status,
             spotify_uri: uri.map(str::to_owned),
             method: Some(Method::Exact),
@@ -735,7 +822,11 @@ mod tests {
     }
 
     fn written(f: &Fixture, push: &PushConfig) -> String {
-        let report = report("alice", &f.paths, push).unwrap();
+        let config = Config {
+            push: push.clone(),
+            ..Config::default()
+        };
+        let report = report("alice", &f.paths, &config).unwrap();
         assert_eq!(report.path, f.paths.report());
         std::fs::read_to_string(&report.path).unwrap()
     }
@@ -754,7 +845,7 @@ mod tests {
     fn every_section_is_written_with_its_counts() {
         let f = fixture();
         let doc = written(&f, &PushConfig::default());
-        assert!(doc.starts_with("# Pandora to Spotify: alice\n"), "{doc}");
+        assert!(doc.starts_with("# alice: to Spotify\n"), "{doc}");
         let export = section(&doc, "Export");
         assert!(
             export.contains("- Latest complete export run: `unknown`"),
@@ -1042,7 +1133,7 @@ mod tests {
                 steps: export::Steps::default(),
                 complete,
             };
-            repo::write_json(&run.join(export::MANIFEST_FILE), &manifest).unwrap();
+            repo::write_json(&run.join(repo::MANIFEST_FILE), &manifest).unwrap();
         }
         let doc = written(&f, &PushConfig::default());
         assert!(
@@ -1052,12 +1143,102 @@ mod tests {
     }
 
     #[test]
-    fn no_export_is_an_error_naming_pandora_export() {
+    fn no_export_is_a_config_error_naming_pandora_export() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Repo::at(tmp.path()).profile("alice").unwrap();
-        let err = report("alice", &paths, &PushConfig::default()).unwrap_err();
+        let err = report("alice", &paths, &Config::default()).unwrap_err();
+        assert_eq!(crate::error::kind(&err), crate::error::Kind::Config);
         assert!(format!("{err:#}").contains("sss pandora export"), "{err:#}");
         assert!(!paths.report().exists());
+    }
+
+    /// A YouTube video of kind `song` from a Topic channel, played `plays`
+    /// times.
+    fn youtube_video(id: &str, title: &str, plays: u32, duration_s: Option<u32>) -> Value {
+        serde_json::json!({
+            "video_id": id, "title": title, "artists": ["The Band"], "album": null,
+            "duration_s": duration_s,
+            "channel": {"name": "The Band - Topic", "channel_id": null},
+            "kind": "song", "evidence": ["topic-channel"], "title_source": "history",
+            "youtube_title": title, "plays": plays, "music_app_plays": plays,
+            "removed": false, "first_played": "2026-01-01T00:00:00.000Z",
+            "last_played": "2026-01-02T00:00:00.000Z", "in_library": false,
+            "liked": false, "available": null, "category_id": null, "topics": []
+        })
+    }
+
+    #[test]
+    fn a_mixed_profile_reports_both_sources_youtube_links_and_the_most_played_top_n() {
+        let f = fixture();
+        let videos = serde_json::json!({
+            "calmCALM123": youtube_video("calmCALM123", "Calm Waters", 2, None),
+            "odd0ODD0123": youtube_video("odd0ODD0123", "Odd One", 1, Some(222)),
+        });
+        let youtube = youtube_model::Normalized {
+            videos: serde_json::from_value(videos).unwrap(),
+            ..youtube_model::Normalized::default()
+        };
+        youtube_model::write(&f.paths, &youtube).unwrap();
+        repo::write_json(&f.paths.youtube_runs(), &["20260101T000000Z"]).unwrap();
+        let tracks = f.paths.track_matches();
+        matches::append(
+            &tracks,
+            &entry("YV:calmCALM123", Status::Matched, Some(&uri("track", 'y'))),
+        )
+        .unwrap();
+        let mut ambiguous = entry("YV:odd0ODD0123", Status::Ambiguous, None);
+        ambiguous.method = None;
+        ambiguous.confidence = None;
+        matches::append(&tracks, &ambiguous).unwrap();
+        let mut ledger = Ledger::default();
+        ledger.playlists.insert(
+            youtube_select::MOST_PLAYED_KEY.into(),
+            PlaylistEntry::Created {
+                spotify_id: sid('m'),
+                snapshot_id: None,
+                name: Some("YouTube Music: most played".into()),
+                items: vec![uri("track", 'y')],
+                at: None,
+            },
+        );
+        ledger.save(&f.paths.spotify_state()).unwrap();
+
+        let doc = written(&f, &PushConfig::default());
+        let export = section(&doc, "Export");
+        assert!(export.contains("### Pandora\n"), "{export}");
+        assert!(
+            export.contains(
+                "### YouTube\n\n- Latest complete import run: `20260101T000000Z` (playlists, \
+                 library, subscriptions)\n"
+            ),
+            "{export}"
+        );
+        let human = section(&doc, "Needs a human");
+        assert!(
+            human.contains("- \"Odd One\" by The Band `YV:odd0ODD0123`: ambiguous\n"),
+            "{human}"
+        );
+        assert!(human.contains("  - Length: 3:42\n"), "{human}");
+        assert!(
+            human.contains(
+                "  - [Search Spotify](<https://open.spotify.com/search/Odd%20One%20The%20Band>) \
+                 · [Watch on YouTube](https://www.youtube.com/watch?v=odd0ODD0123)\n"
+            ),
+            "{human}"
+        );
+        assert!(
+            section(&doc, "YouTube playlists not pushed").contains("None."),
+            "{doc}"
+        );
+        let pushed = section(&doc, "Push");
+        assert!(
+            pushed.contains(
+                "`youtube:most-played`: 1 added by sss; 0 matched not added by sss (already \
+                 there, or for the next `sss push`)\n  - Now the 100 most played: 2 music \
+                 videos, 1 matched, 1 of them added by sss;"
+            ),
+            "{pushed}"
+        );
     }
 
     #[test]

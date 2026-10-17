@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::Value;
 use url::Url;
 
-use crate::config::PushConfig;
+use crate::config::{Config, PushConfig};
 use crate::error::Kind;
 use crate::fail;
 use crate::lazy::Lazy;
@@ -23,16 +24,19 @@ use crate::matching::score::{Decision, TrackItem};
 use crate::pandora::model::{Normalized, SeedKind, Track};
 use crate::push::playlist_is_pushed;
 use crate::repo::{self, ProfilePaths};
-use crate::spotify::ids::{self, IdKind};
+use crate::source::{Exports, Source};
+use crate::spotify::ids::{self, ITEM_ID_FORMS, IdKind};
+use crate::youtube;
 
-/// One Pandora item to match. `name` is a track's title, an artist's or an
+/// One source item to match. `name` is a track's title, an artist's or an
 /// album's name; `artist` is empty for an artist; `album`, `duration_s`,
-/// `explicit_hint`, `isrc` and `playlists` are a track's. `stations` and
-/// `context_titles` are what the LLM is told about where the item came
-/// from.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `explicit_hint`, `isrc` and `playlists` are a track's. `stations`,
+/// `context_titles` and `extra` are what the LLM is told about where the
+/// item came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
-    pub pandora_id: String,
+    pub item_id: String,
+    pub source: Source,
     pub name: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -46,6 +50,10 @@ pub struct Item {
     /// For an artist seed: up to [`CONTEXT_TITLES`] thumbed-up titles from
     /// its stations.
     pub context_titles: Vec<String>,
+    /// What the source alone knows of the item: for a YouTube video its own
+    /// title, channel, kind, plays, liked and library flags; for a YouTube
+    /// channel its own name. `null` for Pandora.
+    pub extra: Value,
 }
 
 /// How many thumbed-up titles an artist seed carries as context.
@@ -59,48 +67,88 @@ fn push_once(list: &mut Vec<String>, value: &str) {
 }
 
 impl Item {
+    /// The item `item_id` of `source`, every other field empty.
+    pub fn new(source: Source, item_id: &str) -> Self {
+        Item {
+            item_id: item_id.to_owned(),
+            source,
+            name: None,
+            artist: None,
+            album: None,
+            duration_s: None,
+            explicit_hint: false,
+            isrc: None,
+            stations: Vec::new(),
+            playlists: Vec::new(),
+            context_titles: Vec::new(),
+            extra: Value::Null,
+        }
+    }
+
     fn from_track(t: &Track) -> Self {
         Item {
-            pandora_id: t.pandora_id.clone(),
             name: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
             duration_s: t.duration_s,
             explicit_hint: t.explicit_hint,
             isrc: t.isrc.clone(),
-            ..Item::default()
+            ..Item::new(Source::Pandora, &t.pandora_id)
         }
     }
 
-    fn named(pandora_id: &str, name: Option<&String>, artist: Option<&String>) -> Self {
+    fn named(item_id: &str, name: Option<&String>, artist: Option<&String>) -> Self {
         Item {
-            pandora_id: pandora_id.to_owned(),
             name: name.cloned(),
             artist: artist.cloned(),
-            ..Item::default()
+            ..Item::new(Source::Pandora, item_id)
         }
     }
 }
 
-/// The items of each kind, keyed and ordered by Pandora id.
+/// The items of each kind, keyed and ordered by item id.
 pub type Items = ByKind<BTreeMap<String, Item>>;
 
 /// Inserts `item` unless its id is there already with a name.
 fn insert(map: &mut BTreeMap<String, Item>, item: Item) {
-    match map.get(&item.pandora_id) {
+    match map.get(&item.item_id) {
         Some(have) if have.name.is_some() => {}
         _ => {
-            map.insert(item.pandora_id.clone(), item);
+            map.insert(item.item_id.clone(), item);
         }
     }
 }
 
-/// Every item push would send: the tracks of thumbs-up, track seeds,
-/// pushed playlists, the collection and bookmarks (thumbs-down tracks only
-/// with `[push] thumbs_down_playlist`); artist seeds and collection
-/// artists; collection and bookmarked albums. A track missing from
-/// `tracks.json` takes its title and artist from its bookmark.
-pub fn select(export: &Normalized, push: &PushConfig) -> Items {
+/// Every item push would send, from every source `exports` holds. Item
+/// ids never collide across sources: each source has its own prefixes.
+pub fn select(exports: &Exports, config: &Config) -> Items {
+    let mut items = exports
+        .pandora
+        .as_ref()
+        .map(|export| select_pandora(export, &config.push))
+        .unwrap_or_default();
+    if let Some(export) = &exports.youtube {
+        let youtube = youtube::select::items(export, &config.youtube);
+        items.tracks.extend(youtube.tracks);
+        items.artists.extend(youtube.artists);
+        items.albums.extend(youtube.albums);
+    }
+    items
+}
+
+/// Keeps only the items of `source`.
+pub fn retain_source(items: &mut Items, source: Source) {
+    for kind in IdKind::ALL {
+        items.of_mut(kind).retain(|_, item| item.source == source);
+    }
+}
+
+/// Every Pandora item push would send: the tracks of thumbs-up, track
+/// seeds, pushed playlists, the collection and bookmarks (thumbs-down
+/// tracks only with `[push] thumbs_down_playlist`); artist seeds and
+/// collection artists; collection and bookmarked albums. A track missing
+/// from `tracks.json` takes its title and artist from its bookmark.
+pub fn select_pandora(export: &Normalized, push: &PushConfig) -> Items {
     let mut track_ids: Vec<&str> = Vec::new();
     let mut artists = BTreeMap::new();
     for station in &export.stations {
@@ -267,8 +315,8 @@ impl KindReport {
             *self.by_method.entry(m).or_default() += 1;
         }
         match entry.status {
-            Status::Unmatched => self.unmatched_ids.push(entry.pandora_id.clone()),
-            Status::LlmFailed => self.llm_failed_ids.push(entry.pandora_id.clone()),
+            Status::Unmatched => self.unmatched_ids.push(entry.item_id.clone()),
+            Status::LlmFailed => self.llm_failed_ids.push(entry.item_id.clone()),
             _ => {}
         }
     }
@@ -346,7 +394,7 @@ pub type ConnectMatcher<'a> = Box<dyn FnOnce() -> Result<Box<dyn Matcher + 'a>> 
 /// The entry an item with no name (or a track with no artist) gets.
 fn nameless(item: &Item, kind: IdKind, at: String) -> MatchEntry {
     MatchEntry {
-        pandora_id: item.pandora_id.clone(),
+        item_id: item.item_id.clone(),
         status: Status::Unmatched,
         spotify_uri: None,
         method: None,
@@ -379,7 +427,7 @@ fn decided(item: &Item, found: Found, at: String) -> MatchEntry {
         Decision::Unmatched => (Status::Unmatched, None, None, None),
     };
     MatchEntry {
-        pandora_id: item.pandora_id.clone(),
+        item_id: item.item_id.clone(),
         status,
         spotify_uri: uri,
         method,
@@ -444,7 +492,7 @@ fn llm_entry(
         Err(why) => (Status::LlmFailed, None, None, None, Some(why.to_owned())),
     };
     MatchEntry {
-        pandora_id: prior.pandora_id.clone(),
+        item_id: prior.item_id.clone(),
         status,
         spotify_uri: uri,
         method,
@@ -514,7 +562,7 @@ pub fn run<S: Search>(
         let latest = model::read_latest(&file)?;
         let mut queue: Vec<(&Item, MatchEntry)> = Vec::new();
         for item in items.of(kind).values() {
-            let stored = match latest.get(&item.pandora_id) {
+            let stored = match latest.get(&item.item_id) {
                 None => None,
                 Some(e) if llm && e.awaits_llm() => Some(e.clone()),
                 Some(_) => continue,
@@ -586,7 +634,7 @@ fn flush<S, F: FnOnce() -> Result<S>>(
     report.kinds.of_mut(kind).llm_batches += 1;
     for (item, prior) in queue.drain(..) {
         let decision = match &verdict {
-            Verdict::Decided(all) => match all.iter().find(|d| d.item == item.pandora_id) {
+            Verdict::Decided(all) => match all.iter().find(|d| d.item == item.item_id) {
                 Some(d) => Ok(d),
                 None => Err("the LLM gave no decision"),
             },
@@ -608,7 +656,7 @@ fn flush<S, F: FnOnce() -> Result<S>>(
 
 /// `track TR:1 "Song" by Artist: matched (isrc)`.
 fn progress_line(kind: IdKind, item: &Item, entry: &MatchEntry) -> String {
-    let mut line = format!("{} {}", kind.as_str(), item.pandora_id);
+    let mut line = format!("{} {}", kind.as_str(), item.item_id);
     if let Some(name) = &item.name {
         line.push_str(&format!(" {name:?}"));
     }
@@ -631,7 +679,7 @@ pub const REVIEW_CANDIDATES: usize = 3;
 /// One item `match review` lists.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReviewItem {
-    pub pandora_id: String,
+    pub item_id: String,
     pub kind: IdKind,
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -654,7 +702,7 @@ impl ReviewReport {
             return writeln!(out, "nothing to review");
         }
         for item in &self.items {
-            let mut head = format!("{} {}", item.pandora_id, item.status.as_str());
+            let mut head = format!("{} {}", item.item_id, item.status.as_str());
             if let Some(c) = item.confidence {
                 head.push_str(&format!(" ({} confidence)", c.as_str()));
             }
@@ -724,7 +772,7 @@ pub fn review(
             };
             out.push(ReviewItem {
                 search_url: search_url(item.name.as_deref(), item.artist.as_deref()),
-                pandora_id: id.clone(),
+                item_id: id.clone(),
                 kind,
                 title: item.name,
                 artist: item.artist,
@@ -752,38 +800,38 @@ pub struct MatchSetReport {
 impl MatchSetReport {
     pub fn write_text(&self, out: &mut dyn Write) -> io::Result<()> {
         match self.entry.matched_uri() {
-            Some(uri) => writeln!(out, "{} matched to {uri} (manual)", self.entry.pandora_id),
-            None => writeln!(out, "{} rejected (manual)", self.entry.pandora_id),
+            Some(uri) => writeln!(out, "{} matched to {uri} (manual)", self.entry.item_id),
+            None => writeln!(out, "{} rejected (manual)", self.entry.item_id),
         }
     }
 }
 
-/// The match file of the kind `pandora_id`'s prefix names; any other
+/// The match file of the kind `item_id`'s prefix names; any other
 /// prefix is kind `input`.
-fn file_for(paths: &ProfilePaths, pandora_id: &str) -> Result<PathBuf> {
-    match IdKind::of_pandora_id(pandora_id) {
+fn file_for(paths: &ProfilePaths, item_id: &str) -> Result<PathBuf> {
+    match IdKind::of_item_id(item_id) {
         Some(k) => Ok(model::file(paths, k)),
         None => fail!(
             Kind::Input,
-            "{pandora_id:?} is not a Pandora track, artist or album id (TR:…, AR:…, CO:…, AL:…)"
+            "{item_id:?} is not an item id ({ITEM_ID_FORMS})"
         ),
     }
 }
 
 /// `sss match set`: records `spotify` (a URI, address or bare id of the
-/// kind the Pandora id calls for) as the item's match, by hand.
-pub fn set(paths: &ProfilePaths, pandora_id: &str, spotify: &str) -> Result<MatchSetReport> {
-    let file = file_for(paths, pandora_id)?;
-    let id = ids::parse_for(pandora_id, spotify)?;
-    let entry = MatchEntry::manual_set(pandora_id, &id.uri(), repo::now_rfc3339()?);
+/// kind the item id calls for) as the item's match, by hand.
+pub fn set(paths: &ProfilePaths, item_id: &str, spotify: &str) -> Result<MatchSetReport> {
+    let file = file_for(paths, item_id)?;
+    let id = ids::parse_for(item_id, spotify)?;
+    let entry = MatchEntry::manual_set(item_id, &id.uri(), repo::now_rfc3339()?);
     model::append(&file, &entry)?;
     Ok(MatchSetReport { entry })
 }
 
 /// `sss match reject`: records that the item has no Spotify counterpart.
-pub fn reject(paths: &ProfilePaths, pandora_id: &str) -> Result<MatchSetReport> {
-    let file = file_for(paths, pandora_id)?;
-    let entry = MatchEntry::manual_reject(pandora_id, repo::now_rfc3339()?);
+pub fn reject(paths: &ProfilePaths, item_id: &str) -> Result<MatchSetReport> {
+    let file = file_for(paths, item_id)?;
+    let entry = MatchEntry::manual_reject(item_id, repo::now_rfc3339()?);
     model::append(&file, &entry)?;
     Ok(MatchSetReport { entry })
 }
@@ -826,7 +874,7 @@ pub fn questions(
         }
         let entries = latest.of(kind);
         for item in items.of(kind).values() {
-            let Some(entry) = entries.get(&item.pandora_id).filter(|e| e.awaits_llm()) else {
+            let Some(entry) = entries.get(&item.item_id).filter(|e| e.awaits_llm()) else {
                 continue;
             };
             if limit.is_some_and(|n| report.items.len() >= n) {
@@ -862,19 +910,19 @@ impl std::fmt::Display for DecisionsRefused {
 
 impl std::error::Error for DecisionsRefused {}
 
-/// Why `pandora_id` has no open question, given the latest entries and the
+/// Why `item_id` has no open question, given the latest entries and the
 /// item set: the line a decision for it is refused with.
 fn no_open_question(
     latest: &ByKind<BTreeMap<String, MatchEntry>>,
     items: &Items,
-    pandora_id: &str,
+    item_id: &str,
 ) -> String {
-    let why = match IdKind::of_pandora_id(pandora_id) {
-        None => "it is not a Pandora track, artist or album id (TR:…, AR:…, CO:…, AL:…)".into(),
-        Some(kind) if !items.of(kind).contains_key(pandora_id) => {
+    let why = match IdKind::of_item_id(item_id) {
+        None => format!("it is not an item id ({ITEM_ID_FORMS})"),
+        Some(kind) if !items.of(kind).contains_key(item_id) => {
             "it is not among the items push would send".into()
         }
-        Some(kind) => match latest.of(kind).get(pandora_id) {
+        Some(kind) => match latest.of(kind).get(item_id) {
             None => "it has not been searched yet; run sss match --no-llm".into(),
             Some(e) => {
                 let mut why = format!("its latest entry is {}", e.status.as_str());
@@ -885,7 +933,7 @@ fn no_open_question(
             }
         },
     };
-    format!("item {pandora_id:?} has no open question ({why})")
+    format!("item {item_id:?} has no open question ({why})")
 }
 
 /// One decision `sss match answer` recorded.
@@ -977,7 +1025,7 @@ pub fn answer(
         model::append(&model::file(paths, kind), &entry)
             .with_context(|| format!("recording the decision for {}", d.item))?;
         report.recorded.push(Recorded {
-            item: entry.pandora_id,
+            item: entry.item_id,
             status: entry.status,
             spotify_uri: entry.spotify_uri,
             confidence: entry.confidence,
@@ -1128,7 +1176,7 @@ mod tests {
 
     #[test]
     fn the_item_set_is_what_push_would_send() {
-        let items = select(&export(), &PushConfig::default());
+        let items = select_pandora(&export(), &PushConfig::default());
         assert_eq!(
             ids(&items.tracks),
             ["TR:1", "TR:3", "TR:4", "TR:5", "TR:8", "TR:9"],
@@ -1155,12 +1203,74 @@ mod tests {
             ..PushConfig::default()
         };
         assert_eq!(
-            ids(&select(&export(), &all).tracks),
+            ids(&select_pandora(&export(), &all).tracks),
             [
                 "TR:1", "TR:2", "TR:3", "TR:4", "TR:5", "TR:6", "TR:8", "TR:9"
             ],
             "StationThumbs is never pushed"
         );
+    }
+
+    /// A YouTube export with one played Topic song and one subscribed
+    /// VEVO channel.
+    fn youtube_export() -> youtube::model::Normalized {
+        let video: youtube::model::Video = serde_json::from_value(serde_json::json!({
+            "video_id": "abcDEF12345", "title": "Song", "artists": ["Band"], "album": null,
+            "duration_s": null,
+            "channel": {"name": "Band - Topic", "channel_id": "UCtopic"},
+            "kind": "song", "evidence": ["topic-channel"], "title_source": "history",
+            "youtube_title": "Song", "plays": 3, "music_app_plays": 3, "removed": false,
+            "first_played": "2024-01-01T00:00:00.000Z", "last_played": "2024-01-02T00:00:00.000Z",
+            "in_library": false, "liked": false, "available": null, "category_id": null,
+            "topics": []
+        }))
+        .unwrap();
+        let channel: youtube::model::Channel = serde_json::from_value(serde_json::json!({
+            "channel_id": "UCvevo", "name": "BandVEVO", "url": null, "kind": "artist",
+            "evidence": ["vevo-channel"], "music_videos": 0
+        }))
+        .unwrap();
+        youtube::model::Normalized {
+            videos: [(video.video_id.clone(), video)].into(),
+            subscriptions: vec![channel],
+            ..youtube::model::Normalized::default()
+        }
+    }
+
+    #[test]
+    fn select_merges_both_sources_and_retain_source_keeps_one() {
+        let exports = Exports {
+            pandora: Some(export()),
+            youtube: Some(youtube_export()),
+        };
+        let mut items = select(&exports, &Config::default());
+        assert_eq!(
+            ids(&items.tracks),
+            [
+                "TR:1",
+                "TR:3",
+                "TR:4",
+                "TR:5",
+                "TR:8",
+                "TR:9",
+                "YV:abcDEF12345"
+            ]
+        );
+        assert_eq!(ids(&items.artists), ["AR:1", "AR:2", "CO:1", "YC:UCvevo"]);
+        assert_eq!(items.tracks["YV:abcDEF12345"].source, Source::Youtube);
+
+        let mut config = Config::default();
+        config.youtube.most_played = 0;
+        assert!(
+            !select(&exports, &config)
+                .tracks
+                .contains_key("YV:abcDEF12345")
+        );
+
+        retain_source(&mut items, Source::Youtube);
+        assert_eq!(ids(&items.tracks), ["YV:abcDEF12345"]);
+        assert_eq!(ids(&items.artists), ["YC:UCvevo"]);
+        assert!(items.albums.is_empty());
     }
 
     fn found_track(uri: &str, name: &str) -> FoundTrack {
@@ -1183,7 +1293,7 @@ mod tests {
 
     fn entry(id: &str, status: Status) -> MatchEntry {
         MatchEntry {
-            pandora_id: id.into(),
+            item_id: id.into(),
             status,
             spotify_uri: None,
             method: None,
@@ -1202,12 +1312,11 @@ mod tests {
             items.tracks.insert(
                 (*id).into(),
                 Item {
-                    pandora_id: (*id).into(),
                     name: title.map(Into::into),
                     artist: Some("The Band".into()),
                     album: Some("Record".into()),
                     duration_s: Some(200),
-                    ..Item::default()
+                    ..Item::new(Source::Pandora, id)
                 },
             );
         }
@@ -1448,16 +1557,15 @@ mod tests {
         items.albums.insert(
             "AL:1".into(),
             Item {
-                pandora_id: "AL:1".into(),
                 name: Some("Record".into()),
                 artist: Some("The Band".into()),
-                ..Item::default()
+                ..Item::new(Source::Pandora, "AL:1")
             },
         );
 
         let latest = model::read_all_latest(&paths).unwrap();
         let report = review(&latest, &items, None);
-        let listed: Vec<&str> = report.items.iter().map(|i| i.pandora_id.as_str()).collect();
+        let listed: Vec<&str> = report.items.iter().map(|i| i.item_id.as_str()).collect();
         assert_eq!(
             listed,
             ["TR:1", "TR:2", "AL:1"],
@@ -1707,7 +1815,7 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|e| e.pandora_id == "TR:1")
+                .filter(|e| e.item_id == "TR:1")
                 .map(|e| e.status)
                 .collect::<Vec<_>>(),
             [Status::Ambiguous, Status::Matched]
@@ -1867,7 +1975,7 @@ mod tests {
             )
         );
         assert!(all.items[1].candidates.is_empty());
-        let nine = &all.items[2].pandora;
+        let nine = &all.items[2].record;
         assert_eq!(
             (&nine["album"], &nine["duration_s"]),
             (&serde_json::Value::Null, &serde_json::Value::Null),
@@ -2000,7 +2108,7 @@ mod tests {
             review(&all, &items, Some(IdKind::Track))
                 .items
                 .iter()
-                .map(|i| i.pandora_id.as_str())
+                .map(|i| i.item_id.as_str())
                 .collect::<Vec<_>>(),
             ["TR:2"],
             "an external unmatched decision stays in review"
@@ -2114,7 +2222,7 @@ mod tests {
             ("TR:8", "it is not among the items push would send"),
             (
                 "ST:1",
-                "it is not a Pandora track, artist or album id (TR:…, AR:…, CO:…, AL:…)",
+                "it is not an item id (TR:…, AR:…, CO:…, AL:…, YV:…, YC:…)",
             ),
         ] {
             let err = answer(&paths, &items, &decision(id), None).unwrap_err();

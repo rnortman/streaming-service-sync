@@ -59,6 +59,7 @@ mod tests {
     use super::*;
     use crate::error::Kind;
     use crate::matching::llm::{self, BatchItem, Completeness};
+    use crate::source::Source;
     use crate::spotify::ids::IdKind;
     use crate::spotify::item::Offered;
     use serde_json::Value;
@@ -84,7 +85,10 @@ mod tests {
     #[test]
     fn the_protocol_holds_the_matcher_rules_verbatim() {
         let body = agent_body();
-        assert!(body.starts_with("You match Pandora records"), "{body}");
+        assert!(
+            body.starts_with("You match source records — from Pandora or YouTube Music"),
+            "{body}"
+        );
         assert!(
             MATCHING.contains(body),
             "docs/matching-protocol.md does not contain the body of \
@@ -172,7 +176,8 @@ mod tests {
                     "album" => IdKind::Album,
                     other => panic!("kind {other}"),
                 },
-                pandora: i["pandora"].clone(),
+                source: serde_json::from_value(i["source"].clone()).expect("source"),
+                record: i["record"].clone(),
                 candidates: i["candidates"]
                     .as_array()
                     .expect("candidates")
@@ -202,12 +207,13 @@ mod tests {
         assert_eq!(blocks.len(), 2, "the example is a questions and an answer");
         let questions: Value = serde_json::from_str(&blocks[0]).unwrap();
         let offered = batch_items(&questions);
-        assert_eq!(offered.len(), 2);
+        assert_eq!(offered.len(), 3);
+        assert!(offered.iter().any(|i| i.source == Source::Youtube));
         let decisions = llm::parse_decisions(&blocks[1], &offered, Completeness::Any, |id| {
             format!("{id} is not in the example")
         })
         .unwrap_or_else(|p| panic!("{p:?}"));
-        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions.len(), 3);
         assert!(decisions.iter().any(|d| d.choice.is_none()));
         assert!(decisions.iter().any(|d| d.choice.is_some()));
     }

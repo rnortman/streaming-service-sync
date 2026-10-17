@@ -1,11 +1,14 @@
 //! The HTTP transport the service clients share: the agent, request
 //! pacing, a reply read whatever its status, base URLs taken from the
-//! environment, and the stderr warning line. Retry policy is each client's.
+//! environment, the verbatim form a recorded body is stored in, and the
+//! stderr warning line. Retry policy is each client's.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// How long one request may take, connect to last byte.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
@@ -88,6 +91,18 @@ pub fn read(result: Result<ureq::Response, ureq::Error>) -> Result<Reply> {
     })
 }
 
+/// `body` parsed, when it is JSON, and the form it is recorded in: the body
+/// verbatim when it is JSON, else the body as a JSON string.
+pub fn stored_body(body: &str) -> Result<(Option<Value>, Box<RawValue>)> {
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let stored = match parsed {
+        Some(_) => RawValue::from_string(body.trim().to_owned()),
+        None => serde_json::value::to_raw_value(body),
+    }
+    .context("storing the response")?;
+    Ok((parsed, stored))
+}
+
 /// Writes `line` to stderr; a failed write is ignored.
 pub fn print_warning(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
@@ -124,6 +139,16 @@ mod tests {
         assert_eq!(reply.status, 429);
         assert_eq!(reply.retry_after.as_deref(), Some("7"));
         assert_eq!(reply.body, "no \u{fffd}");
+    }
+
+    #[test]
+    fn a_json_body_is_stored_verbatim_and_any_other_as_a_string() {
+        let (parsed, stored) = stored_body(" {\"a\": [1, 2]}\n").unwrap();
+        assert_eq!(parsed, Some(serde_json::json!({"a": [1, 2]})));
+        assert_eq!(stored.get(), "{\"a\": [1, 2]}");
+        let (parsed, stored) = stored_body("<html>busy</html>").unwrap();
+        assert_eq!(parsed, None);
+        assert_eq!(stored.get(), "\"<html>busy</html>\"");
     }
 
     #[test]

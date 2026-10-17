@@ -11,9 +11,8 @@ use url::Url;
 
 use crate::error::Kind;
 use crate::fail;
-use crate::pandora;
 
-/// The kinds of Spotify entity a Pandora item is matched to, in the order
+/// The kinds of Spotify entity a source item is matched to, in the order
 /// a matching run takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,12 +52,14 @@ impl IdKind {
         }
     }
 
-    /// The kind a Pandora id is matched to, from its prefix: `TR:` a track,
-    /// `AR:` and `CO:` (a composer) an artist, `AL:` an album.
-    pub fn of_pandora_id(pandora_id: &str) -> Option<Self> {
-        match pandora::model::id_type(pandora_id)? {
-            "TR" => Some(IdKind::Track),
-            "AR" | "CO" => Some(IdKind::Artist),
+    /// The kind a source item id is matched to, from its prefix: Pandora's
+    /// `TR:` a track, `AR:` and `CO:` (a composer) an artist, `AL:` an
+    /// album; YouTube's `YV:` (a video) a track, `YC:` (a channel) an
+    /// artist.
+    pub fn of_item_id(item_id: &str) -> Option<Self> {
+        match item_id_type(item_id)? {
+            "TR" | "YV" => Some(IdKind::Track),
+            "AR" | "CO" | "YC" => Some(IdKind::Artist),
             "AL" => Some(IdKind::Album),
             _ => None,
         }
@@ -69,6 +70,17 @@ impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The prefixes [`IdKind::of_item_id`] accepts, as refusals name them.
+pub const ITEM_ID_FORMS: &str = "TR:…, AR:…, CO:…, AL:…, YV:…, YC:…";
+
+/// `TR` for `TR:123`: two uppercase letters, a colon and a non-empty
+/// rest.
+pub fn item_id_type(id: &str) -> Option<&str> {
+    let (kind, rest) = id.split_once(':')?;
+    (kind.len() == 2 && kind.bytes().all(|b| b.is_ascii_uppercase()) && !rest.is_empty())
+        .then_some(kind)
 }
 
 /// A typed Spotify id.
@@ -255,20 +267,20 @@ pub fn parse_target(text: &str) -> Result<Target> {
     }
 }
 
-/// Parses `text` (as [`parse`]) as the Spotify counterpart of `pandora_id`:
-/// its kind must be the one the Pandora prefix calls for.
-pub fn parse_for(pandora_id: &str, text: &str) -> Result<SpotifyId> {
-    let Some(wanted) = IdKind::of_pandora_id(pandora_id) else {
+/// Parses `text` (as [`parse`]) as the Spotify counterpart of `item_id`:
+/// its kind must be the one the item id's prefix calls for.
+pub fn parse_for(item_id: &str, text: &str) -> Result<SpotifyId> {
+    let Some(wanted) = IdKind::of_item_id(item_id) else {
         fail!(
             Kind::Input,
-            "{pandora_id:?} is not a Pandora track (TR:), artist (AR:, CO:) or album (AL:) id"
+            "{item_id:?} is not an item id ({ITEM_ID_FORMS})"
         );
     };
     let (kind, id) = parse(text)?;
     match kind {
         Some(kind) if kind != wanted => fail!(
             Kind::Input,
-            "{pandora_id} is a Pandora {wanted} but {text:?} is a Spotify {kind}"
+            "{item_id} is an item matched to a {wanted} but {text:?} is a Spotify {kind}"
         ),
         _ => Ok(SpotifyId { kind: wanted, id }),
     }
@@ -347,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pandora_prefix_fixes_the_kind() {
+    fn the_item_prefix_fixes_the_kind() {
         assert_eq!(
             parse_for("TR:1", &format!("https://open.spotify.com/track/{ID}?si=x")).unwrap(),
             SpotifyId {
@@ -356,6 +368,8 @@ mod tests {
             }
         );
         assert_eq!(parse_for("CO:9", ID).unwrap().kind, IdKind::Artist);
+        assert_eq!(parse_for("YV:abcDEF-_123", ID).unwrap().kind, IdKind::Track);
+        assert_eq!(parse_for("YC:UC1", ID).unwrap().kind, IdKind::Artist);
         assert_eq!(
             parse_for("AL:2", ID).unwrap().uri(),
             format!("spotify:album:{ID}")
@@ -363,13 +377,35 @@ mod tests {
         let err = parse_for("TR:1", &format!("spotify:album:{ID}")).unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Input);
         assert!(
-            format!("{err:#}").contains("TR:1 is a Pandora track but"),
+            format!("{err:#}").contains("TR:1 is an item matched to a track but"),
             "{err:#}"
         );
-        for not_an_item in ["ST:1", "TR:", "tr:1", "TR1"] {
+        for not_an_item in ["ST:1", "YP:PL1", "TR:", "tr:1", "TR1"] {
             let err = parse_for(not_an_item, ID).unwrap_err();
             assert_eq!(crate::error::kind(&err), Kind::Input, "{not_an_item}");
+            assert!(format!("{err:#}").contains("YV:…, YC:…"), "{err:#}");
         }
+    }
+
+    #[test]
+    fn every_item_prefix_routes_to_its_kind() {
+        for (id, kind) in [
+            ("TR:1", Some(IdKind::Track)),
+            ("AR:1", Some(IdKind::Artist)),
+            ("CO:1", Some(IdKind::Artist)),
+            ("AL:1", Some(IdKind::Album)),
+            ("YV:dQw4w9WgXcQ", Some(IdKind::Track)),
+            ("YC:UCabc", Some(IdKind::Artist)),
+            ("ST:1", None),
+            ("YP:PL1", None),
+            ("YV:", None),
+            ("yv:x", None),
+        ] {
+            assert_eq!(IdKind::of_item_id(id), kind, "{id}");
+        }
+        assert_eq!(item_id_type("TR:12"), Some("TR"));
+        assert_eq!(item_id_type("tr:12"), None);
+        assert_eq!(item_id_type("TR:"), None);
     }
 
     #[test]

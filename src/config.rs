@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::error::{Kind, WithKind};
 use crate::fail;
 use crate::repo::validate_profile_name;
+use crate::youtube::takeout::is_playlist_id;
 
 /// The text `sss init` writes as `config.toml`. Every value in it equals
 /// the built-in default.
@@ -37,6 +38,11 @@ thumbs_down_playlist = false
 public_playlists = false  # make the playlists sss creates public
 linked_playlists = false  # also push Pandora-made playlists (Personalized, SharedListening, Curated, …)
 
+[youtube]
+most_played = 100         # songs in the "most played" playlist; 0 = none
+include_unknown = false   # also match and push videos sss could not classify as music
+skip_playlists = []       # YouTube playlist ids (PL…) never matched or pushed
+
 # One table per profile, for overrides only.
 # [profiles.alice]
 # client_id = "…"       # a second app if the first app's user allowlist is full
@@ -50,6 +56,7 @@ pub struct Config {
     pub spotify: SpotifyConfig,
     pub matcher: MatcherConfig,
     pub push: PushConfig,
+    pub youtube: YoutubeConfig,
     pub profiles: BTreeMap<String, ProfileConfig>,
 }
 
@@ -117,6 +124,29 @@ impl Default for PushConfig {
     }
 }
 
+/// The `[youtube]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YoutubeConfig {
+    /// How many of the most played songs are matched and pushed as one
+    /// playlist; 0 for none.
+    pub most_played: u32,
+    /// Also match and push videos no evidence classifies.
+    pub include_unknown: bool,
+    /// Ids of YouTube playlists never matched or pushed.
+    pub skip_playlists: Vec<String>,
+}
+
+impl Default for YoutubeConfig {
+    fn default() -> Self {
+        Self {
+            most_played: 100,
+            include_unknown: false,
+            skip_playlists: Vec::new(),
+        }
+    }
+}
+
 /// One `[profiles.<name>]` table: per-profile overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -167,6 +197,11 @@ impl Config {
         if self.matcher.timeout_s == 0 {
             bail!("[matcher] timeout_s must be at least 1");
         }
+        for id in &self.youtube.skip_playlists {
+            if !is_playlist_id(id) {
+                bail!("[youtube] skip_playlists: {id:?} is not a YouTube playlist id (PL…)");
+            }
+        }
         for name in self.profiles.keys() {
             validate_profile_name(name).context("in a [profiles.…] table name")?;
         }
@@ -203,6 +238,23 @@ mod tests {
         assert_eq!(c.matcher.timeout_s, 900);
         assert!(c.push.liked_songs);
         assert!(!c.push.thumbs_down_playlist && !c.push.public_playlists);
+        assert_eq!(c.youtube.most_played, 100);
+        assert!(!c.youtube.include_unknown && c.youtube.skip_playlists.is_empty());
+    }
+
+    #[test]
+    fn the_youtube_table_is_read() {
+        let c = Config::parse(
+            "[youtube]\nmost_played = 0\ninclude_unknown = true\n\
+             skip_playlists = [\"PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.youtube.most_played, 0);
+        assert!(c.youtube.include_unknown);
+        assert_eq!(
+            c.youtube.skip_playlists,
+            ["PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
     }
 
     #[test]
@@ -267,6 +319,13 @@ mod tests {
             ("[matcher]\nagent = \" \"\n", "agent"),
             ("[matcher]\nbatch_size = \"many\"\n", "batch_size"),
             ("[profiles.Alice]\n", "Alice"),
+            ("[youtube]\nskip_playlists = [\"Road Trip\"]\n", "Road Trip"),
+            (
+                "[youtube]\nskip_playlists = [\"PLshort\"]\n",
+                "skip_playlists",
+            ),
+            ("[youtube]\nmost_played = -1\n", "most_played"),
+            ("[youtube]\nskip = []\n", "skip"),
             ("[push\n", "line 1"),
         ] {
             let err = format!("{:#}", Config::parse(text).unwrap_err());

@@ -10,6 +10,7 @@ use crate::matching::run::DecisionsRefused;
 use crate::pandora::client::SessionRejected;
 use crate::pandora::export::{ExportIncomplete, ExportStopped};
 use crate::spotify::playback::PlayerRefused;
+use crate::youtube::takeout::ImportIncomplete;
 
 /// Declares [`Kind`] and [`Kind::ALL`] from one list of variants, so `ALL`
 /// cannot miss one.
@@ -38,7 +39,7 @@ kinds! {
     /// The service's rate or quota limit was reached; what was done so far
     /// is recorded and a later re-run continues.
     Quota,
-    /// An export run ended with failed steps.
+    /// A Pandora export or a YouTube import run ended incomplete.
     Incomplete,
     /// What was pasted or piped is unusable.
     Input,
@@ -133,7 +134,7 @@ fn carried_kind(err: &anyhow::Error) -> Option<Kind> {
             return Some(f.kind);
         } else if e.is::<SessionRejected>() {
             return Some(Kind::Auth);
-        } else if e.is::<ExportIncomplete>() {
+        } else if e.is::<ExportIncomplete>() || e.is::<ImportIncomplete>() {
             return Some(Kind::Incomplete);
         } else if e.is::<DecisionsRefused>() {
             return Some(Kind::Input);
@@ -148,23 +149,28 @@ fn carried_kind(err: &anyhow::Error) -> Option<Kind> {
     None
 }
 
-/// The export run `err` concerns, when it stopped or ended incomplete.
-pub fn export_run(err: &anyhow::Error) -> Option<ExportRun<'_>> {
+/// The export or import run `err` concerns, when it stopped or ended
+/// incomplete.
+pub fn run_failure(err: &anyhow::Error) -> Option<RunFailure<'_>> {
     err.chain().find_map(|e| {
         if let Some(s) = e.downcast_ref::<ExportStopped>() {
-            Some(ExportRun::Stopped(s))
+            Some(RunFailure::Stopped(s))
+        } else if let Some(i) = e.downcast_ref::<ExportIncomplete>() {
+            Some(RunFailure::Incomplete(i))
         } else {
-            e.downcast_ref::<ExportIncomplete>()
-                .map(ExportRun::Incomplete)
+            e.downcast_ref::<ImportIncomplete>()
+                .map(RunFailure::ImportIncomplete)
         }
     })
 }
 
-/// An export run found in an error chain by [`export_run`].
+/// A run found in an error chain by [`run_failure`].
 #[derive(Debug, Clone, Copy)]
-pub enum ExportRun<'a> {
+pub enum RunFailure<'a> {
     Stopped(&'a ExportStopped),
     Incomplete(&'a ExportIncomplete),
+    /// A YouTube Takeout import.
+    ImportIncomplete(&'a ImportIncomplete),
 }
 
 #[cfg(test)]

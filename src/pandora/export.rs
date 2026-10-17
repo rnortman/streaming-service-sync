@@ -5,20 +5,16 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::pandora::client::{Client, Reply, endpoint};
 use crate::pandora::model::Summary;
 use crate::repo::{self, ProfilePaths};
-
-/// The ledger file of a raw run.
-pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// Page size of every paged request; the largest Pandora accepts.
 pub const PAGE: usize = 100;
@@ -163,74 +159,10 @@ fn slug(path: &str) -> String {
         .collect()
 }
 
-/// A run id from the current UTC time, `YYYYMMDDTHHMMSSZ`.
-fn run_id_now() -> String {
-    let t = time::OffsetDateTime::now_utc();
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        t.year(),
-        u8::from(t.month()),
-        t.day(),
-        t.hour(),
-        t.minute(),
-        t.second()
-    )
-}
-
-/// Creates a new, empty run directory named after `base` (with `-2`, `-3`, …
-/// appended when that name is taken) and returns its id and path.
-fn create_run_dir(paths: &ProfilePaths, base: &str) -> Result<(String, PathBuf)> {
-    let raw = paths.raw_dir();
-    fs::create_dir_all(&raw).with_context(|| format!("creating {}", raw.display()))?;
-    for n in 1u32.. {
-        let id = if n == 1 {
-            base.to_owned()
-        } else {
-            format!("{base}-{n}")
-        };
-        let dir = paths.raw_run_dir(&id);
-        match fs::create_dir(&dir) {
-            Ok(()) => return Ok((id, dir)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
-        }
-    }
-    unreachable!("some suffix is always free")
-}
-
-/// The run ids under `raw/`, oldest first: by timestamp, then by the `-N`
-/// suffix a second run in the same second gets.
-pub fn run_ids(paths: &ProfilePaths) -> Result<Vec<String>> {
-    let raw = paths.raw_dir();
-    let entries = match fs::read_dir(&raw) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", raw.display())),
-    };
-    let mut ids = Vec::new();
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", raw.display()))?;
-        if entry.file_type()?.is_dir()
-            && let Some(name) = entry.file_name().to_str()
-        {
-            ids.push(name.to_owned());
-        }
-    }
-    ids.sort_by_key(|id| run_order(id));
-    Ok(ids)
-}
-
-fn run_order(id: &str) -> (String, u64) {
-    match id.rsplit_once('-') {
-        Some((base, n)) if n.parse::<u64>().is_ok() => (base.to_owned(), n.parse().unwrap_or(0)),
-        _ => (id.to_owned(), 1),
-    }
-}
-
 /// The newest run whose manifest says `complete`.
 pub fn latest_complete_run(paths: &ProfilePaths) -> Result<Option<Manifest>> {
-    for id in run_ids(paths)?.iter().rev() {
-        if let Some(m) = read_manifest(&paths.raw_run_dir(id))?
+    for id in repo::run_ids(&paths.raw_dir())?.iter().rev() {
+        if let Some(m) = repo::read_manifest::<Manifest>(&paths.raw_run_dir(id))?
             && m.complete
         {
             return Ok(Some(m));
@@ -723,7 +655,7 @@ pub fn export(
     progress: &mut dyn Write,
 ) -> Result<Captured> {
     let started = repo::now_rfc3339()?;
-    let (run_id, dir) = create_run_dir(paths, &run_id_now())?;
+    let (run_id, dir) = repo::create_run_dir(&paths.raw_dir(), &repo::run_id_now())?;
     match capture_run(run_id.clone(), dir.clone(), started, client, progress) {
         Ok(manifest) => Ok(Captured {
             run_dir: dir,
@@ -773,16 +705,10 @@ fn capture_run(
         complete: outcome.is_ok() && run.steps.failed().is_empty(),
         steps: run.steps,
     };
-    let written = repo::write_json(&run.dir.join(MANIFEST_FILE), &manifest);
+    let written = repo::write_json(&run.dir.join(repo::MANIFEST_FILE), &manifest);
     outcome?;
     written?;
     Ok(manifest)
-}
-
-/// The manifest of the run in `dir`, `None` when it has none (a run that
-/// never ended).
-pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>> {
-    repo::read_json_opt(&dir.join(MANIFEST_FILE))
 }
 
 #[cfg(test)]
@@ -792,6 +718,7 @@ mod tests {
     use crate::pandora::test_support::{FAST, session};
     use crate::repo::Repo;
     use httpmock::prelude::*;
+    use std::fs;
 
     /// A mock answering `request` on `path` with `reply`.
     fn on<'a>(
@@ -916,7 +843,7 @@ mod tests {
     }
 
     fn manifest_on_disk(fx: &Fixture) -> Manifest {
-        read_manifest(&run_files(fx).0)
+        repo::read_manifest(&run_files(fx).0)
             .unwrap()
             .expect("manifest written")
     }
@@ -1083,7 +1010,7 @@ mod tests {
             "one file per response plus the manifest: {files:?}"
         );
         assert_eq!(files[0], "0001-v1-station-getStations.json");
-        assert_eq!(files[19], MANIFEST_FILE);
+        assert_eq!(files[19], repo::MANIFEST_FILE);
         let first: Value = serde_json::from_slice(&fs::read(dir.join(&files[0])).unwrap()).unwrap();
         assert_eq!(first["path"], "v1/station/getStations");
         assert_eq!(first["request"], stations_req(0));
@@ -1366,16 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn a_taken_run_id_gets_a_suffix() {
-        let fx = fixture();
-        let (a, dir_a) = create_run_dir(&fx.paths, "20261013T000000Z").unwrap();
-        let (b, dir_b) = create_run_dir(&fx.paths, "20261013T000000Z").unwrap();
-        assert_eq!(a, "20261013T000000Z");
-        assert_eq!(b, "20261013T000000Z-2");
-        assert!(dir_a.is_dir() && dir_b.is_dir());
-    }
-
-    #[test]
     fn paging_rule() {
         assert!(more_pages(0, 2, 2, Some(3)));
         assert!(!more_pages(0, 3, 3, Some(3)));
@@ -1400,19 +1317,14 @@ mod tests {
     }
 
     #[test]
-    fn slugs_and_run_ids() {
+    fn slugs() {
         assert_eq!(slug("v1/station/getStations"), "v1-station-getStations");
-        let id = run_id_now();
-        assert_eq!(id.len(), 16, "{id}");
-        assert!(id.ends_with('Z') && id.as_bytes()[8] == b'T', "{id}");
-        assert_eq!(run_order("20261013T000000Z-10").1, 10);
-        assert_eq!(run_order("20261013T000000Z").1, 1);
     }
 
     #[test]
     fn a_run_without_a_manifest_reads_as_none() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_manifest(tmp.path()).unwrap(), None);
+        assert_eq!(repo::read_manifest::<Manifest>(tmp.path()).unwrap(), None);
     }
 
     #[test]
@@ -1425,7 +1337,7 @@ mod tests {
         let (dir, _) = run_files(&fx);
         assert_eq!(stopped.run_dir, dir);
         assert_eq!(dir.file_name().unwrap().to_str(), Some(&*stopped.run_id));
-        let manifest = read_manifest(&stopped.run_dir).unwrap().unwrap();
+        let manifest: Manifest = repo::read_manifest(&stopped.run_dir).unwrap().unwrap();
         assert!(!manifest.complete);
         assert_eq!(manifest.steps.failed(), Step::ALL);
         assert!(

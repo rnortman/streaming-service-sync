@@ -1,28 +1,33 @@
 # streaming-service-sync
 
-Move a family's music from Pandora to Spotify without losing what matters:
-stations and their seeds, thumbs up **and** thumbs down, Premium playlists and
-the on-demand collection.
+Move a family's music from Pandora and YouTube Music to Spotify without
+losing what matters: Pandora stations and their seeds, thumbs up **and**
+thumbs down, Premium playlists and the on-demand collection; YouTube Music
+listening history, playlists, library and subscriptions.
 
 `sss`, the command-line tool this repository builds, will:
 
-1. **Preserve** — export everything a Pandora account holds into a local data
+1. **Preserve** — export everything a Pandora account holds, and import a
+   YouTube Music account's Google Takeout archive, into a local data
    repository of plain, deterministic JSON that you own and can keep in
    version control, independent of any streaming service. Every Pandora
-   response is stored verbatim before it is parsed.
-2. **Match** — find each Pandora track, artist and album on Spotify, deciding
+   response and every Takeout file is stored verbatim before it is parsed.
+2. **Match** — find each track, artist and album on Spotify, deciding
    exact matches in code and handing only the ambiguous ones to an LLM.
 3. **Push** — recreate the material in a Spotify account (a private playlist
-   per station, playlists, saved library), idempotently, recording what was
-   done next to the export.
+   per station, playlists, saved library, a "most played" playlist from the
+   YouTube history), idempotently, recording what was done next to the
+   export.
 
-It never asks for a Pandora password: it uses the session of a browser where
-you are already logged in.
+It never asks for a Pandora or Google password: it uses the session of a
+browser where you are already logged in to Pandora, and the archive each
+member downloads from Google Takeout.
 
 ## Status
 
 Early development. `sss init`, `sss pandora auth`, `sss pandora export`,
-`sss pandora normalize`, `sss spotify auth`, `sss match`,
+`sss pandora normalize`, `sss youtube import`, `sss youtube normalize`,
+`sss youtube api-key`, `sss youtube enrich`, `sss spotify auth`, `sss match`,
 `sss match review|questions|answer|set|reject`, `sss search`, `sss push`,
 `sss report`, `sss status`, `sss guide` and the playback commands
 (`sss devices|player|play|pause|next|previous|queue|shuffle|repeat|volume|seek`)
@@ -90,6 +95,35 @@ and collection counts with what the Pandora app shows; `sss status --json`
 gives the same as one JSON document.
 [docs/pandora-web-api.md](docs/pandora-web-api.md) describes the requests.
 
+### YouTube Music import
+
+YouTube Music is read from the archive Google Takeout makes for each
+member — [docs/youtube-takeout.md](docs/youtube-takeout.md) says what to
+select (history as JSON) and how to extract it. Then:
+
+```sh
+sss youtube import ~/takeout --profile NAME
+```
+
+copies the history, playlists, subscriptions and music library files
+verbatim into `profiles/NAME/youtube/raw/<run-id>/` and normalizes them
+into `history.json`, `videos.json`, `playlists.json`, `subscriptions.json`
+and `library.json` beside it. Each video is classified `song`,
+`music_video`, `video` or `unknown` from what the archive shows; only
+music goes on to Spotify. Importing a newer archive later keeps every play
+an older one had. `sss youtube normalize` re-derives the files without the
+archive. The archive has no likes, dislikes or durations, and no titles
+for videos it names only in a playlist.
+
+Optionally, with a YouTube Data API key (one for the whole family, made in
+Google Cloud — the same document walks through it, and through Google's
+storage policy for what the API returns), `sss youtube api-key` stores it
+and `sss youtube enrich --profile NAME` fetches every video's title,
+length and category, so playlist-only videos get titles, podcasts are told
+from songs, and songs with a length can be matched without the LLM.
+`[youtube]` in `config.toml` sets the size of the "most played" playlist,
+whether unclassified videos are matched, and playlists never to push.
+
 ### Spotify sign-in
 
 `sss` reaches Spotify through an app you register once on Spotify's
@@ -114,10 +148,12 @@ A new `sss` may ask for more permissions than the stored token has;
 ### Matching
 
 `sss match --profile NAME` looks up, on Spotify, every track,
-artist and album the profile's push would send: thumbs-up tracks, track
-and artist seeds, the member's own playlists, the collection and
-bookmarks (thumbs-down tracks too when `[push] thumbs_down_playlist =
-true`). A track with an ISRC is searched by it first; otherwise, and when
+artist and album the profile's push would send: from Pandora, thumbs-up
+tracks, track and artist seeds, the member's own playlists, the collection
+and bookmarks (thumbs-down tracks too when `[push] thumbs_down_playlist =
+true`); from YouTube, the music in the library, in pushed playlists and
+among the most played, and the subscribed artist channels.
+`--source pandora|youtube` matches one source only. A track with an ISRC is searched by it first; otherwise, and when
 that finds nothing certain, by title, artist and album. A match is taken
 automatically only when title, artist and length agree closely and no
 other release scores as well; everything else is recorded as `ambiguous`
@@ -157,6 +193,7 @@ every problem. Either path can take over from the other.
   low-confidence items with their best three candidates and a Spotify search link.
 - `sss match set TR:… <Spotify link, URI or id>` records a match by hand;
   `sss match reject TR:…` records that an item has no Spotify counterpart.
+  YouTube items are `YV:<video id>` and `YC:<channel id>`.
   Neither touches the network, and a later `match` run never overrides
   them.
 - `sss search QUERY...` searches Spotify for free text, one request per
@@ -173,14 +210,19 @@ Pandora playlist, saves the collection and bookmarks to the library,
 saves every thumbs-up as a liked song (`liked_songs`, on by default in
 `[push]`; one switch for every profile in the repository) and, when
 switched on, keeps the thumbs-down in a reference playlist
-(`thumbs_down_playlist`). `playlist_prefix` goes in front of station
-playlists' names and `public_playlists = true` makes the playlists public.
+(`thumbs_down_playlist`). From YouTube it follows the matched artist
+channels, makes one private playlist per YouTube playlist, saves the
+library songs, and makes a "YouTube Music: most played" playlist of the
+`[youtube] most_played` most played songs, which later pushes only add to.
+`playlist_prefix` goes in front of station and most-played playlists'
+names and `public_playlists = true` makes the playlists public.
 Each playlist's description ends with `sss:<key>`, so you can tell the
 ones `sss` made from your own.
 
 Start with `sss push --dry-run`: it prints the plan and sends nothing.
-`--only artists|stations|playlists|collection|liked|thumbs-down` runs one
-part and nothing else. Every change is recorded in
+`--only artists|stations|playlists|collection|liked|most-played|thumbs-down`
+runs one part and nothing else; `--source pandora|youtube` pushes only
+what one source contributes. Every change is recorded in
 `profiles/NAME/spotify/state.json` as it lands, so pushing again adds only
 what is new or missing, and an interrupted push continues where it
 stopped. Items you reorder or remove in a playlist `sss` made are left
@@ -241,15 +283,18 @@ it whenever you like, typically after `sss match` and again after
 `sss push`. It holds:
 
 - what the export captured: stations, thumbs, playlists by kind,
-  collection and bookmarks;
+  collection and bookmarks; for YouTube, the history's span and gaps,
+  plays by app and kind, removed videos, the most played, the videos it
+  could not classify, and each playlist with its id;
 - how many tracks, artists and albums are matched, and how;
 - every item that needs a person, with its best candidates, a Spotify
   search link and the `sss match set` / `sss match reject` commands to
   settle it;
 - the thumbs-down, station by station, with a search link (and the
   Spotify link once matched) and how to hide a song in Spotify;
-- seeds Spotify has no counterpart for (genres, unmatched artists) and the
-  Pandora-made playlists that were not pushed;
+- seeds Spotify has no counterpart for (genres, unmatched artists), the
+  Pandora-made playlists that were not pushed, and the YouTube playlists
+  that were not and why;
 - what push did: links to the playlists it made, how many items it added,
   what the library holds, and what to do about any `pending` playlist.
 

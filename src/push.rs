@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::config::PushConfig;
+use crate::config::{Config, PushConfig};
 use crate::lazy::Lazy;
 use crate::matching::model::{self, ByKind, MatchEntry};
 use crate::pandora::model::{Normalized, Playlist, SeedKind, Station};
 use crate::repo::{self, ProfilePaths};
+use crate::source::Exports;
 use crate::spotify::auth::PLAYLIST_MODIFY_PUBLIC_SCOPE;
 use crate::spotify::client::{Spotify, http_status};
+use crate::youtube;
 
 /// Longest playlist name Spotify takes, in characters.
 pub const NAME_MAX: usize = 100;
@@ -28,7 +30,7 @@ pub const THUMBS_DOWN_KEY: &str = "thumbs-down";
 pub const THUMBS_DOWN_NAME: &str = "Pandora thumbs-down (reference)";
 
 /// One playlist the tool made or started to make, keyed in the ledger by
-/// its Pandora source.
+/// its source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PlaylistEntry {
@@ -107,7 +109,7 @@ fn not_applied(err: &anyhow::Error) -> bool {
         )
 }
 
-/// The six parts of a push, in the order they run.
+/// The parts of a push, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Part {
     Artists,
@@ -115,23 +117,80 @@ pub enum Part {
     Playlists,
     Collection,
     Liked,
+    MostPlayed,
     ThumbsDown,
 }
 
 impl Part {
-    pub const ALL: [Part; 6] = [
+    pub const ALL: [Part; 7] = [
         Part::Artists,
         Part::Stations,
         Part::Playlists,
         Part::Collection,
         Part::Liked,
+        Part::MostPlayed,
         Part::ThumbsDown,
     ];
 }
 
-/// The playlists `part` makes or keeps up to date under `config`: none for
-/// a library part or a playlist part switched off.
+/// The playlists `part` makes or keeps up to date under `config`, from
+/// every source `exports` holds: none for a library part or a playlist
+/// part switched off.
 pub fn wanted_playlists(
+    part: Part,
+    exports: &Exports,
+    matches: &Matches,
+    config: &Config,
+) -> Vec<Wanted> {
+    let mut wanted: Vec<Wanted> = exports
+        .pandora
+        .as_ref()
+        .map(|export| pandora_wanted_playlists(part, export, matches, &config.push))
+        .unwrap_or_default();
+    if let Some(data) = &exports.youtube {
+        match part {
+            Part::Playlists => wanted.extend(youtube::select::playlists(data, matches, config)),
+            Part::MostPlayed => {
+                wanted.extend(youtube::select::most_played_playlist(data, matches, config))
+            }
+            Part::Artists | Part::Stations | Part::Collection | Part::Liked | Part::ThumbsDown => {}
+        }
+    }
+    wanted
+}
+
+/// The library URIs library part `part` saves, from every source `exports`
+/// holds, Pandora's first, each once; none for a playlist part.
+fn library_uris(part: Part, exports: &Exports, matches: &Matches, config: &Config) -> Vec<String> {
+    let pandora = exports.pandora.as_ref();
+    let youtube = exports.youtube.as_ref();
+    let yt = &config.youtube;
+    let (first, more) = match part {
+        Part::Artists => (
+            pandora.map(|e| artist_uris(e, matches)),
+            youtube.map(|d| youtube::select::artist_uris(d, matches)),
+        ),
+        Part::Collection => (
+            pandora.map(|e| collection_uris(e, matches)),
+            youtube.map(|d| youtube::select::collection_uris(d, matches, yt)),
+        ),
+        Part::Liked => (
+            pandora.map(|e| liked_uris(e, matches)),
+            youtube.map(|d| youtube::select::liked_uris(d, matches, yt)),
+        ),
+        Part::Stations | Part::Playlists | Part::MostPlayed | Part::ThumbsDown => {
+            return Vec::new();
+        }
+    };
+    let mut uris = first.unwrap_or_default();
+    uris.extend(more.unwrap_or_default());
+    let mut seen = HashSet::new();
+    uris.retain(|uri| seen.insert(uri.clone()));
+    uris
+}
+
+/// The playlists `part` makes or keeps up to date from the Pandora export.
+fn pandora_wanted_playlists(
     part: Part,
     export: &Normalized,
     matches: &Matches,
@@ -143,11 +202,13 @@ pub fn wanted_playlists(
         Part::ThumbsDown if config.thumbs_down_playlist => {
             thumbs_down_playlist(export, matches).into_iter().collect()
         }
-        Part::ThumbsDown | Part::Artists | Part::Collection | Part::Liked => Vec::new(),
+        Part::ThumbsDown | Part::Artists | Part::Collection | Part::Liked | Part::MostPlayed => {
+            Vec::new()
+        }
     }
 }
 
-/// The latest match entry per Pandora id, per kind.
+/// The latest match entry per item id, per kind.
 pub type Matches = ByKind<BTreeMap<String, MatchEntry>>;
 
 /// Playlist kinds never pushed: they duplicate the station playlists and
@@ -164,7 +225,7 @@ pub fn playlist_is_pushed(playlist: &Playlist, push: &PushConfig) -> bool {
 }
 
 /// The matched URIs of `ids` in order, each once.
-fn matched<'a>(
+pub(crate) fn matched<'a>(
     map: &'a BTreeMap<String, MatchEntry>,
     ids: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
@@ -177,13 +238,13 @@ fn matched<'a>(
 }
 
 /// `text` cut to `max` characters.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
 /// `text` cut so that it and ` sss:<key>` fit in [`DESCRIPTION_MAX`],
 /// followed by the marker.
-fn with_marker(text: &str, key: &str) -> String {
+pub(crate) fn with_marker(text: &str, key: &str) -> String {
     let marker = format!("sss:{key}");
     let room = DESCRIPTION_MAX.saturating_sub(marker.chars().count() + 1);
     let text = cut(text.trim(), room);
@@ -202,7 +263,7 @@ pub struct Wanted {
     pub description: String,
     /// The matched URIs, in order, each once.
     pub uris: Vec<String>,
-    /// Matched tracks the Pandora source holds more than once.
+    /// Matched tracks the source holds more than once.
     pub repeats: usize,
 }
 
@@ -379,7 +440,7 @@ pub struct PlaylistReport {
     /// When a `pending` entry was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
-    /// Matched tracks the Pandora playlist repeats; Spotify gets each once.
+    /// Matched tracks the source playlist repeats; Spotify gets each once.
     #[serde(skip_serializing_if = "is_zero")]
     pub repeats: usize,
     /// The created playlist's Spotify id.
@@ -430,6 +491,8 @@ pub struct Parts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liked: Option<LibraryPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub most_played: Option<PlaylistsPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbs_down: Option<PlaylistsPart>,
 }
 
@@ -450,6 +513,7 @@ impl PushReport {
         [
             &self.parts.stations,
             &self.parts.playlists,
+            &self.parts.most_played,
             &self.parts.thumbs_down,
         ]
         .into_iter()
@@ -482,14 +546,15 @@ impl PushReport {
                 a.to_follow, a.followed, a.skipped
             )?;
         }
-        for (label, part) in [
-            ("stations", &p.stations),
-            ("playlists", &p.playlists),
-            ("thumbs-down", &p.thumbs_down),
+        for (label, table, part) in [
+            ("stations", "push", &p.stations),
+            ("playlists", "push", &p.playlists),
+            ("most-played", "youtube", &p.most_played),
+            ("thumbs-down", "push", &p.thumbs_down),
         ] {
             let Some(part) = part else { continue };
             if !part.enabled {
-                writeln!(out, "{label}: off in config.toml [push]")?;
+                writeln!(out, "{label}: off in config.toml [{table}]")?;
                 continue;
             }
             writeln!(out, "{label}: {} playlists", part.playlists.len())?;
@@ -553,14 +618,14 @@ struct Pusher<'a> {
     progress: &'a mut dyn Write,
 }
 
-/// Plans the selected parts from the export, the match entries and the
+/// Plans the selected parts from the exports, the match entries and the
 /// ledger; unless `dry_run`, applies them, writing the ledger after every
 /// Spotify write. A failure leaves the ledger consistent with what landed.
 pub fn push<'a>(
     profile: &str,
     paths: &ProfilePaths,
-    export: &Normalized,
-    config: &PushConfig,
+    exports: &Exports,
+    config: &Config,
     options: Options,
     connect: Connect<'a>,
     progress: &'a mut dyn Write,
@@ -572,7 +637,7 @@ pub fn push<'a>(
         ledger: Ledger::load(&state_file)?,
         state_file: state_file.clone(),
         dry_run: options.dry_run,
-        public: config.public_playlists,
+        public: config.push.public_playlists,
         client: Lazy::new(connect),
         progress,
     };
@@ -583,7 +648,8 @@ pub fn push<'a>(
         }
         match part {
             Part::Artists => {
-                let r = pusher.save_library("artists", artist_uris(export, &matches))?;
+                let r = pusher
+                    .save_library("artists", library_uris(part, exports, &matches, config))?;
                 parts.artists = Some(FollowsPart {
                     to_follow: r.to_save,
                     followed: r.saved,
@@ -591,27 +657,38 @@ pub fn push<'a>(
                 });
             }
             Part::Stations => {
-                let wanted = wanted_playlists(part, export, &matches, config);
+                let wanted = wanted_playlists(part, exports, &matches, config);
                 parts.stations = Some(pusher.playlists(true, wanted)?);
             }
             Part::Playlists => {
-                let wanted = wanted_playlists(part, export, &matches, config);
+                let wanted = wanted_playlists(part, exports, &matches, config);
                 parts.playlists = Some(pusher.playlists(true, wanted)?);
             }
             Part::Collection => {
                 parts.collection =
-                    Some(pusher.save_library("collection", collection_uris(export, &matches))?);
+                    Some(pusher.save_library(
+                        "collection",
+                        library_uris(part, exports, &matches, config),
+                    )?);
             }
             Part::Liked => {
-                parts.liked = Some(if config.liked_songs {
-                    pusher.save_library("liked songs", liked_uris(export, &matches))?
+                parts.liked = Some(if config.push.liked_songs {
+                    pusher.save_library(
+                        "liked songs",
+                        library_uris(part, exports, &matches, config),
+                    )?
                 } else {
                     LibraryPart::default()
                 });
             }
+            Part::MostPlayed => {
+                let wanted = wanted_playlists(part, exports, &matches, config);
+                parts.most_played = Some(pusher.playlists(config.youtube.most_played > 0, wanted)?);
+            }
             Part::ThumbsDown => {
-                let wanted = wanted_playlists(part, export, &matches, config);
-                parts.thumbs_down = Some(pusher.playlists(config.thumbs_down_playlist, wanted)?);
+                let wanted = wanted_playlists(part, exports, &matches, config);
+                parts.thumbs_down =
+                    Some(pusher.playlists(config.push.thumbs_down_playlist, wanted)?);
             }
         }
     }
@@ -927,6 +1004,20 @@ mod tests {
     /// thumbing up `TR:b`; the member's playlist `PL:1` repeating `TR:a`, a
     /// `Personalized`, a `StationThumbs` and a `MyThumbsUp` one; a
     /// collection and bookmarks.
+    fn with_push(push: &PushConfig) -> Config {
+        Config {
+            push: push.clone(),
+            ..Config::default()
+        }
+    }
+
+    fn pandora_only(export: Normalized) -> Exports {
+        Exports {
+            pandora: Some(export),
+            youtube: None,
+        }
+    }
+
     fn export() -> Normalized {
         let mut st = station("41", Some("ST:9"), "Morning");
         st.seeds = vec![
@@ -977,7 +1068,7 @@ mod tests {
 
     fn entry(id: &str, uri: Option<&str>) -> MatchEntry {
         MatchEntry {
-            pandora_id: id.into(),
+            item_id: id.into(),
             status: if uri.is_some() {
                 Status::Matched
             } else {
@@ -1048,8 +1139,8 @@ mod tests {
             push(
                 "alice",
                 &self.paths,
-                &export(),
-                config,
+                &pandora_only(export()),
+                &with_push(config),
                 options,
                 connect,
                 &mut Vec::new(),
@@ -1109,11 +1200,11 @@ mod tests {
         Box::new(|| panic!("a dry run makes no client"))
     }
 
-    /// Every Pandora track, artist and album id anywhere in `value`.
+    /// Every track, artist and album item id anywhere in `value`.
     fn ids_in(value: &serde_json::Value, found: &mut Vec<(IdKind, String)>) {
         match value {
             serde_json::Value::String(s) => {
-                if let Some(kind) = IdKind::of_pandora_id(s) {
+                if let Some(kind) = IdKind::of_item_id(s) {
                     found.push((kind, s.clone()));
                 }
             }
@@ -1123,17 +1214,126 @@ mod tests {
         }
     }
 
+    fn yt_video(id: &str, kind: youtube::classify::VideoKind, plays: u32) -> youtube::model::Video {
+        youtube::model::Video {
+            video_id: id.to_owned(),
+            title: Some(format!("Song {id}")),
+            artists: vec!["The Band".to_owned()],
+            album: None,
+            duration_s: None,
+            channel: None,
+            kind,
+            evidence: Vec::new(),
+            title_source: youtube::model::TitleSource::History,
+            youtube_title: None,
+            plays,
+            music_app_plays: plays,
+            removed: false,
+            first_played: None,
+            last_played: (plays > 0).then(|| "2025-01-01T00:00:00.000Z".to_owned()),
+            in_library: false,
+            liked: false,
+            available: None,
+            category_id: None,
+            topics: Vec::new(),
+        }
+    }
+
+    fn yt_playlist(id: Option<&str>, title: &str, items: &[&str]) -> youtube::model::Playlist {
+        youtube::model::Playlist {
+            playlist_id: id.map(str::to_owned),
+            title: title.to_owned(),
+            created: None,
+            updated: None,
+            order: None,
+            visibility: None,
+            special: youtube::model::Special::of_title(title),
+            items_source: youtube::takeout::ItemsSource::File,
+            items: items
+                .iter()
+                .map(|v| youtube::model::PlaylistItem {
+                    video_id: (*v).to_owned(),
+                    added_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    const YP1: &str = "PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const YP2: &str = "PLbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Songs `s1` (most played), `s2` and `lib` (library), a music video
+    /// `mv` (liked), a `video` and an `unknown` played most of all; a pushed
+    /// playlist holding every kind, an ambiguous one, a skipped one and
+    /// Watch later; an artist channel and a plain one.
+    fn youtube_export() -> youtube::model::Normalized {
+        use youtube::classify::{ChannelKind, VideoKind};
+        let videos = vec![
+            yt_video("s1", VideoKind::Song, 9),
+            yt_video("s2", VideoKind::Song, 2),
+            yt_video("lib", VideoKind::Song, 0),
+            yt_video("mv", VideoKind::MusicVideo, 1),
+            yt_video("talk", VideoKind::Video, 20),
+            yt_video("bare", VideoKind::Unknown, 15),
+            yt_video("later", VideoKind::Song, 0),
+        ];
+        let mut ambiguous = yt_playlist(Some(YP2), "Mix", &["later"]);
+        ambiguous.items_source = youtube::takeout::ItemsSource::AmbiguousTitle;
+        let channel = |id: &str, kind| youtube::model::Channel {
+            channel_id: id.to_owned(),
+            name: format!("Channel {id}"),
+            url: None,
+            kind,
+            evidence: Vec::new(),
+            music_videos: 0,
+        };
+        youtube::model::Normalized {
+            history: Vec::new(),
+            videos: videos
+                .into_iter()
+                .map(|v| (v.video_id.clone(), v))
+                .collect(),
+            playlists: vec![
+                yt_playlist(Some(YP1), "Road Trip", &["s2", "talk", "bare", "mv", "s2"]),
+                ambiguous,
+                yt_playlist(Some(YP1), "Watch later", &["later"]),
+                yt_playlist(None, "Old file", &["later"]),
+            ],
+            subscriptions: vec![
+                channel("UCartist", ChannelKind::Artist),
+                channel("UCplain", ChannelKind::Channel),
+            ],
+            library: youtube::model::Library {
+                songs: vec!["lib".into()],
+                liked: vec!["mv".into(), "talk".into()],
+                disliked: Vec::new(),
+            },
+        }
+    }
+
     /// Push sends only what `match` decides: with every switch on, each part
-    /// built from a match of every id the export holds equals the part built
-    /// from matches of the selected items alone.
+    /// built from a match of every id a mixed export holds equals the part
+    /// built from matches of the selected items alone.
     #[test]
     fn every_id_a_part_sends_is_in_the_match_selection() {
         let export = export();
-        let config = PushConfig {
-            liked_songs: true,
-            thumbs_down_playlist: true,
-            linked_playlists: true,
-            ..PushConfig::default()
+        let yt = youtube_export();
+        let exports = Exports {
+            pandora: Some(export.clone()),
+            youtube: Some(yt.clone()),
+        };
+        let config = Config {
+            push: PushConfig {
+                liked_songs: true,
+                thumbs_down_playlist: true,
+                linked_playlists: true,
+                ..PushConfig::default()
+            },
+            youtube: crate::config::YoutubeConfig {
+                most_played: 2,
+                ..crate::config::YoutubeConfig::default()
+            },
+            ..Config::default()
         };
         let mut found = Vec::new();
         for value in [
@@ -1144,6 +1344,19 @@ mod tests {
         ] {
             ids_in(&value, &mut found);
         }
+        let mut youtube_ids: Vec<String> = yt
+            .videos
+            .keys()
+            .map(|id| youtube::select::video_item_id(id))
+            .collect();
+        youtube_ids.extend(
+            yt.subscriptions
+                .iter()
+                .map(|c| youtube::select::channel_item_id(&c.channel_id)),
+        );
+        ids_in(&serde_json::to_value(&youtube_ids).unwrap(), &mut found);
+        assert!(found.iter().any(|(_, id)| id.starts_with("YV:")));
+        assert!(found.iter().any(|(_, id)| id.starts_with("YC:")));
         let mut every = Matches::default();
         for (kind, id) in found {
             let uri = format!("spotify:{kind}:{}", &id[3..]);
@@ -1151,7 +1364,7 @@ mod tests {
                 .of_mut(kind)
                 .insert(id.clone(), entry(&id, Some(&uri)));
         }
-        let items = crate::matching::run::select(&export, &config);
+        let items = crate::matching::run::select(&exports, &config);
         let mut selected = every.clone();
         for kind in IdKind::ALL {
             selected
@@ -1160,18 +1373,22 @@ mod tests {
         }
 
         let parts = |m: &Matches| {
-            (
-                station_playlists(&export, m, &config),
-                pandora_playlists(&export, m, &config),
-                thumbs_down_playlist(&export, m),
-                artist_uris(&export, m),
-                collection_uris(&export, m),
-                liked_uris(&export, m),
-            )
+            let playlists: Vec<Vec<Wanted>> = Part::ALL
+                .into_iter()
+                .map(|part| wanted_playlists(part, &exports, m, &config))
+                .collect();
+            let libraries: Vec<Vec<String>> = [Part::Artists, Part::Collection, Part::Liked]
+                .into_iter()
+                .map(|part| library_uris(part, &exports, m, &config))
+                .collect();
+            (playlists, libraries)
         };
         let all = parts(&every);
-        assert!(!all.0.is_empty() && !all.1.is_empty() && all.2.is_some());
-        assert!(!all.3.is_empty() && !all.4.is_empty() && !all.5.is_empty());
+        assert!(all.0.iter().filter(|p| !p.is_empty()).count() >= 4);
+        assert!(all.1.iter().all(|uris| !uris.is_empty()));
+        let keys: Vec<&str> = all.0.iter().flatten().map(|w| w.key.as_str()).collect();
+        assert!(keys.contains(&youtube::select::MOST_PLAYED_KEY), "{keys:?}");
+        assert!(keys.contains(&format!("YP:{YP1}").as_str()), "{keys:?}");
         assert_eq!(parts(&selected), all);
     }
 
@@ -1188,7 +1405,9 @@ mod tests {
                 thumbs_down_playlist,
                 ..PushConfig::default()
             };
-            let of = |part| wanted_playlists(part, &export, &matches, &config);
+            let exports = pandora_only(export.clone());
+            let full = with_push(&config);
+            let of = |part| wanted_playlists(part, &exports, &matches, &full);
             assert_eq!(
                 of(Part::Stations),
                 station_playlists(&export, &matches, &config)
@@ -1228,8 +1447,8 @@ mod tests {
         let report = push(
             "alice",
             &f.paths,
-            &export(),
-            &config,
+            &pandora_only(export()),
+            &with_push(&config),
             Options {
                 only: None,
                 dry_run: true,
@@ -1383,8 +1602,8 @@ mod tests {
         let report = push(
             "alice",
             &f.paths,
-            &ex,
-            &PushConfig::default(),
+            &pandora_only(ex.clone()),
+            &Config::default(),
             Options {
                 only: Some(Part::Stations),
                 dry_run: false,
@@ -1545,8 +1764,8 @@ mod tests {
         let report = push(
             "alice",
             &f.paths,
-            &ex,
-            &PushConfig::default(),
+            &pandora_only(ex.clone()),
+            &Config::default(),
             Options {
                 only: Some(Part::Collection),
                 dry_run: false,
@@ -1713,8 +1932,8 @@ mod tests {
         let err = push(
             "alice",
             &f.paths,
-            &ex,
-            &PushConfig::default(),
+            &pandora_only(ex.clone()),
+            &Config::default(),
             Options {
                 only: Some(Part::Stations),
                 dry_run: false,
@@ -1783,8 +2002,8 @@ mod tests {
         let err = push(
             "alice",
             &f.paths,
-            &export(),
-            &PushConfig::default(),
+            &pandora_only(export()),
+            &Config::default(),
             Options {
                 only: Some(Part::Stations),
                 dry_run: false,

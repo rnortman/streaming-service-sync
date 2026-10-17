@@ -125,10 +125,9 @@ fn a_failing_command_reports_an_error_and_exits_1() {
         .clone();
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.starts_with("error: no normalized export in ")
-            && stderr.ends_with("; run `sss pandora export`\n"),
-        "{stderr}"
+    assert_eq!(
+        stderr,
+        "error: no export for profile alice; run `sss pandora export` or `sss youtube import DIR`\n"
     );
 }
 
@@ -819,7 +818,8 @@ fn status_with_no_profiles_says_how_to_add_one() {
         .clone();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "no profiles yet; run `sss pandora auth --profile NAME` first\n"
+        "no profiles yet; run `sss pandora auth --profile NAME` or `sss youtube import \
+         --profile NAME DIR` first\n"
     );
     let out = sss(tmp.path())
         .args(["--repo", repo, "pandora", "auth"])
@@ -1281,7 +1281,7 @@ fn match_decides_by_isrc_text_and_the_llm_and_honours_the_limit() {
         .get_output()
         .clone();
     let doc = json_document(&out.stdout);
-    assert_eq!(doc["items"][0]["pandora_id"], "TR:3");
+    assert_eq!(doc["items"][0]["item_id"], "TR:3");
     assert_eq!(
         doc["items"][0]["search_url"],
         "https://open.spotify.com/search/Third%20The%20Band"
@@ -1351,7 +1351,7 @@ fn match_decides_by_isrc_text_and_the_llm_and_honours_the_limit() {
             .expect("match file");
     let last: serde_json::Value =
         serde_json::from_str(entries.lines().last().expect("an entry")).expect("json");
-    assert_eq!(last["pandora_id"], "TR:3");
+    assert_eq!(last["item_id"], "TR:3");
     assert_eq!(last["status"], "matched");
     assert_eq!(last["spotify_uri"], "spotify:track:t2");
     assert_eq!(last["method"], "llm");
@@ -1370,14 +1370,16 @@ fn match_decides_by_isrc_text_and_the_llm_and_honours_the_limit() {
 /// Writes a fake `ccc` named `name` into `dir`: it logs its arguments and
 /// `CCC_AGENTS_CONFIG`, exits `which_exit` for `which`, and otherwise
 /// prints `outN` and exits `exitN` (default 0) on its Nth call.
+///
+/// The script is written by a child `sh`, so this process never holds a
+/// write descriptor on it: a test thread forking meanwhile would inherit
+/// one, and exec'ing the script would then fail with ETXTBSY.
 fn write_fake_ccc(dir: &Path, name: &str, which_exit: i32) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let path = dir.join(name);
     let d = dir.display();
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\n\
+    let script = format!(
+        "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> '{d}/argv'\n\
              printf '%s\\n' \"$CCC_AGENTS_CONFIG\" >> '{d}/env'\n\
              if [ \"$1\" = which ]; then echo 'no definition for agent type' >&2; exit {which_exit}; fi\n\
@@ -1385,10 +1387,19 @@ fn write_fake_ccc(dir: &Path, name: &str, which_exit: i32) -> PathBuf {
              echo $n > '{d}/count'\n\
              cat \"{d}/out$n\" 2>/dev/null\n\
              exit $(cat \"{d}/exit$n\" 2>/dev/null || echo 0)\n"
-        ),
-    )
-    .expect("write fake ccc");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
+    let mut sh = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    sh.stdin
+        .take()
+        .expect("sh stdin")
+        .write_all(script.as_bytes())
+        .expect("write fake ccc");
+    assert!(sh.wait().expect("wait sh").success(), "write fake ccc");
     path
 }
 
@@ -1492,7 +1503,7 @@ fn match_review_lists_only_what_the_push_switches_select() {
             .as_array()
             .expect("items")
             .iter()
-            .map(|i| i["pandora_id"].as_str().expect("id").to_owned())
+            .map(|i| i["item_id"].as_str().expect("id").to_owned())
             .collect();
         ids
     };
@@ -1641,10 +1652,7 @@ fn report_writes_the_profile_report_and_prints_its_path() {
     assert_eq!(doc["command"], "report");
     assert_eq!(doc["path"], path.to_str().expect("utf-8 path"));
     let report = std::fs::read_to_string(&path).expect("report.md");
-    assert!(
-        report.starts_with("# Pandora to Spotify: alice\n"),
-        "{report}"
-    );
+    assert!(report.starts_with("# alice: to Spotify\n"), "{report}");
     assert!(
         report.contains("\"Disliked\" by The Band: [search]("),
         "{report}"
@@ -2339,4 +2347,1173 @@ fn playlist_reads_the_details_then_the_items() {
     let entry = &doc["playlists"][0];
     assert_eq!(entry["playlist"]["total"], 1);
     assert_eq!(entry["items"][0]["id"], TRACK_B);
+}
+
+/// Writes `files` (path relative to `root`, contents) under `root`.
+fn lay_out(root: &Path, files: &[(&str, &str)]) {
+    for (rel, text) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+}
+
+#[test]
+fn youtube_import_files_a_takeout_tree_as_a_raw_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let archive = tmp.path().join("takeout");
+    let base = "Takeout/YouTube and YouTube Music";
+    let history = r#"[{"header": "YouTube Music", "title": "Watched Calm Waters",
+        "titleUrl": "https://music.youtube.com/watch?v=abcDEF12345",
+        "subtitles": [{"name": "Chill Out Radio - Topic",
+                       "url": "https://www.youtube.com/channel/UCcccccccccccccccccccccc"}],
+        "time": "2026-01-02T03:04:05.678Z", "products": ["YouTube"]}]"#;
+    lay_out(
+        &archive,
+        &[
+            (&format!("{base}/history/watch-history.json"), history),
+            (&format!("{base}/history/search-history.json"), "[]"),
+            (
+                &format!("{base}/playlists/playlists.csv"),
+                "Playlist ID,Playlist Title (Original)\n\
+                 PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,Road Trip\n\n\n\n\n\n",
+            ),
+            (
+                &format!("{base}/playlists/Road Trip-videos.csv"),
+                "Video ID,Playlist Video Creation Timestamp\n \
+                 -bcDEF12345,2025-01-02T00:00:00+00:00\n\n\n\n\n\n",
+            ),
+            (
+                &format!("{base}/subscriptions/subscriptions.csv"),
+                "Channel Id,Channel Url,Channel Title\n\
+                 UCcccccccccccccccccccccc,http://www.youtube.com/channel/UCcccccccccccccccccccccc,Radio \n",
+            ),
+            (
+                &format!("{base}/music (library and uploads)/music library songs.csv"),
+                "Video ID,Song Title,Album Title,Artist Name 1\nabcDEF12345,Calm Waters,,Chill\n",
+            ),
+            (&format!("{base}/video metadata/videos.csv"), "Video ID\n"),
+        ],
+    );
+    let out = sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "--json",
+            "youtube",
+            "import",
+        ])
+        .arg(&archive)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(doc["ok"], true);
+    assert_eq!(doc["command"], "youtube import");
+    let manifest = &doc["manifest"];
+    assert_eq!(manifest["complete"], true);
+    for step in ["history", "playlists", "subscriptions", "library"] {
+        assert_eq!(manifest["steps"][step]["status"], "ok", "{step}");
+        assert_eq!(manifest["steps"][step]["count"], 1, "{step}");
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("history: ok, 1 records, 0 skipped"),
+        "{stderr}"
+    );
+    let run_dir = PathBuf::from(doc["run_dir"].as_str().expect("run_dir"));
+    assert!(run_dir.starts_with(Path::new(repo).join("profiles/alice/youtube/raw")));
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("takeout/history/watch-history.json")).expect("copy"),
+        history
+    );
+    let copied: Vec<PathBuf> = walk(&run_dir);
+    assert_eq!(copied.len(), 6, "five copies and the manifest: {copied:?}");
+    assert!(
+        copied
+            .iter()
+            .all(|p| !p.ends_with("videos.csv") && !p.ends_with("search-history.json")),
+        "{copied:?}"
+    );
+
+    // The complete run was normalized: the five files and the summary.
+    let normalized = &doc["normalized"];
+    assert_eq!(normalized["run_id"], doc["run_id"]);
+    assert_eq!(normalized["records"], 1);
+    assert_eq!(normalized["plays"], 1);
+    assert_eq!(
+        normalized["videos"], 2,
+        "the played song and the playlist item"
+    );
+    assert_eq!(normalized["songs"], 1);
+    assert_eq!(normalized["library_songs"], 1);
+    let youtube = Path::new(repo).join("profiles/alice/youtube");
+    for file in [
+        "history.json",
+        "videos.json",
+        "playlists.json",
+        "subscriptions.json",
+        "library.json",
+        "runs.json",
+    ] {
+        assert!(youtube.join(file).is_file(), "{file}");
+    }
+    let videos: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(youtube.join("videos.json")).expect("videos.json"),
+    )
+    .expect("json");
+    assert_eq!(videos["abcDEF12345"]["kind"], "song");
+    assert_eq!(videos["-bcDEF12345"]["kind"], "unknown");
+
+    // `youtube normalize` re-derives the same files.
+    let before = std::fs::read(youtube.join("history.json")).expect("history.json");
+    std::fs::remove_file(youtube.join("videos.json")).expect("rm");
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "normalize"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("normalized run ") && stdout.contains("1 history records, 1 plays"),
+        "{stdout}"
+    );
+    assert!(youtube.join("videos.json").is_file());
+    assert_eq!(
+        std::fs::read(youtube.join("history.json")).expect("history.json"),
+        before
+    );
+
+    // `status` shows the import ledger and no Pandora line.
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(": complete, 5 files, finished "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  youtube videos: 2 (0 enriched, 1 unknown); no likes in this archive\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("pandora"), "{stdout}");
+}
+
+#[test]
+fn youtube_normalize_without_an_import_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "normalize"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: no complete import run to normalize; run `sss youtube import DIR`\n"
+    );
+}
+
+#[test]
+fn youtube_import_refuses_html_history_and_an_empty_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let html = tmp.path().join("html");
+    lay_out(&html, &[("history/watch-history.html", "<html></html>")]);
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    for (dir, says) in [
+        (&html, "history in HTML"),
+        (&empty, "no YouTube Takeout files"),
+    ] {
+        let out = sss(tmp.path())
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "--json",
+                "youtube",
+                "import",
+            ])
+            .arg(dir)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("one JSON document");
+        assert_eq!(doc["kind"], "input");
+        assert!(
+            doc["error"].as_str().expect("error").contains(says),
+            "{doc}"
+        );
+    }
+    assert!(!Path::new(repo).join("profiles/alice/youtube").exists());
+}
+
+#[test]
+fn youtube_import_without_history_is_incomplete_and_kept() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let archive = tmp.path().join("takeout");
+    lay_out(
+        &archive,
+        &[("subscriptions/subscriptions.csv", "Channel Id\n")],
+    );
+    let out = sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "--json",
+            "youtube",
+            "import",
+        ])
+        .arg(&archive)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(doc["kind"], "incomplete");
+    assert_eq!(doc["details"]["failed_steps"], serde_json::json!([]));
+    assert_eq!(
+        doc["details"]["manifest"]["steps"]["history"]["status"],
+        "missing"
+    );
+    let run_dir = PathBuf::from(doc["details"]["run_dir"].as_str().expect("run_dir"));
+    assert!(run_dir.join("manifest.json").is_file());
+}
+
+#[test]
+fn youtube_import_with_an_unparsable_history_names_the_failed_step() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let archive = tmp.path().join("takeout");
+    lay_out(&archive, &[("history/watch-history.json", "not json")]);
+    let out = sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "--json",
+            "youtube",
+            "import",
+        ])
+        .arg(&archive)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON document");
+    assert_eq!(doc["kind"], "incomplete");
+    assert_eq!(
+        doc["details"]["failed_steps"],
+        serde_json::json!(["history"])
+    );
+    let message = doc["error"].as_str().expect("error message");
+    assert!(
+        message.ends_with("is incomplete: failed steps history; its copies are kept"),
+        "{message}"
+    );
+}
+
+#[test]
+fn match_on_a_youtube_only_profile_scopes_and_filters_by_source() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n",
+    )
+    .expect("write config");
+    // A Topic song, a removed video played in the Music app, and a playlist
+    // holding a video seen nowhere else.
+    let archive = tmp.path().join("takeout");
+    let base = "Takeout/YouTube and YouTube Music";
+    let history = r#"[{"header": "YouTube Music", "title": "Watched Calm Waters",
+        "titleUrl": "https://music.youtube.com/watch?v=abcDEF12345",
+        "subtitles": [{"name": "The Band - Topic",
+                       "url": "https://www.youtube.com/channel/UCcccccccccccccccccccccc"}],
+        "time": "2026-01-02T03:04:05.678Z", "products": ["YouTube"]},
+        {"header": "YouTube Music",
+         "title": "Watched https://music.youtube.com/watch?v=goneGONE123",
+         "titleUrl": "https://music.youtube.com/watch?v=goneGONE123",
+         "time": "2026-01-01T03:04:05.678Z", "products": ["YouTube"]}]"#;
+    lay_out(
+        &archive,
+        &[
+            (&format!("{base}/history/watch-history.json"), history),
+            (
+                &format!("{base}/playlists/playlists.csv"),
+                "Playlist ID,Playlist Title (Original)\n\
+                 PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,Road Trip\n",
+            ),
+            (
+                &format!("{base}/playlists/Road Trip-videos.csv"),
+                "Video ID,Playlist Video Creation Timestamp\n\
+                 xyzXYZ12345,2025-01-02T00:00:00+00:00\n",
+            ),
+        ],
+    );
+    sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "import"])
+        .arg(&archive)
+        .assert()
+        .code(0);
+    let state_dir = tmp.path().join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z", "scopes": ["user-library-read"]}})
+        .to_string(),
+    )
+    .expect("write token");
+    let search = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/search");
+        then.status(200)
+            .json_body(search_body(&[("spotify:track:calm", "Calm Waters", None)]));
+    });
+    let match_cmd = |extra: &[&str]| {
+        let mut cmd = sss(tmp.path());
+        cmd.env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "match",
+                "--no-llm",
+                "--json",
+            ])
+            .args(extra);
+        cmd
+    };
+
+    // No Pandora export: the Pandora half has nothing to decide.
+    let doc = json_document(
+        &match_cmd(&["--source", "pandora"])
+            .assert()
+            .code(0)
+            .get_output()
+            .stdout,
+    );
+    assert_eq!(doc["kinds"]["tracks"]["processed"], 0);
+    search.assert_calls(0);
+
+    let doc = json_document(
+        &match_cmd(&["--source", "youtube"])
+            .assert()
+            .code(0)
+            .get_output()
+            .stdout,
+    );
+    let tracks = &doc["kinds"]["tracks"];
+    assert_eq!(tracks["processed"], 2, "the playlist-only video is no item");
+    assert_eq!(
+        tracks["by_status"]["ambiguous"], 1,
+        "an exact title without a duration"
+    );
+    assert_eq!(
+        tracks["unmatched_ids"],
+        serde_json::json!(["YV:goneGONE123"])
+    );
+    let entries =
+        std::fs::read_to_string(Path::new(repo).join("profiles/alice/matches/tracks.jsonl"))
+            .expect("match file");
+    assert!(
+        entries.contains(r#""item_id":"YV:abcDEF12345""#),
+        "{entries}"
+    );
+    assert!(entries.contains(r#""reason":"no title""#), "{entries}");
+    assert!(!entries.contains("xyzXYZ12345"), "{entries}");
+
+    // With include_unknown the playlist-only video is an item, titleless.
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n[youtube]\ninclude_unknown = true\n",
+    )
+    .expect("write config");
+    let doc = json_document(&match_cmd(&[]).assert().code(0).get_output().stdout);
+    assert_eq!(
+        doc["kinds"]["tracks"]["unmatched_ids"],
+        serde_json::json!(["YV:xyzXYZ12345"])
+    );
+
+    for args in [
+        &[
+            "set",
+            "YV:abcDEF12345",
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        ][..],
+        &["reject", "YC:UCcccccccccccccccccccccc"][..],
+    ] {
+        sss(tmp.path())
+            .args(["--repo", repo, "--profile", "alice", "match"])
+            .args(args)
+            .assert()
+            .code(0);
+    }
+}
+
+#[test]
+fn a_skip_playlists_entry_of_the_wrong_shape_is_kind_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[youtube]\nskip_playlists = [\"Road Trip\"]\n",
+    )
+    .expect("write config");
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "--json", "status"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kind"], "config");
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("skip_playlists")),
+        "{doc}"
+    );
+}
+
+#[test]
+fn push_on_a_mixed_profile_plans_youtube_parts_and_grows_most_played() {
+    const POP: &str = "spotify:track:0000000000000000000pop";
+    const DEEP: &str = "spotify:track:000000000000000000deep";
+    const PANDORA: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
+    const ROAD_TRIP: &str = "PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let config = |most_played: u32| {
+        std::fs::write(
+            Path::new(repo).join("config.toml"),
+            format!(
+                "[spotify]\nclient_id = \"test-client-id\"\n\
+                 [youtube]\nmost_played = {most_played}\n"
+            ),
+        )
+        .expect("write config");
+    };
+    config(1);
+    write_export(repo, &[("TR:1", "First", true)]);
+    // "Pop Song" played twice, "Deep Cut" once, both from a Topic channel;
+    // a pushed playlist holding both, Watch later holding one and the liked
+    // list the other.
+    let archive = tmp.path().join("takeout");
+    let base = "Takeout/YouTube and YouTube Music";
+    let play = |id: &str, title: &str, time: &str| {
+        format!(
+            r#"{{"header": "YouTube Music", "title": "Watched {title}",
+               "titleUrl": "https://music.youtube.com/watch?v={id}",
+               "subtitles": [{{"name": "The Band - Topic",
+                  "url": "https://www.youtube.com/channel/UCcccccccccccccccccccccc"}}],
+               "time": "{time}", "products": ["YouTube"]}}"#
+        )
+    };
+    let history = format!(
+        "[{}, {}, {}]",
+        play("popPOP12345", "Pop Song", "2026-01-03T00:00:00.000Z"),
+        play("popPOP12345", "Pop Song", "2026-01-02T00:00:00.000Z"),
+        play("deepDEEP123", "Deep Cut", "2026-01-01T00:00:00.000Z"),
+    );
+    lay_out(
+        &archive,
+        &[
+            (&format!("{base}/history/watch-history.json"), &history),
+            (
+                &format!("{base}/playlists/playlists.csv"),
+                &format!(
+                    "Playlist ID,Playlist Title (Original)\n\
+                     {ROAD_TRIP},Road Trip\n\
+                     PLwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww,Watch later\n\
+                     PLllllllllllllllllllllllllllllllll,Liked videos\n"
+                ),
+            ),
+            (
+                &format!("{base}/playlists/Road Trip-videos.csv"),
+                "Video ID,Playlist Video Creation Timestamp\n\
+                 deepDEEP123,2025-01-02T00:00:00+00:00\n\
+                 popPOP12345,2025-01-03T00:00:00+00:00\n",
+            ),
+            (
+                &format!("{base}/playlists/Liked videos-videos.csv"),
+                "Video ID,Playlist Video Creation Timestamp\n\
+                 deepDEEP123,2025-01-02T00:00:00+00:00\n",
+            ),
+            (
+                &format!("{base}/playlists/Watch later-videos.csv"),
+                "Video ID,Playlist Video Creation Timestamp\n\
+                 popPOP12345,2025-01-02T00:00:00+00:00\n",
+            ),
+        ],
+    );
+    sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "import"])
+        .arg(&archive)
+        .assert()
+        .code(0);
+    for (id, uri) in [
+        ("YV:popPOP12345", POP),
+        ("YV:deepDEEP123", DEEP),
+        ("TR:1", PANDORA),
+    ] {
+        sss(tmp.path())
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "match",
+                "set",
+                id,
+                uri,
+            ])
+            .assert()
+            .code(0);
+    }
+    let state_dir = tmp.path().join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "scopes": ["playlist-modify-private", "user-library-modify"]}})
+        .to_string(),
+    )
+    .expect("write token");
+    let push = |extra: &[&str]| {
+        let out = sss(tmp.path())
+            .env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+            .args(["--repo", repo, "--profile", "alice", "push", "--json"])
+            .args(extra)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        json_document(&out.stdout)
+    };
+    let keys = |part: &serde_json::Value| -> Vec<String> {
+        part["playlists"]
+            .as_array()
+            .expect("playlists")
+            .iter()
+            .map(|p| p["key"].as_str().expect("key").to_owned())
+            .collect()
+    };
+
+    let doc = push(&["--dry-run"]);
+    let parts = &doc["parts"];
+    assert_eq!(keys(&parts["stations"]), ["ST:1"]);
+    assert_eq!(
+        keys(&parts["playlists"]),
+        [format!("YP:{ROAD_TRIP}")],
+        "neither Watch later nor the liked list is a playlist"
+    );
+    assert_eq!(parts["playlists"]["playlists"][0]["name"], "Road Trip");
+    assert_eq!(parts["playlists"]["playlists"][0]["to_add"], 2);
+    assert_eq!(keys(&parts["most_played"]), ["youtube:most-played"]);
+    assert_eq!(parts["most_played"]["playlists"][0]["to_add"], 1);
+    assert_eq!(parts["collection"]["to_save"], 0);
+    assert_eq!(
+        parts["liked"]["to_save"], 2,
+        "the Pandora thumbs-up and the liked video"
+    );
+
+    let doc = push(&["--dry-run", "--source", "youtube"]);
+    assert!(keys(&doc["parts"]["stations"]).is_empty());
+    assert_eq!(keys(&doc["parts"]["most_played"]), ["youtube:most-played"]);
+    let doc = push(&["--dry-run", "--source", "pandora"]);
+    assert!(keys(&doc["parts"]["playlists"]).is_empty());
+    assert!(keys(&doc["parts"]["most_played"]).is_empty());
+
+    let create = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/me/playlists")
+            .json_body_includes(
+                serde_json::json!({"name": "YouTube Music: most played"}).to_string(),
+            );
+        then.status(201)
+            .json_body(serde_json::json!({"id": "top", "snapshot_id": "s0"}));
+    });
+    let add_pop = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/playlists/top/items")
+            .json_body(serde_json::json!({ "uris": [POP] }));
+        then.status(201)
+            .json_body(serde_json::json!({"snapshot_id": "s1"}));
+    });
+    let only_most_played = ["--only", "most-played"];
+    let doc = push(&only_most_played);
+    let made = &doc["parts"]["most_played"]["playlists"][0];
+    assert_eq!(
+        (&made["action"], &made["added"]),
+        (&"create".into(), &1.into())
+    );
+    assert!(doc["parts"]["playlists"].is_null(), "only the one part ran");
+    create.assert_calls(1);
+    add_pop.assert_calls(1);
+
+    let mut held = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/playlists/top/items");
+        then.status(200)
+            .json_body(serde_json::json!({"items": [{"item": {"uri": POP}}], "next": null}));
+    });
+    let doc = push(&only_most_played);
+    assert_eq!(
+        doc["parts"]["most_played"]["playlists"][0]["action"],
+        "skip"
+    );
+    add_pop.assert_calls(1);
+
+    // A larger top N appends the new entrant and removes nothing.
+    config(2);
+    let add_deep = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/playlists/top/items")
+            .json_body(serde_json::json!({ "uris": [DEEP] }));
+        then.status(201)
+            .json_body(serde_json::json!({"snapshot_id": "s2"}));
+    });
+    let remove = server.mock(|when, then| {
+        when.method(httpmock::Method::DELETE);
+        then.status(200);
+    });
+    let doc = push(&only_most_played);
+    let grown = &doc["parts"]["most_played"]["playlists"][0];
+    assert_eq!(
+        (&grown["action"], &grown["added"]),
+        (&"update".into(), &1.into())
+    );
+    add_deep.assert_calls(1);
+    remove.assert_calls(0);
+    create.assert_calls(1);
+    held.assert_calls(2);
+    held.delete();
+
+    // Off: the part is reported off in [youtube] and plans nothing.
+    config(0);
+    let out = sss(tmp.path())
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "push",
+            "--dry-run",
+            "--only",
+            "most-played",
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("most-played: off in config.toml [youtube]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn report_on_youtube_only_then_mixed_profiles_shows_the_youtube_summary() {
+    const SKIPPED: &str = "PLssssssssssssssssssssssssssssssss";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        format!("[youtube]\nskip_playlists = [\"{SKIPPED}\"]\n"),
+    )
+    .expect("write config");
+    // A Topic song played in January and again in April (a gap of more
+    // than 30 days), a removed video, a video of no known kind, and three
+    // playlists: one holding a video seen nowhere else, one skipped by id,
+    // and two whose titles share one items file.
+    let archive = tmp.path().join("takeout");
+    let base = "Takeout/YouTube and YouTube Music";
+    let history = r#"[
+        {"header": "YouTube Music", "title": "Watched Calm Waters",
+         "titleUrl": "https://music.youtube.com/watch?v=abcDEF12345",
+         "subtitles": [{"name": "The Band - Topic",
+                        "url": "https://www.youtube.com/channel/UCcccccccccccccccccccccc"}],
+         "time": "2026-04-02T03:04:05.678Z", "products": ["YouTube"]},
+        {"header": "YouTube", "title": "Watched Painting a Lake",
+         "titleUrl": "https://www.youtube.com/watch?v=paintPAINT1",
+         "subtitles": [{"name": "Paint Club",
+                        "url": "https://www.youtube.com/channel/UCpppppppppppppppppppppp"}],
+         "time": "2026-01-03T03:04:05.678Z", "products": ["YouTube"]},
+        {"header": "YouTube Music",
+         "title": "Watched https://music.youtube.com/watch?v=goneGONE123",
+         "titleUrl": "https://music.youtube.com/watch?v=goneGONE123",
+         "time": "2026-01-02T03:04:05.678Z", "products": ["YouTube"]},
+        {"header": "YouTube Music", "title": "Watched Calm Waters",
+         "titleUrl": "https://music.youtube.com/watch?v=abcDEF12345",
+         "subtitles": [{"name": "The Band - Topic",
+                        "url": "https://www.youtube.com/channel/UCcccccccccccccccccccccc"}],
+         "time": "2026-01-01T03:04:05.678Z", "products": ["YouTube"]}]"#;
+    let items = "Video ID,Playlist Video Creation Timestamp\n\
+                 xyzXYZ12345,2025-01-02T00:00:00+00:00\n\
+                 abcDEF12345,2025-01-03T00:00:00+00:00\n";
+    lay_out(
+        &archive,
+        &[
+            (&format!("{base}/history/watch-history.json"), history),
+            (
+                &format!("{base}/playlists/playlists.csv"),
+                &format!(
+                    "Playlist ID,Playlist Title (Original)\n\
+                     PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,Road Trip\n\
+                     {SKIPPED},Converted\n\
+                     PLmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm,Mix: 2024\n\
+                     PLnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn,Mix/ 2024\n"
+                ),
+            ),
+            (&format!("{base}/playlists/Road Trip-videos.csv"), items),
+            (&format!("{base}/playlists/Converted-videos.csv"), items),
+            (&format!("{base}/playlists/Mix_ 2024-videos.csv"), items),
+        ],
+    );
+    sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "import"])
+        .arg(&archive)
+        .assert()
+        .code(0);
+    let report = || {
+        sss(tmp.path())
+            .args(["--repo", repo, "--profile", "alice", "report"])
+            .assert()
+            .code(0);
+        std::fs::read_to_string(Path::new(repo).join("profiles/alice/report.md"))
+            .expect("report.md")
+    };
+    // The removed video, in the top N, as `match` leaves it.
+    let matches = Path::new(repo).join("profiles/alice/matches");
+    std::fs::create_dir_all(&matches).expect("matches dir");
+    std::fs::write(
+        matches.join("tracks.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"item_id": "YV:goneGONE123", "status": "unmatched",
+                "reason": "no title", "decided_at": "2026-10-15T00:00:00Z"})
+        ),
+    )
+    .expect("write matches");
+    let doc = report();
+    assert!(!doc.contains("### Pandora"), "{doc}");
+    for expected in [
+        "### YouTube\n\n- Latest complete import run: `",
+        "- History: 4 records, 4 plays from 2026-01-01 to 2026-04-02\n",
+        "  - no plays from 2026-01-03 to 2026-04-02\n",
+        "- Plays by app: YouTube Music 3, YouTube 1\n",
+        "- 1 removed videos, 1 plays, titles withheld by Takeout\n",
+        "- Liked: no likes in this archive\n",
+        "#### Not classified\n",
+        "| Paint Club | 1 | 1 |\n",
+        "#### Typed music by the Music app alone\n",
+        "1 removed videos are typed this way too",
+        "- Road Trip `PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`: 2 videos, 1 music, 1 with no \
+         evidence\n",
+        "- Mix: 2024 `PLmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm`: 0 videos, 0 music, 0 with no \
+         evidence; items: ambiguous\\_title",
+        "## YouTube playlists not pushed\n",
+        "- Converted `PLssssssssssssssssssssssssssssssss`: in `[youtube] skip_playlists`\n",
+        "- Mix/ 2024 `PLnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn`: its items file is shared",
+        "- Road Trip `PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`: no matched music\n",
+        "[Watch on YouTube](https://www.youtube.com/watch?v=goneGONE123)",
+    ] {
+        assert!(doc.contains(expected), "{expected}\n---\n{doc}");
+    }
+
+    write_export(repo, &[("TR:1", "First", true)]);
+    let doc = report();
+    assert!(doc.contains("### Pandora\n"), "{doc}");
+    assert!(doc.contains("### YouTube\n"), "{doc}");
+    assert!(doc.contains("## Pandora playlists not pushed\n"), "{doc}");
+    assert!(doc.contains("## YouTube playlists not pushed\n"), "{doc}");
+}
+
+/// Every file under `dir`, read as text, by path.
+fn texts_under(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut paths = walk(dir);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).expect("read");
+            (p, text)
+        })
+        .collect()
+}
+
+#[test]
+fn youtube_api_key_is_verified_before_it_is_stored_and_never_shown() {
+    use httpmock::prelude::*;
+    const KEY: &str = "AIza-test-key-0001";
+    let server = MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    let refused = server.mock(|when, then| {
+        when.method(GET)
+            .path("/youtube/v3/videos")
+            .query_param("key", "AIza-bad");
+        then.status(400).json_body(serde_json::json!({"error": {
+            "code": 400, "message": "API key not valid. Please pass a valid API key.",
+            "errors": [{"reason": "keyInvalid"}]}}));
+    });
+    let accepted = server.mock(|when, then| {
+        when.method(GET)
+            .path("/youtube/v3/videos")
+            .query_param("key", KEY)
+            .query_param("id", "dQw4w9WgXcQ")
+            .query_param("part", "id");
+        then.status(200)
+            .json_body(serde_json::json!({"items": [{"id": "dQw4w9WgXcQ"}]}));
+    });
+    let api_key = |stdin: &str| {
+        sss(tmp.path())
+            .env("SSS_YOUTUBE_API_BASE_URL", server.url("/youtube/v3"))
+            .args(["--repo", repo, "--json", "youtube", "api-key"])
+            .write_stdin(stdin.to_owned())
+            .assert()
+            .get_output()
+            .clone()
+    };
+    let key_file = tmp
+        .path()
+        .join("streaming-service-sync/youtube-api-key.json");
+
+    let out = api_key("AIza-bad\n\n");
+    assert_eq!(out.status.code(), Some(1));
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kind"], "input");
+    refused.assert_calls(1);
+    assert!(!key_file.exists());
+
+    let out = api_key(&format!("{KEY}\n\n"));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    accepted.assert_calls(1);
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["command"], "youtube api-key");
+    assert_eq!(doc["key_path"], key_file.to_str().expect("utf-8"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(KEY) && !stderr.contains(KEY), "{out:?}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&key_file)
+        .expect("key file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(
+        std::fs::read_to_string(&key_file)
+            .expect("read")
+            .contains(KEY)
+    );
+
+    // `status` says when it was stored, never the key; no profile appears.
+    let out = sss(tmp.path())
+        .args(["--repo", repo, "--json", "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["profiles"], serde_json::json!([]));
+    assert!(doc["youtube_api_key"]["stored_at"].is_string(), "{doc}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(KEY));
+}
+
+#[test]
+fn youtube_enrich_fetches_in_fifties_stops_on_quota_and_resumes() {
+    use httpmock::prelude::*;
+    const KEY: &str = "AIza-test-key-0002";
+    let server = MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("data");
+    let repo = repo.to_str().expect("utf-8 path");
+    sss(tmp.path())
+        .args(["--repo", repo, "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        Path::new(repo).join("config.toml"),
+        "[spotify]\nclient_id = \"test-client-id\"\n[youtube]\nmost_played = 1\n",
+    )
+    .expect("write config");
+    // 51 videos played once in the Music app with no channel; the first
+    // played twice, so it alone is the top 1.
+    let id = |n: usize| format!("v{n:010}");
+    let mut plays: Vec<serde_json::Value> = (0..51)
+        .map(|n| {
+            serde_json::json!({"header": "YouTube Music", "title": format!("Watched Track {n}"),
+                "titleUrl": format!("https://music.youtube.com/watch?v={}", id(n)),
+                "time": format!("2026-01-01T00:{:02}:{:02}.000Z", n / 60, n % 60),
+                "products": ["YouTube"]})
+        })
+        .collect();
+    plays.push(
+        serde_json::json!({"header": "YouTube Music", "title": "Watched Track 1",
+        "titleUrl": format!("https://music.youtube.com/watch?v={}", id(1)),
+        "time": "2026-02-01T00:00:00.000Z", "products": ["YouTube"]}),
+    );
+    let archive = tmp.path().join("takeout");
+    lay_out(
+        &archive,
+        &[(
+            "Takeout/YouTube and YouTube Music/history/watch-history.json",
+            &serde_json::Value::Array(plays).to_string(),
+        )],
+    );
+    sss(tmp.path())
+        .args(["--repo", repo, "--profile", "alice", "youtube", "import"])
+        .arg(&archive)
+        .assert()
+        .code(0);
+
+    let enrich = || {
+        sss(tmp.path())
+            .env("SSS_YOUTUBE_API_BASE_URL", server.url("/youtube/v3"))
+            .args([
+                "--repo",
+                repo,
+                "--profile",
+                "alice",
+                "--json",
+                "youtube",
+                "enrich",
+            ])
+            .assert()
+            .get_output()
+            .clone()
+    };
+    let out = enrich();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_document(&out.stdout)["kind"], "auth");
+
+    let key_file = tmp
+        .path()
+        .join("streaming-service-sync/youtube-api-key.json");
+    std::fs::create_dir_all(key_file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &key_file,
+        serde_json::json!({"key": KEY, "stored_at": "2026-10-17T00:00:00Z"}).to_string(),
+    )
+    .expect("write key");
+
+    // The first fifty: all but video 3 found, as Topic songs of 3:20.
+    let first: Vec<String> = (0..50).map(id).collect();
+    let items: Vec<serde_json::Value> = (0..50)
+        .filter(|&n| n != 3)
+        .map(|n| {
+            serde_json::json!({"id": id(n),
+                "snippet": {"title": format!("Track {n}"), "channelId": "UCbbbbbbbbbbbbbbbbbbbbbb",
+                            "channelTitle": "The Band - Topic", "categoryId": "10"},
+                "contentDetails": {"duration": "PT3M20S"}})
+        })
+        .collect();
+    let first_chunk = server.mock(|when, then| {
+        when.method(GET)
+            .path("/youtube/v3/videos")
+            .query_param("key", KEY)
+            .query_param("part", "snippet,contentDetails,topicDetails")
+            .query_param("id", first.join(","));
+        then.status(200)
+            .json_body(serde_json::json!({ "items": items }));
+    });
+    let mut quota = server.mock(|when, then| {
+        when.method(GET)
+            .path("/youtube/v3/videos")
+            .query_param("id", id(50));
+        then.status(403).json_body(serde_json::json!({"error": {
+            "code": 403, "message": "quota", "errors": [{"reason": "quotaExceeded"}]}}));
+    });
+
+    let out = enrich();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(json_document(&out.stdout)["kind"], "quota");
+    first_chunk.assert_calls(1);
+    quota.assert_calls(1);
+    let youtube = Path::new(repo).join("profiles/alice/youtube");
+    let cached = texts_under(&youtube.join("api"));
+    let names: Vec<_> = cached.iter().map(|(p, _)| p.file_name()).collect();
+    assert_eq!(
+        names,
+        [
+            Some("0001-videos-list.json".as_ref()),
+            Some("0002-videos-list.json".as_ref())
+        ],
+        "the answer and the refusal"
+    );
+    assert!(
+        cached[1].1.contains("\"status\": 403"),
+        "the refusal is kept"
+    );
+    assert!(cached.iter().all(|(_, t)| !t.contains(KEY)));
+    // What was fetched before the stop is normalized.
+    let videos: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(youtube.join("videos.json")).expect("videos.json"),
+    )
+    .expect("json");
+    assert_eq!(videos[id(1)]["duration_s"], 200);
+    assert_eq!(videos[id(1)]["kind"], "song");
+    assert_eq!(videos[id(3)]["available"], false);
+    assert_eq!(videos[id(50)]["available"], serde_json::Value::Null);
+
+    // The next day: only the rest is asked for.
+    quota.delete();
+    let rest = server.mock(|when, then| {
+        when.method(GET)
+            .path("/youtube/v3/videos")
+            .query_param("key", KEY)
+            .query_param("id", id(50));
+        then.status(200)
+            .json_body(serde_json::json!({"items": [{"id": id(50),
+            "snippet": {"title": "Track 50", "channelTitle": "Someone", "categoryId": "22"}}]}));
+    });
+    let out = enrich();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let doc = json_document(&out.stdout);
+    assert_eq!(
+        (
+            &doc["requested"],
+            &doc["found"],
+            &doc["unavailable"],
+            &doc["remaining"]
+        ),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(0),
+            &serde_json::json!(0)
+        )
+    );
+    assert_eq!(doc["normalized"]["videos"], 51);
+    first_chunk.assert_calls(1);
+    rest.assert_calls(1);
+    for (path, text) in texts_under(Path::new(repo)) {
+        assert!(!text.contains(KEY), "{}", path.display());
+    }
+    let status = sss(tmp.path())
+        .args(["--repo", repo, "status"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("youtube videos: 51 (51 enriched"),
+        "{stdout}"
+    );
+
+    // With an API duration the Topic song is matched outright.
+    let spotify = server.mock(|when, then| {
+        when.method(GET).path("/v1/search");
+        then.status(200)
+            .json_body(search_body(&[("spotify:track:track1", "Track 1", None)]));
+    });
+    let state_dir = tmp.path().join("streaming-service-sync/alice");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("spotify-token.json"),
+        serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
+            "access_token": "access-secret", "refresh_token": "refresh-secret",
+            "expires_at": "2099-01-01T00:00:00Z", "scopes": ["user-library-read"]}})
+        .to_string(),
+    )
+    .expect("write token");
+    let out = sss(tmp.path())
+        .env("SSS_SPOTIFY_API_BASE_URL", server.url("/v1"))
+        .args([
+            "--repo",
+            repo,
+            "--profile",
+            "alice",
+            "--json",
+            "match",
+            "--no-llm",
+            "--source",
+            "youtube",
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["kinds"]["tracks"]["processed"], 1, "{doc}");
+    assert_eq!(doc["kinds"]["tracks"]["by_method"]["exact"], 1, "{doc}");
+    assert_eq!(doc["kinds"]["tracks"]["by_status"]["matched"], 1, "{doc}");
+    assert!(spotify.calls() >= 1);
 }

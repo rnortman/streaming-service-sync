@@ -79,6 +79,56 @@ run is kept, `details.failed_steps` names the steps, and a later export
 captures everything again. `sss pandora normalize` re-derives the
 normalized files from the latest complete run without contacting Pandora.
 
+### YouTube Music
+
+A profile can also, or instead, hold a YouTube Music account, read from a
+Google Takeout archive the person downloads and extracts themselves (see
+`docs/youtube-takeout.md` in the repository for what to select). Ask them
+for the directory they extracted it into:
+
+```sh
+sss youtube import DIR --profile NAME --json
+```
+
+It copies the archive's history, playlists, subscriptions and library
+files verbatim into a new run, parses the copies and, when the run is
+complete, normalizes: the play history is the union of every complete
+run's, so importing a newer archive never loses plays an older one had,
+and playlists, subscriptions and library come from the newest archive.
+A run without the history, or with a file that does not parse, ends with
+kind `incomplete` and is kept; an archive with the history only as HTML
+is kind `input`: the person requests Takeout again with history in JSON.
+`sss youtube normalize` re-derives the normalized files from every
+complete run without reading the archive again.
+
+A YouTube Data API key is optional and improves matching: it gives every
+video its title, length and category, which the archive lacks. Ask
+whether the person has one (`docs/youtube-takeout.md` says how to make
+it); if they do, have them store it once for every profile — piped or
+from a file, never as an argument — and then enrich each YouTube
+profile:
+
+```sh
+sss youtube api-key --from-file KEYFILE --json
+sss youtube enrich --profile NAME --json
+```
+
+`youtube api-key` stores the key only after one test request succeeds:
+kind `input` is a key Google refused, kind `config` a Cloud project
+without YouTube Data API v3 enabled. `youtube enrich` asks only about the
+videos not asked about before, then normalizes; kind `quota` means the
+daily quota is spent and what was fetched is kept — run it again the next
+day. `--limit N` bounds one run. Enrich before the profile's first
+`sss match`: matching decides each item once, so a video matched before
+it was enriched keeps that decision (an ambiguous one is still settled by
+the LLM or `match answer`; an unmatched one by `match set` or
+`match reject`).
+
+Matching (section 6) takes both sources together; `--source youtube` or
+`--source pandora` on `sss match` narrows a run to one. YouTube items are
+`YV:` (a video, matched as a track) and `YC:` (a channel, matched as an
+artist).
+
 ## 5. Spotify sign-in
 
 ```sh
@@ -252,7 +302,10 @@ sss report --profile NAME --json
 
 writes `profiles/NAME/report.md` and prints its path. Read it: it says what
 was exported, how much is matched, and every item that needs a person.
-Tell the person what needs them.
+Tell the person what needs them. For a YouTube export it also lists the
+videos sss could not classify and the playlists it will not push, with
+the reason; a playlist the person does not want on Spotify goes into
+`[youtube] skip_playlists` by the id the report prints.
 
 ## 11. Push
 
@@ -263,7 +316,9 @@ sss push --profile NAME --json
 
 The dry run prints the plan and sends nothing. Show the person the plan and
 push only with their agreement. `--only
-artists|stations|playlists|collection|liked|thumbs-down` pushes one part.
+artists|stations|playlists|collection|liked|most-played|thumbs-down`
+pushes one part; `--source pandora|youtube` pushes only what one source
+contributes.
 A second push adds only what is missing; push never removes anything from
 Spotify. A playlist with action `pending` may already have been made by an
 earlier push that stopped before recording it: `sss` leaves it alone and

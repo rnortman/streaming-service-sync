@@ -6,6 +6,53 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+YouTube Music joins Pandora as a source. Existing data repositories keep
+their `README.md`: `sss init` never rewrites it, so it does not describe
+the new `youtube/` directory; the layout is in `docs/json-output.md` and
+`docs/youtube-takeout.md`.
+
+### Added
+
+- **`sss youtube import DIR`** files an extracted Google Takeout archive
+  (watch history as JSON, playlists, subscriptions, music library songs)
+  as a raw run, copied verbatim, and normalizes it into
+  `profiles/NAME/youtube/`: the play history (the union of every archive
+  imported, so a newer archive never loses older plays), videos classified
+  `song`, `music_video`, `video` or `unknown`, playlists, subscriptions
+  and the library. **`sss youtube normalize`** re-derives those files.
+- **`sss youtube api-key`** stores an optional YouTube Data API key, shared
+  by every profile, after one test request; **`sss youtube enrich`**
+  fetches title, length, category and topics for every video not yet
+  asked about, resumable after a spent quota. `docs/youtube-takeout.md`
+  covers the archive, the key and Google's storage policy.
+- `sss match --source pandora|youtube` and `sss push --source
+  pandora|youtube` act on one source. YouTube items are `YV:` (video) and
+  `YC:` (channel).
+- Push: YouTube playlists, library songs, liked videos and artist channels,
+  and a new **`most-played`** part — one cumulative "YouTube Music: most
+  played" playlist of the `[youtube] most_played` (default 100) most
+  played songs.
+- `[youtube]` in `config.toml`: `most_played`, `include_unknown`,
+  `skip_playlists`.
+- `sss report` has a YouTube part (history span and gaps, plays by app and
+  kind, removed videos, most played, unclassified videos by channel, each
+  playlist with its id) and lists YouTube playlists not pushed with the
+  reason. `sss status` shows YouTube import runs, video counts and whether
+  an API key is stored (`youtube`, `youtube_api_key`).
+
+### Changed
+
+- Match files and `match review` name an item `item_id` (was
+  `pandora_id`); files written before are still read.
+- The report is titled `<profile>: to Spotify`, with one export summary
+  per source.
+- A profile with no export at all fails `match`, `push` and `report` with
+  kind `config` (was `other`), naming both `sss pandora export` and `sss
+  youtube import DIR`.
+- The LLM matching record is source-neutral: `record` (was `pandora`) and
+  a new `source` field; `docs/matching-protocol.md` and the
+  `music-matcher` agent describe both sources.
+
 ## [0.4.0] - 2026-10-16
 
 Every profile should sign in to Spotify once more: `sss` now asks for the
