@@ -1551,7 +1551,8 @@ fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
         serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
             "access_token": "access-secret", "refresh_token": "refresh-secret",
             "expires_at": "2099-01-01T00:00:00Z",
-            "scopes": ["playlist-modify-private", "user-library-modify"]}})
+            "scopes": ["playlist-modify-private", "user-library-modify", "user-library-read",
+                "user-follow-read", "playlist-read-private", "playlist-read-collaborative"]}})
         .to_string(),
     )
     .expect("write token");
@@ -1603,6 +1604,7 @@ fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
         then.status(200)
             .json_body(serde_json::json!({"items": [{"item": {"uri": TRACK}}], "next": null}));
     });
+    let on_account = on_account_mock(&server, "pl1");
 
     let doc = push(&[]);
     assert_eq!(doc["dry_run"], false);
@@ -1613,6 +1615,7 @@ fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
     create.assert_calls(1);
     add.assert_calls(1);
     items.assert_calls(0);
+    on_account.assert_calls(0);
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&ledger).expect("ledger")).expect("json");
     assert_eq!(state["playlists"]["ST:1"]["status"], "created");
@@ -1625,6 +1628,19 @@ fn push_dry_run_writes_nothing_then_push_creates_and_a_second_push_is_idle() {
     create.assert_calls(1);
     add.assert_calls(1);
     items.assert_calls(1);
+    on_account.assert_calls(1);
+}
+
+/// `GET me/library/contains` for playlist `id` alone, answering that the
+/// account holds it.
+fn on_account_mock<'a>(server: &'a httpmock::MockServer, id: &str) -> httpmock::Mock<'a> {
+    let uri = format!("spotify:playlist:{id}");
+    server.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/library/contains")
+            .query_param("uris", uri);
+        then.status(200).json_body(serde_json::json!([true]));
+    })
 }
 
 #[test]
@@ -2940,7 +2956,8 @@ fn push_on_a_mixed_profile_plans_youtube_parts_and_grows_most_played() {
         serde_json::json!({"stored_at": "2026-10-15T00:00:00Z", "token": {
             "access_token": "access-secret", "refresh_token": "refresh-secret",
             "expires_at": "2099-01-01T00:00:00Z",
-            "scopes": ["playlist-modify-private", "user-library-modify"]}})
+            "scopes": ["playlist-modify-private", "user-library-modify", "user-library-read",
+                "user-follow-read", "playlist-read-private", "playlist-read-collaborative"]}})
         .to_string(),
     )
     .expect("write token");
@@ -3022,6 +3039,7 @@ fn push_on_a_mixed_profile_plans_youtube_parts_and_grows_most_played() {
         then.status(200)
             .json_body(serde_json::json!({"items": [{"item": {"uri": POP}}], "next": null}));
     });
+    let on_account = on_account_mock(&server, "top");
     let doc = push(&only_most_played);
     assert_eq!(
         doc["parts"]["most_played"]["playlists"][0]["action"],
@@ -3052,6 +3070,7 @@ fn push_on_a_mixed_profile_plans_youtube_parts_and_grows_most_played() {
     remove.assert_calls(0);
     create.assert_calls(1);
     held.assert_calls(2);
+    on_account.assert_calls(2);
     held.delete();
 
     // Off: the part is reported off in [youtube] and plans nothing.
@@ -3516,4 +3535,263 @@ fn youtube_enrich_fetches_in_fifties_stops_on_quota_and_resumes() {
     assert_eq!(doc["kinds"]["tracks"]["by_method"]["exact"], 1, "{doc}");
     assert_eq!(doc["kinds"]["tracks"]["by_status"]["matched"], 1, "{doc}");
     assert!(spotify.calls() >= 1);
+}
+
+/// The playlist the playlist-write tests change.
+const KIDS: &str = "37i9dQZF1DXcBWIGoYBM5M";
+
+/// `GET me` answers Alice's account.
+fn me_is_alice(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/me");
+        then.status(200)
+            .json_body(serde_json::json!({"id": "alice-spotify", "display_name": "Alice"}));
+    })
+}
+
+/// Alice's private "Kids Songs" holding `total` items, as the details read
+/// and the listing give it.
+fn kids_songs(total: u32) -> serde_json::Value {
+    serde_json::json!({"uri": format!("spotify:playlist:{KIDS}"), "name": "Kids Songs",
+        "description": "", "public": false, "collaborative": false, "snapshot_id": "k0",
+        "owner": {"id": "alice-spotify", "display_name": "Alice"},
+        "items": {"href": "https://api.spotify.com/v1/x", "total": total}})
+}
+
+/// The details read and the items read of "Kids Songs" holding `uris`.
+fn kids_songs_holding<'a>(
+    server: &'a httpmock::MockServer,
+    uris: &[&str],
+) -> (httpmock::Mock<'a>, httpmock::Mock<'a>) {
+    let total = u32::try_from(uris.len()).expect("small");
+    let details = server.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/v1/playlists/{KIDS}"));
+        then.status(200).json_body(kids_songs(total));
+    });
+    let items: Vec<serde_json::Value> = uris
+        .iter()
+        .map(|u| serde_json::json!({"item": {"type": "track", "uri": u, "name": "Song"}}))
+        .collect();
+    let contents = server.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/v1/playlists/{KIDS}/items"));
+        then.status(200)
+            .json_body(serde_json::json!({"items": items, "next": null}));
+    });
+    (details, contents)
+}
+
+#[test]
+fn playlist_create_then_add_by_name_from_a_file() {
+    const TRACK_C: &str = "spotify:track:6rqhFgbbKwnb9MLmUQDhG6";
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), ALL_SCOPES);
+    let me = me_is_alice(&server);
+    let mut empty = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/me/playlists");
+        then.status(200)
+            .json_body(serde_json::json!({"items": [], "next": null}));
+    });
+    let create = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1/me/playlists")
+            .json_body(serde_json::json!({"name": "Kids Songs", "public": false,
+                "description": ""}));
+        then.status(201)
+            .json_body(serde_json::json!({"id": KIDS, "snapshot_id": "k0"}));
+    });
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &["playlist", "create", "Kids Songs"],
+    );
+    assert_eq!(code, 0, "{doc}");
+    me.assert_calls(1);
+    empty.assert_calls(1);
+    create.assert_calls(1);
+    assert_eq!(doc["created"]["id"], format!("spotify:playlist:{KIDS}"));
+    empty.delete();
+
+    let listing = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/v1/me/playlists");
+        then.status(200)
+            .json_body(serde_json::json!({"items": [kids_songs(1)], "next": null}));
+    });
+    let (details, contents) = kids_songs_holding(&server, &[TRACK_A]);
+    let add = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path(format!("/v1/playlists/{KIDS}/items"))
+            .json_body(serde_json::json!({"uris": [TRACK_B, TRACK_C]}));
+        then.status(201)
+            .json_body(serde_json::json!({"snapshot_id": "k1"}));
+    });
+    let list = tmp.path().join("uris.txt");
+    std::fs::write(
+        &list,
+        format!("# kids\n{TRACK_A}\n{TRACK_B}\n\n{TRACK_C}\n"),
+    )
+    .expect("list");
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &[
+            "playlist",
+            "add",
+            "Kids Songs",
+            "--from-file",
+            list.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(code, 0, "{doc}");
+    listing.assert_calls(1);
+    details.assert_calls(1);
+    contents.assert_calls(1);
+    add.assert_calls(1);
+    assert_eq!(doc["to_add"], serde_json::json!([TRACK_B, TRACK_C]));
+    assert_eq!(doc["already_present"], serde_json::json!([TRACK_A]));
+}
+
+#[test]
+fn a_deleted_pushed_playlist_is_left_alone_by_the_next_push() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), ALL_SCOPES);
+    write_export(&repo, &[("TR:1", "First", true)]);
+    sss(tmp.path())
+        .args([
+            "--repo",
+            &repo,
+            "--profile",
+            "alice",
+            "match",
+            "set",
+            "TR:1",
+            TRACK_A,
+        ])
+        .assert()
+        .code(0);
+    let ledger = Path::new(&repo).join("profiles/alice/spotify/state.json");
+    std::fs::create_dir_all(ledger.parent().expect("parent")).expect("spotify dir");
+    std::fs::write(
+        &ledger,
+        serde_json::json!({"playlists": {"ST:1": {"status": "created",
+            "spotify_id": KIDS, "items": [TRACK_A]}}})
+        .to_string(),
+    )
+    .expect("write ledger");
+    let before = std::fs::read(&ledger).expect("ledger");
+    let uri = format!("spotify:playlist:{KIDS}");
+
+    me_is_alice(&server);
+    let (details, contents) = kids_songs_holding(&server, &[TRACK_A]);
+    let held_uri = uri.clone();
+    let mut held = server.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/library/contains")
+            .query_param("uris", held_uri);
+        then.status(200).json_body(serde_json::json!([true]));
+    });
+    let removed_uri = uri.clone();
+    let remove = server.mock(move |when, then| {
+        when.method(httpmock::Method::DELETE)
+            .path("/v1/me/library")
+            .query_param("uris", removed_uri);
+        then.status(200).body("");
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["playlist", "delete", &uri]);
+    assert_eq!(code, 0, "{doc}");
+    held.assert_calls(1);
+    remove.assert_calls(1);
+    details.assert_calls(1);
+    assert_eq!(doc["action"], "deleted");
+    assert_eq!(doc["pushed_as"], "ST:1");
+    assert_eq!(std::fs::read(&ledger).expect("ledger"), before);
+    held.delete();
+
+    let gone_uri = uri.clone();
+    let gone = server.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path("/v1/me/library/contains")
+            .query_param("uris", gone_uri);
+        then.status(200).json_body(serde_json::json!([false]));
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["push", "--only", "stations"]);
+    assert_eq!(code, 0, "{doc}");
+    gone.assert_calls(1);
+    contents.assert_calls(0);
+    let pushed = &doc["parts"]["stations"]["playlists"][0];
+    assert_eq!(pushed["key"], "ST:1");
+    assert_eq!(pushed["action"], "deleted");
+    assert_eq!(std::fs::read(&ledger).expect("ledger"), before);
+}
+
+#[test]
+fn library_remove_without_the_modify_scope_is_kind_auth_with_no_request() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), &["user-library-read", "user-follow-read"]);
+    let any = server.mock(|_, then| {
+        then.status(500);
+    });
+    let (code, doc) = spotify_json(tmp.path(), &server, &repo, &["library", "remove", TRACK_A]);
+    assert_eq!(code, 1, "{doc}");
+    assert_eq!(doc["kind"], "auth");
+    assert!(
+        doc["error"]
+            .as_str()
+            .expect("error")
+            .contains("user-library-modify"),
+        "{doc}"
+    );
+    any.assert_calls(0);
+}
+
+#[test]
+fn a_playlist_add_that_fails_on_its_second_chunk_reports_what_landed() {
+    let server = httpmock::MockServer::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = repo_with_spotify_token(tmp.path(), ALL_SCOPES);
+    let uris: Vec<String> = (0..150)
+        .map(|n| format!("spotify:track:{n:0>22}"))
+        .collect();
+    me_is_alice(&server);
+    kids_songs_holding(&server, &[]);
+    let first = uris[..100].to_vec();
+    let landed = server.mock(move |when, then| {
+        when.method(httpmock::Method::POST)
+            .path(format!("/v1/playlists/{KIDS}/items"))
+            .json_body(serde_json::json!({"uris": first}));
+        then.status(201)
+            .json_body(serde_json::json!({"snapshot_id": "k1"}));
+    });
+    let rest = uris[100..].to_vec();
+    let failed = server.mock(move |when, then| {
+        when.method(httpmock::Method::POST)
+            .path(format!("/v1/playlists/{KIDS}/items"))
+            .json_body(serde_json::json!({"uris": rest}));
+        then.status(503).body("");
+    });
+    let list = tmp.path().join("uris.txt");
+    std::fs::write(&list, uris.join("\n")).expect("list");
+    let (code, doc) = spotify_json(
+        tmp.path(),
+        &server,
+        &repo,
+        &[
+            "playlist",
+            "add",
+            &format!("spotify:playlist:{KIDS}"),
+            "--from-file",
+            list.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(code, 1, "{doc}");
+    landed.assert_calls(1);
+    failed.assert_calls(1);
+    assert_eq!(doc["kind"], "unavailable");
+    assert_eq!(doc["details"]["done"], serde_json::json!(uris[..100]));
 }

@@ -219,17 +219,21 @@ names and `public_playlists = true` makes the playlists public.
 Each playlist's description ends with `sss:<key>`, so you can tell the
 ones `sss` made from your own.
 
-Start with `sss push --dry-run`: it prints the plan and sends nothing.
+Start with `sss push --dry-run`: it prints the plan and sends nothing
+(so it cannot see a playlist deleted in Spotify, which the real push
+checks for and leaves alone).
 `--only artists|stations|playlists|collection|liked|most-played|thumbs-down`
 runs one part and nothing else; `--source pandora|youtube` pushes only
 what one source contributes. Every change is recorded in
 `profiles/NAME/spotify/state.json` as it lands, so pushing again adds only
 what is new or missing, and an interrupted push continues where it
-stopped. Items you reorder or remove in a playlist `sss` made are left
-alone, except that a removed item is added again on the next push.
-Deleting a playlist in Spotify only unfollows it, so `sss` cannot tell and
-keeps adding to it; to have it made again, remove its entry from
-`state.json`.
+stopped. Items you reorder, add or remove in a playlist `sss` made are
+left alone: push adds each matched track once and never again, so a track
+you removed stays removed (`sss playlist add` puts it back if you change
+your mind). A playlist you delete — in Spotify or with `sss playlist
+delete` — is left alone by push until it is back on the account (Spotify
+keeps it recoverable for 90 days); to have it made again from scratch,
+remove its entry from `state.json`.
 
 A playlist reported as `pending` may have been made by an earlier push
 that stopped before recording it: the create request got no answer, or an
@@ -258,6 +262,30 @@ sss play --item TR:123                       # a track's stored candidates, in o
 sss queue spotify:track:4uLU6hMCjMI75M1A2tKUQC # cannot be undone
 sss pause | next | previous
 sss shuffle on|off ; sss repeat off|track|context ; sss volume 40 ; sss seek 90
+```
+
+### Playlists and library
+
+The member's playlists and library — saved tracks and albums, followed
+artists and playlists — can be read and changed. A playlist is named by
+URI, by the key `sss push` recorded (`ST:…`), or by its name. Every
+change takes `--dry-run`,
+which reads what the command needs and writes nothing; items are Spotify
+URIs, links, bare track ids or the export's item ids (`TR:…`), and a
+`--from-file` list (`-` for stdin) takes one per line.
+
+```sh
+sss playlist create "Kids Songs"             # a private playlist; refuses a name you own
+sss playlist add "Kids Songs" --from-file uris.txt   # skips tracks already there
+sss playlist remove ST:123 TR:456            # every occurrence of the track
+sss playlist move "Kids Songs" --from 3 --count 2 --before 1   # positions as `sss playlist` shows
+sss playlist replace "Kids Songs" --from-file order.txt --dry-run   # exactly this list, in order
+sss playlist edit "Kids Songs" --name "Car songs" --public
+sss playlist delete ST:123 --dry-run         # delete your own, unfollow another's
+sss library tracks --limit 20                # saved tracks, most recent first
+sss library albums ; sss library artists     # saved albums, followed artists
+sss library add TR:123 spotify:album:6akEvsycLGftJxYudPjmqK --dry-run
+sss library remove --from-file unwanted.txt  # remove or unfollow what is saved
 ```
 
 ### Listening

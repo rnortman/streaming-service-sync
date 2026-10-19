@@ -8,10 +8,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::config::{self, Config};
-use crate::error::{self, Kind, RunFailure};
+use crate::error::{self, Kind, PartialWrite, RunFailure};
 use crate::fail;
 use crate::guide::{self, GuideReport};
 use crate::input;
+use crate::library::{self, LibraryAddReport, LibraryKind, LibraryRemoveReport, LibraryReport};
 use crate::listening::{self, HistoryReport, TopReport};
 use crate::matching::llm;
 use crate::matching::run::{
@@ -23,9 +24,13 @@ use crate::pandora::client::Client;
 use crate::pandora::export::{self, ExportIncomplete, ExportReport, Manifest};
 use crate::pandora::model::{self, Summary};
 use crate::player::{self, Control, DevicesReport, PlayerReport, PlayerStateReport, QueueReport};
+use crate::playlist_edit::{
+    self, AddReport, CreateReport, DeleteReport, EditReport, MoveReport, RemoveReport,
+    ReplaceReport,
+};
 use crate::playlists::{self, PlaylistReport, PlaylistsReport};
 use crate::profiles;
-use crate::push::{self, PushReport};
+use crate::push::{self, Ledger, PushReport};
 use crate::repo::{self, Repo};
 use crate::report::{self, ReportFile};
 use crate::search::{self, SearchReport};
@@ -36,6 +41,7 @@ use crate::spotify::account::{self, TimeRange};
 use crate::spotify::ids::IdKind;
 use crate::spotify::playback::{Device, PlayerRefused, Repeat};
 use crate::status::{self, StatusReport};
+use crate::targets;
 use crate::youtube::api as youtube_api;
 use crate::youtube::enrich::{self, ApiKeyReport, EnrichReport};
 use crate::youtube::model as youtube_model;
@@ -154,8 +160,13 @@ pub enum Command {
     /// List the playlists on the profile's account, its own and those it
     /// follows
     Playlists,
-    /// Show the contents of playlists, by URI or link; several at once
+    /// Show the contents of playlists, by URI, link, push ledger key or
+    /// name; several at once
     Playlist(PlaylistArgs),
+    /// The member's library: list the saved tracks and albums and the
+    /// followed artists; save, follow, remove and unfollow
+    #[command(subcommand)]
+    Library(LibraryCommand),
 }
 
 /// The Spotify player a command that changes playback goes to.
@@ -197,11 +208,7 @@ pub struct PlayArgs {
 impl PlayArgs {
     /// The shuffle state to set first; `None` leaves it as it is.
     fn shuffle(&self) -> Option<bool> {
-        match (self.shuffle, self.no_shuffle) {
-            (true, _) => Some(true),
-            (_, true) => Some(false),
-            _ => None,
-        }
+        either(self.shuffle, self.no_shuffle)
     }
 }
 
@@ -240,11 +247,272 @@ pub struct HistoryArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct PlaylistArgs {
-    /// Spotify playlists (spotify:playlist:<id> or an open.spotify.com
-    /// playlist address)
+    /// Playlists: spotify:playlist:<id>, an open.spotify.com playlist
+    /// address, the key of a playlist `sss push` made (ST:…, PL:…, YP:…),
+    /// or the name of a playlist on the account
     #[arg(value_name = "TARGET", required = true)]
     pub targets: Vec<String>,
+
+    #[command(subcommand)]
+    pub command: Option<PlaylistCommand>,
+}
+
+/// The playlist a playlist write changes.
+#[derive(Debug, Args)]
+pub struct PlaylistTargetArg {
+    /// The playlist: spotify:playlist:<id>, an open.spotify.com playlist
+    /// address, the key of a playlist `sss push` made (ST:…, PL:…, YP:…),
+    /// or the name of a playlist on the account
+    #[arg(value_name = "PLAYLIST")]
+    pub target: String,
+}
+
+/// The help of a playlist write's `ITEM` list.
+const TRACK_ITEMS_HELP: &str = "Tracks: Spotify URIs, open.spotify.com addresses, bare track ids or \
+                                source item ids (TR:…, YV:…)";
+
+/// The tracks of a playlist write: at least one.
+#[derive(Debug, Args)]
+pub struct TrackItems {
+    #[arg(value_name = "ITEM", help = TRACK_ITEMS_HELP, required_unless_present = "from_file")]
+    pub items: Vec<String>,
+
+    #[command(flatten)]
+    pub source: TrackSource,
+}
+
+impl TrackItems {
+    /// The write as [`playlist_edit`] takes it.
+    fn items(&self) -> targets::Items<'_> {
+        self.source.items(&self.items)
+    }
+}
+
+/// The new contents of `sss playlist replace`: possibly none.
+#[derive(Debug, Args)]
+pub struct ReplaceItems {
+    #[arg(value_name = "ITEM", help = TRACK_ITEMS_HELP)]
+    pub items: Vec<String>,
+
+    #[command(flatten)]
+    pub source: TrackSource,
+}
+
+impl ReplaceItems {
+    /// The write as [`playlist_edit`] takes it.
+    fn items(&self) -> targets::Items<'_> {
+        self.source.items(&self.items)
+    }
+}
+
+/// The options a playlist write's track list shares with every other.
+#[derive(Debug, Args)]
+pub struct TrackSource {
+    /// Also read tracks from a file, one per line (`-` for stdin, to EOF);
+    /// blank lines and lines starting with `#` are skipped
+    #[arg(long, value_name = "FILE")]
+    pub from_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub dry_run: DryRun,
+}
+
+impl TrackSource {
+    /// The write of `args` and these options as [`playlist_edit`] takes it.
+    fn items<'a>(&'a self, args: &'a [String]) -> targets::Items<'a> {
+        targets::Items {
+            args,
+            from_file: self.from_file.as_deref(),
+            dry_run: self.dry_run.dry_run,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlaylistCommand {
+    /// Make a playlist, private unless --public; a name the member already
+    /// owns is refused unless --duplicate
+    Create {
+        /// The new playlist's name, 1 to 100 characters
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Its description (cut to 300 characters)
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+        /// Make it public
+        #[arg(long, conflicts_with = "collaborative")]
+        public: bool,
+        /// Make it collaborative (a collaborative playlist is private)
+        #[arg(long)]
+        collaborative: bool,
+        /// Make it even when the member owns a playlist of that name
+        #[arg(long)]
+        duplicate: bool,
+        #[command(flatten)]
+        dry_run: DryRun,
+    },
+    /// Change a playlist's name, description, visibility or collaboration;
+    /// only its owner can
+    #[command(group(clap::ArgGroup::new("change").required(true).multiple(true)
+        .args(["name", "description", "public", "private", "collaborative", "no_collaborative"])))]
+    Edit {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        /// The new name, 1 to 100 characters
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The new description (cut to 300 characters; a pushed playlist
+        /// keeps its sss:<key> marker)
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+        /// Make it public
+        #[arg(long, conflicts_with = "private")]
+        public: bool,
+        /// Make it private
+        #[arg(long)]
+        private: bool,
+        /// Make it collaborative (a collaborative playlist is private)
+        #[arg(long, conflicts_with = "no_collaborative")]
+        collaborative: bool,
+        /// Make it no longer collaborative
+        #[arg(long)]
+        no_collaborative: bool,
+        #[command(flatten)]
+        dry_run: DryRun,
+    },
+    /// Append tracks to a playlist, or insert them at a position; tracks
+    /// already in it are skipped unless --duplicates
+    Add {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        #[command(flatten)]
+        items: TrackItems,
+        /// Insert before the item at this 1-based position (as `sss
+        /// playlist` numbers them) [default: append]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        at: Option<u32>,
+        /// Add tracks the playlist already holds too
+        #[arg(long)]
+        duplicates: bool,
+    },
+    /// Remove every occurrence of tracks from a playlist
+    Remove {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        #[command(flatten)]
+        items: TrackItems,
+    },
+    /// Move items within a playlist: --count items (default 1) from
+    /// position --from go before position --before, or to the end
+    #[command(group(clap::ArgGroup::new("destination").required(true)
+        .args(["before", "to_end"])))]
+    Move {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        /// The 1-based position (as `sss playlist` numbers them) of the
+        /// first item to move
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        from: u32,
+        /// How many items to move
+        #[arg(long, value_name = "K", default_value_t = 1,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        count: u32,
+        /// Put them before the item at this 1-based position
+        #[arg(long, value_name = "M", value_parser = clap::value_parser!(u32).range(1..))]
+        before: Option<u32>,
+        /// Put them at the end
+        #[arg(long)]
+        to_end: bool,
+        #[command(flatten)]
+        dry_run: DryRun,
+    },
+    /// Set a playlist's contents to exactly the tracks given, in order and
+    /// duplicates kept; no tracks empties it
+    Replace {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        #[command(flatten)]
+        items: ReplaceItems,
+    },
+    /// Remove a playlist from the account: a delete of the member's own, an
+    /// unfollow of another's (Spotify keeps a deleted one recoverable for
+    /// 90 days)
+    Delete {
+        #[command(flatten)]
+        target: PlaylistTargetArg,
+        #[command(flatten)]
+        dry_run: DryRun,
+    },
+}
+
+/// `Some(true)` for `on`, `Some(false)` for `off`, `None` for neither.
+fn either(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// How many entries a library read lists.
+#[derive(Debug, Args)]
+pub struct LimitArg {
+    /// List only the N most recently saved [default: every one]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: Option<u32>,
+}
+
+/// Every write's `--dry-run`.
+#[derive(Debug, Args)]
+pub struct DryRun {
+    /// Make every read and no write; report what the command would change
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The items of a library write.
+#[derive(Debug, Args)]
+pub struct LibraryItems {
+    /// Tracks, albums, artists or playlists: Spotify URIs, open.spotify.com
+    /// addresses, bare track ids or source item ids (TR:…, YV:…, AR:…, AL:…)
+    #[arg(value_name = "ITEM", required_unless_present = "from_file")]
+    pub items: Vec<String>,
+
+    /// Also read items from a file, one per line (`-` for stdin, to EOF);
+    /// blank lines and lines starting with `#` are skipped
+    #[arg(long, value_name = "FILE")]
+    pub from_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub dry_run: DryRun,
+}
+
+impl LibraryItems {
+    /// The write as [`library`] and [`playlist_edit`] take it.
+    fn items(&self) -> targets::Items<'_> {
+        targets::Items {
+            args: &self.items,
+            from_file: self.from_file.as_deref(),
+            dry_run: self.dry_run.dry_run,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LibraryCommand {
+    /// List the saved tracks, most recently saved first
+    Tracks(LimitArg),
+    /// List the saved albums, most recently saved first
+    Albums(LimitArg),
+    /// List the followed artists
+    Artists(LimitArg),
+    /// Save tracks and albums, follow artists and playlists; what is
+    /// already in the library is left as it is
+    Add(LibraryItems),
+    /// Remove saved tracks and albums, unfollow artists and playlists
+    Remove(LibraryItems),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -565,7 +833,24 @@ impl Command {
             Command::History(_) => "history",
             Command::Top { .. } => "top",
             Command::Playlists => "playlists",
-            Command::Playlist(_) => "playlist",
+            Command::Playlist(PlaylistArgs { command: None, .. }) => "playlist",
+            Command::Playlist(PlaylistArgs {
+                command: Some(command),
+                ..
+            }) => match command {
+                PlaylistCommand::Create { .. } => "playlist create",
+                PlaylistCommand::Edit { .. } => "playlist edit",
+                PlaylistCommand::Add { .. } => "playlist add",
+                PlaylistCommand::Remove { .. } => "playlist remove",
+                PlaylistCommand::Move { .. } => "playlist move",
+                PlaylistCommand::Replace { .. } => "playlist replace",
+                PlaylistCommand::Delete { .. } => "playlist delete",
+            },
+            Command::Library(LibraryCommand::Tracks(_)) => "library tracks",
+            Command::Library(LibraryCommand::Albums(_)) => "library albums",
+            Command::Library(LibraryCommand::Artists(_)) => "library artists",
+            Command::Library(LibraryCommand::Add(_)) => "library add",
+            Command::Library(LibraryCommand::Remove(_)) => "library remove",
         }
     }
 
@@ -630,6 +915,16 @@ pub enum Output {
     Top(TopReport),
     Playlists(PlaylistsReport),
     Playlist(PlaylistReport),
+    PlaylistCreate(CreateReport),
+    PlaylistEdit(EditReport),
+    PlaylistAdd(AddReport),
+    PlaylistRemove(RemoveReport),
+    PlaylistMove(MoveReport),
+    PlaylistReplace(ReplaceReport),
+    PlaylistDelete(DeleteReport),
+    Library(LibraryReport),
+    LibraryAdd(LibraryAddReport),
+    LibraryRemove(LibraryRemoveReport),
 }
 
 impl Output {
@@ -663,6 +958,16 @@ impl Output {
             Output::Top(r) => r.write_text(out),
             Output::Playlists(r) => r.write_text(out),
             Output::Playlist(r) => r.write_text(out),
+            Output::PlaylistCreate(r) => r.write_text(out),
+            Output::PlaylistEdit(r) => r.write_text(out),
+            Output::PlaylistAdd(r) => r.write_text(out),
+            Output::PlaylistRemove(r) => r.write_text(out),
+            Output::PlaylistMove(r) => r.write_text(out),
+            Output::PlaylistReplace(r) => r.write_text(out),
+            Output::PlaylistDelete(r) => r.write_text(out),
+            Output::Library(r) => r.write_text(out),
+            Output::LibraryAdd(r) => r.write_text(out),
+            Output::LibraryRemove(r) => r.write_text(out),
         }
     }
 }
@@ -687,8 +992,9 @@ struct FailureDocument<'a> {
     details: Option<Details<'a>>,
 }
 
-/// The `details` of a failed `pandora export`, a refused `match answer` or
-/// a player refusal.
+/// The `details` of a failed `pandora export`, a refused `match answer`, a
+/// player refusal or a write that failed after some of its requests
+/// landed.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Details<'a> {
@@ -714,6 +1020,9 @@ enum Details<'a> {
     Player {
         reason: &'a str,
         devices: &'a [Device],
+    },
+    Partial {
+        done: &'a [String],
     },
 }
 
@@ -770,6 +1079,8 @@ fn report_failure(cli: &Cli, err: &anyhow::Error, out: &mut dyn Write) -> Result
                 Some(Details::Refused {
                     problems: &r.problems,
                 })
+            } else if let Some(p) = e.downcast_ref::<PartialWrite>() {
+                Some(Details::Partial { done: &p.done })
             } else {
                 e.downcast_ref::<PlayerRefused>().map(|p| Details::Player {
                     reason: &p.reason,
@@ -1156,11 +1467,25 @@ fn dispatch(
                 spotify_client(name, &config, &repo, state_root.profile(name)?)
             })?))
         }
-        (Command::Playlist(args), Some(name)) => Ok(Output::Playlist(playlists::playlist(
-            name,
-            &args.targets,
-            || spotify_client(name, &config, &repo, state_root.profile(name)?),
-        )?)),
+        (
+            Command::Playlist(PlaylistArgs {
+                command: Some(command),
+                ..
+            }),
+            Some(name),
+        ) => playlist_command(command, name, &config, &repo, state_root, input, err),
+        (Command::Playlist(args), Some(name)) => {
+            let ledger = Ledger::load(&repo.profile(name)?.spotify_state())?;
+            Ok(Output::Playlist(playlists::playlist(
+                name,
+                &args.targets,
+                &ledger,
+                || spotify_client(name, &config, &repo, state_root.profile(name)?),
+            )?))
+        }
+        (Command::Library(command), Some(name)) => {
+            library_command(command, name, &config, &repo, state_root, input, err)
+        }
         // `guide` and `init` returned above, and every other command has a
         // profile by now: `--profile`, or the only one.
         (Command::Guide { .. } | Command::Init, _) | (_, None) => fail!(
@@ -1213,6 +1538,172 @@ fn player_command(
         )?)),
         _ => unreachable!("`{}` is not a playback command", command.name()),
     }
+}
+
+/// Runs a `sss playlist` write for profile `name`: its items are resolved
+/// and the push ledger read before the profile's Spotify client is made.
+fn playlist_command(
+    command: &PlaylistCommand,
+    name: &str,
+    config: &Config,
+    repo: &Repo,
+    state_root: &StateRoot,
+    input: &mut dyn BufRead,
+    err: &mut dyn Write,
+) -> Result<Output> {
+    let connect = || spotify_client(name, config, repo, state_root.profile(name)?);
+    let paths = repo.profile(name)?;
+    Ok(match command {
+        PlaylistCommand::Create {
+            name: title,
+            description,
+            public,
+            collaborative,
+            duplicate,
+            dry_run,
+        } => Output::PlaylistCreate(playlist_edit::create(
+            name,
+            &playlist_edit::Create {
+                name: title,
+                description: description.as_deref(),
+                public: *public,
+                collaborative: *collaborative,
+                duplicate: *duplicate,
+                dry_run: dry_run.dry_run,
+            },
+            connect,
+            err,
+        )?),
+        PlaylistCommand::Edit {
+            target,
+            name: title,
+            description,
+            public,
+            private,
+            collaborative,
+            no_collaborative,
+            dry_run,
+        } => Output::PlaylistEdit(playlist_edit::edit(
+            name,
+            &paths,
+            &target.target,
+            &playlist_edit::Edit {
+                name: title.as_deref(),
+                description: description.as_deref(),
+                public: either(*public, *private),
+                collaborative: either(*collaborative, *no_collaborative),
+                dry_run: dry_run.dry_run,
+            },
+            connect,
+            err,
+        )?),
+        PlaylistCommand::Add {
+            target,
+            items,
+            at,
+            duplicates,
+        } => Output::PlaylistAdd(playlist_edit::add(
+            name,
+            &paths,
+            &target.target,
+            &playlist_edit::Add {
+                items: items.items(),
+                at: *at,
+                duplicates: *duplicates,
+            },
+            input,
+            connect,
+            err,
+        )?),
+        PlaylistCommand::Remove { target, items } => Output::PlaylistRemove(playlist_edit::remove(
+            name,
+            &paths,
+            &target.target,
+            &items.items(),
+            input,
+            connect,
+            err,
+        )?),
+        PlaylistCommand::Move {
+            target,
+            from,
+            count,
+            before,
+            to_end: _,
+            dry_run,
+        } => Output::PlaylistMove(playlist_edit::move_items(
+            name,
+            &paths,
+            &target.target,
+            &playlist_edit::Move {
+                from: *from,
+                count: *count,
+                to: match before {
+                    Some(m) => playlist_edit::Destination::Before(*m),
+                    None => playlist_edit::Destination::End,
+                },
+                dry_run: dry_run.dry_run,
+            },
+            connect,
+        )?),
+        PlaylistCommand::Replace { target, items } => {
+            Output::PlaylistReplace(playlist_edit::replace(
+                name,
+                &paths,
+                &target.target,
+                &items.items(),
+                input,
+                connect,
+                err,
+            )?)
+        }
+        PlaylistCommand::Delete { target, dry_run } => Output::PlaylistDelete(
+            playlist_edit::delete(name, &paths, &target.target, dry_run.dry_run, connect)?,
+        ),
+    })
+}
+
+/// Runs a `sss library` command for profile `name`: the items of a write
+/// are resolved before the profile's Spotify client is made.
+fn library_command(
+    command: &LibraryCommand,
+    name: &str,
+    config: &Config,
+    repo: &Repo,
+    state_root: &StateRoot,
+    input: &mut dyn BufRead,
+    err: &mut dyn Write,
+) -> Result<Output> {
+    let connect = || spotify_client(name, config, repo, state_root.profile(name)?);
+    let (kind, limit) = match command {
+        LibraryCommand::Tracks(limit) => (LibraryKind::Tracks, limit),
+        LibraryCommand::Albums(limit) => (LibraryKind::Albums, limit),
+        LibraryCommand::Artists(limit) => (LibraryKind::Artists, limit),
+        LibraryCommand::Add(args) => {
+            return Ok(Output::LibraryAdd(library::add(
+                name,
+                &repo.profile(name)?,
+                &args.items(),
+                input,
+                connect,
+                err,
+            )?));
+        }
+        LibraryCommand::Remove(args) => {
+            return Ok(Output::LibraryRemove(library::remove(
+                name,
+                &repo.profile(name)?,
+                &args.items(),
+                input,
+                connect,
+                err,
+            )?));
+        }
+    };
+    let limit = limit
+        .limit
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    Ok(Output::Library(library::list(name, kind, limit, connect)?))
 }
 
 /// The Spotify client of profile `name`: its client id from the
@@ -1311,6 +1802,26 @@ mod tests {
     }
 
     #[test]
+    fn the_push_part_a_pending_key_names_parses_as_its_part() {
+        for (key, part) in [
+            ("ST:9", push::Part::Stations),
+            ("station:41", push::Part::Stations),
+            ("PL:1", push::Part::Playlists),
+            ("YP:x", push::Part::Playlists),
+            (push::THUMBS_DOWN_KEY, push::Part::ThumbsDown),
+            (
+                crate::youtube::select::MOST_PLAYED_KEY,
+                push::Part::MostPlayed,
+            ),
+        ] {
+            let named = playlists::push_part(key);
+            let parsed = PushPart::from_str(named, false)
+                .unwrap_or_else(|e| panic!("--only {named} for {key}: {e}"));
+            assert_eq!(push::Part::from(parsed), part, "{key}");
+        }
+    }
+
+    #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
     }
@@ -1385,6 +1896,52 @@ mod tests {
         ),
         (&["playlists"], "playlists"),
         (&["playlist", PLAYLIST], "playlist"),
+        (&["playlist", "create", "x"], "playlist create"),
+        (
+            &["playlist", "create", "x", "--public", "--description", "d"],
+            "playlist create",
+        ),
+        (
+            &["playlist", "edit", PLAYLIST, "--name", "y"],
+            "playlist edit",
+        ),
+        (&["playlist", "add", PLAYLIST, TRACK], "playlist add"),
+        (
+            &["playlist", "add", PLAYLIST, "--from-file", "f", "--at", "2"],
+            "playlist add",
+        ),
+        (&["playlist", "add", PLAYLIST, "TR:1"], "playlist add"),
+        (&["playlist", "add", "ST:1", TRACK], "playlist add"),
+        (&["playlist", "remove", PLAYLIST, TRACK], "playlist remove"),
+        (
+            &["playlist", "move", PLAYLIST, "--from", "1", "--before", "3"],
+            "playlist move",
+        ),
+        (
+            &[
+                "playlist", "move", PLAYLIST, "--from", "1", "--count", "2", "--to-end",
+            ],
+            "playlist move",
+        ),
+        (&["playlist", "replace", PLAYLIST], "playlist replace"),
+        (
+            &["playlist", "replace", PLAYLIST, TRACK],
+            "playlist replace",
+        ),
+        (&["playlist", "delete", PLAYLIST], "playlist delete"),
+        (
+            &["playlist", "delete", PLAYLIST, "--dry-run"],
+            "playlist delete",
+        ),
+        (&["library", "tracks"], "library tracks"),
+        (&["library", "albums", "--limit", "5"], "library albums"),
+        (&["library", "artists"], "library artists"),
+        (&["library", "add", TRACK], "library add"),
+        (&["library", "add", TRACK, "--dry-run"], "library add"),
+        (
+            &["library", "remove", TRACK, "--from-file", "f"],
+            "library remove",
+        ),
     ];
 
     /// The documentation's public example playlist.
@@ -1480,6 +2037,50 @@ mod tests {
             panic!("not playlist")
         };
         assert_eq!(p.targets, [PLAYLIST, "spotify:playlist:x"]);
+        assert!(p.command.is_none());
+        // After a target, a subcommand word is one more target.
+        let Command::Playlist(p) = parse(&["playlist", PLAYLIST, "create"]).command else {
+            panic!("not playlist")
+        };
+        assert_eq!(p.targets, [PLAYLIST, "create"]);
+        let Command::Playlist(PlaylistArgs {
+            command:
+                Some(PlaylistCommand::Edit {
+                    public,
+                    private,
+                    collaborative,
+                    no_collaborative,
+                    ..
+                }),
+            ..
+        }) = parse(&["playlist", "edit", PLAYLIST, "--private", "--collaborative"]).command
+        else {
+            panic!("not playlist edit")
+        };
+        assert_eq!(either(public, private), Some(false));
+        assert_eq!(either(collaborative, no_collaborative), Some(true));
+        let Command::Playlist(PlaylistArgs {
+            command:
+                Some(PlaylistCommand::Add {
+                    target, items, at, ..
+                }),
+            ..
+        }) = parse(&[
+            "playlist",
+            "add",
+            "Kids Songs",
+            "--from-file",
+            "-",
+            "--at",
+            "3",
+        ])
+        .command
+        else {
+            panic!("not playlist add")
+        };
+        assert_eq!(target.target, "Kids Songs");
+        assert!(items.items.is_empty());
+        assert_eq!(at, Some(3));
     }
 
     #[test]
@@ -1523,6 +2124,38 @@ mod tests {
             &["top", "tracks", "--device", "Firefox"],
             &["playlists", "--device", "Firefox"],
             &["playlist", PLAYLIST, "--device", "Firefox"],
+            &["playlist", "create"],
+            &["playlist", "create", "x", "--public", "--collaborative"],
+            &["playlist", "edit", PLAYLIST],
+            &["playlist", "edit", PLAYLIST, "--public", "--private"],
+            &[
+                "playlist",
+                "edit",
+                PLAYLIST,
+                "--collaborative",
+                "--no-collaborative",
+            ],
+            &["playlist", "add", PLAYLIST],
+            &["playlist", "add", PLAYLIST, TRACK, "--at", "0"],
+            &["playlist", "remove", PLAYLIST, "--dry-run"],
+            &["playlist", "move", PLAYLIST, "--from", "1"],
+            &["playlist", "move", PLAYLIST, "--from", "0", "--to-end"],
+            &["playlist", "move", PLAYLIST, "--before", "2"],
+            &[
+                "playlist", "move", PLAYLIST, "--from", "1", "--before", "3", "--to-end",
+            ],
+            &[
+                "playlist", "move", PLAYLIST, "--from", "1", "--count", "0", "--to-end",
+            ],
+            &["playlist", "replace"],
+            &["playlist", "delete"],
+            &["playlist", "delete", PLAYLIST, TRACK],
+            &["library"],
+            &["library", "songs"],
+            &["library", "add"],
+            &["library", "remove", "--dry-run"],
+            &["library", "tracks", "--limit", "0"],
+            &["library", "tracks", TRACK],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("sss").chain(args.iter().copied())).is_err(),
@@ -1880,6 +2513,78 @@ mod tests {
                 "playlist spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
                 Some(Kind::Config),
             ),
+            ("playlist create x", Some(Kind::Config)),
+            (
+                "playlist create x --public --description d",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist edit spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --name y",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist add spotify:playlist:37i9dQZF1DXcBWIGoYBM5M \
+                 spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist add spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --from-file f --at 2",
+                Some(Kind::Other),
+            ),
+            (
+                "playlist add spotify:playlist:37i9dQZF1DXcBWIGoYBM5M TR:1",
+                Some(Kind::Input),
+            ),
+            (
+                "playlist add ST:1 spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Input),
+            ),
+            (
+                "playlist remove spotify:playlist:37i9dQZF1DXcBWIGoYBM5M \
+                 spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist move spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --from 1 --before 3",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist move spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --from 1 --count 2 \
+                 --to-end",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist replace spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist replace spotify:playlist:37i9dQZF1DXcBWIGoYBM5M \
+                 spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist delete spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                Some(Kind::Config),
+            ),
+            (
+                "playlist delete spotify:playlist:37i9dQZF1DXcBWIGoYBM5M --dry-run",
+                Some(Kind::Config),
+            ),
+            ("library tracks", Some(Kind::Config)),
+            ("library albums --limit 5", Some(Kind::Config)),
+            ("library artists", Some(Kind::Config)),
+            (
+                "library add spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                Some(Kind::Config),
+            ),
+            (
+                "library add spotify:track:4uLU6hMCjMI75M1A2tKUQC --dry-run",
+                Some(Kind::Config),
+            ),
+            (
+                "library remove spotify:track:4uLU6hMCjMI75M1A2tKUQC --from-file f",
+                Some(Kind::Other),
+            ),
         ];
         for (args, name) in DOCUMENTED {
             let mut full = with_repo(&repo, args);
@@ -1945,6 +2650,29 @@ mod tests {
             serde_json::json!({"reason": "SEVERAL_DEVICES", "devices": [
                 {"id": "d1", "name": "Firefox", "type": "Computer", "is_active": false,
                  "is_restricted": false, "volume_percent": 80}]})
+        );
+    }
+
+    #[test]
+    fn a_partial_write_renders_what_landed_as_details_done() {
+        let err = anyhow::Error::new(PartialWrite {
+            what: "added",
+            done: vec!["spotify:track:1".into()],
+            total: 2,
+            source: anyhow::Error::new(error::Failure::new(Kind::Unavailable, "no answer")),
+        })
+        .context("adding");
+        let mut out = Vec::new();
+        report_failure(&parse(&["status", "--json"]), &err, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["kind"], "unavailable");
+        assert_eq!(
+            doc["details"],
+            serde_json::json!({"done": ["spotify:track:1"]})
+        );
+        assert_eq!(
+            doc["error"],
+            "adding: added 1 of 2 (spotify:track:1), then: no answer"
         );
     }
 

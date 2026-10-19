@@ -6,6 +6,49 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
+`sss` can now change a Spotify account directly, not only through the
+import: playlists and the library are edited by their own commands, each
+with `--dry-run`, so an assistant can script a merge, a dedupe or a
+playlist of the week. `docs/llm-guide.md` has worked examples. `sss push`
+now respects those edits: a track removed from a pushed playlist stays
+removed, and a deleted pushed playlist is not recreated.
+
+### Added
+
+- **`sss playlist create|edit|add|remove|move|replace|delete`** make a
+  playlist (refusing a name you already own unless `--duplicate`), change
+  its name, description or visibility, append or insert tracks (skipping
+  those present unless `--duplicates`), remove every occurrence of
+  tracks, move a range of items, set the contents to exactly a list, and
+  delete or unfollow a playlist. A playlist is named by its Spotify URI,
+  by its name, or by the key `sss push` recorded for it (such as `ST:…`
+  for a Pandora station).
+- **`sss library add|remove`** save and remove tracks and albums and
+  follow and unfollow artists and playlists, writing only what changes.
+  Items are Spotify URIs or links, or the source ids from the export
+  (`TR:…`, `YV:…`, …) resolved through their match, given on the command
+  line or as a list with `--from-file` (`-` for stdin).
+- **`sss library tracks|albums|artists`** list the saved tracks, saved
+  albums or followed artists, most recent first (`--limit N`).
+- `sss playlist` reports a pushed playlist's key as `pushed_as`, and as
+  `unavailable` the entries Spotify holds but cannot show.
+- A write that fails part-way reports what already landed as
+  `details.done`.
+
+### Changed
+
+- `sss push` adds each matched track to a playlist once and never again:
+  a track removed from a pushed playlist stays removed, and one already
+  there is recorded rather than added.
+- `sss push` leaves alone a pushed playlist that is no longer on the
+  account, reporting it as `action: "deleted"`, instead of refilling it.
+  A live push with a pushed playlist needs the library and playlist read
+  scopes, which every token signed in since 0.4.0 has.
+- `sss playlist` accepts a playlist name; a name matching none or several
+  playlists is refused with kind `input`.
+
 ## [0.5.0] - 2026-10-19
 
 YouTube Music joins Pandora as a source. Existing data repositories keep

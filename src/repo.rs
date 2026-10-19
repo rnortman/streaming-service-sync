@@ -409,6 +409,12 @@ fn run_order(id: &str) -> (String, u64) {
     (id.to_owned(), 1)
 }
 
+/// Whether a count is zero: the `skip_serializing_if` of a count a
+/// document leaves out when there is none.
+pub fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// The repository's JSON form of `value`: two-space indented, one trailing
 /// newline. Object keys come out in declaration order for structs and in
 /// sorted order for maps, so equal values always serialize to equal bytes.

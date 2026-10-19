@@ -122,6 +122,60 @@ macro_rules! fail {
     };
 }
 
+/// A write of several requests that failed after some landed. Its text is
+/// `<what> <n> of <total> (<the URIs>), then`, followed in the chain by
+/// `source`, which carries the kind.
+#[derive(Debug)]
+pub struct PartialWrite {
+    /// What the landed requests did: `added`, `removed`, `saved`, …
+    pub what: &'static str,
+    /// The URIs the landed requests covered, in order.
+    pub done: Vec<String>,
+    pub total: usize,
+    pub source: anyhow::Error,
+}
+
+impl PartialWrite {
+    /// `source`, the failure of a write of `total` URIs after `done`
+    /// landed: wrapped in a `PartialWrite` when any did, else as it is.
+    pub fn after(
+        what: &'static str,
+        done: Vec<String>,
+        total: usize,
+        source: anyhow::Error,
+    ) -> anyhow::Error {
+        if done.is_empty() {
+            source
+        } else {
+            anyhow::Error::new(PartialWrite {
+                what,
+                done,
+                total,
+                source,
+            })
+        }
+    }
+}
+
+impl fmt::Display for PartialWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} of {} ({}), then",
+            self.what,
+            self.done.len(),
+            self.total,
+            self.done.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for PartialWrite {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// The kind of `err`: that of the first error in its chain that carries
 /// one, else [`Kind::Other`].
 pub fn kind(err: &anyhow::Error) -> Kind {
@@ -287,6 +341,52 @@ mod tests {
         .context("playing");
         assert_eq!(kind(&err), Kind::Player);
         assert_eq!(serde_json::to_string(&Kind::Player).unwrap(), "\"player\"");
+    }
+
+    #[test]
+    fn a_partial_write_carries_its_source_s_kind_and_names_what_landed() {
+        let source = anyhow::Error::new(Failure::new(Kind::Quota, "limit reached"))
+            .context("POST playlists/x/items");
+        let err = anyhow::Error::new(PartialWrite {
+            what: "added",
+            done: vec!["spotify:track:1".into(), "spotify:track:2".into()],
+            total: 5,
+            source,
+        })
+        .context("adding to \"Kids Songs\"");
+        assert_eq!(kind(&err), Kind::Quota);
+        assert_eq!(
+            format!("{err:#}"),
+            "adding to \"Kids Songs\": added 2 of 5 (spotify:track:1, spotify:track:2), then: \
+             POST playlists/x/items: limit reached"
+        );
+        let plain = anyhow::Error::new(PartialWrite {
+            what: "removed",
+            done: Vec::new(),
+            total: 1,
+            source: anyhow::anyhow!("disk full"),
+        });
+        assert_eq!(kind(&plain), Kind::Other);
+    }
+
+    #[test]
+    fn a_failure_before_anything_landed_is_not_wrapped() {
+        let first = PartialWrite::after(
+            "saved",
+            Vec::new(),
+            3,
+            anyhow::Error::new(Failure::new(Kind::Unavailable, "down")),
+        );
+        assert!(!first.is::<PartialWrite>());
+        assert_eq!(format!("{first:#}"), "down");
+        let later = PartialWrite::after(
+            "saved",
+            vec!["spotify:track:1".into()],
+            3,
+            anyhow::Error::new(Failure::new(Kind::Unavailable, "down")),
+        );
+        assert_eq!(later.downcast_ref::<PartialWrite>().unwrap().total, 3);
+        assert_eq!(kind(&later), Kind::Unavailable);
     }
 
     #[test]

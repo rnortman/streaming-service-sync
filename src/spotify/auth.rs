@@ -66,6 +66,53 @@ pub const PLAYLIST_MODIFY_PUBLIC_SCOPE: &str = "playlist-modify-public";
 /// The scopes that list the member's playlists, private and collaborative.
 pub const PLAYLIST_READ_SCOPES: &[&str] = &["playlist-read-private", "playlist-read-collaborative"];
 
+/// The scopes a playlist write needs: the two that change playlists and
+/// [`PLAYLIST_READ_SCOPES`], since every write reads first.
+pub const PLAYLIST_WRITE_SCOPES: &[&str] = &[
+    "playlist-modify-private",
+    PLAYLIST_MODIFY_PUBLIC_SCOPE,
+    PLAYLIST_READ_SCOPES[0],
+    PLAYLIST_READ_SCOPES[1],
+];
+
+/// The scopes that read the saved tracks and albums and the followed
+/// artists.
+pub const LIBRARY_READ_SCOPES: &[&str] = &["user-library-read", "user-follow-read"];
+
+/// The scopes that save and remove tracks and albums and follow and
+/// unfollow artists, with [`LIBRARY_READ_SCOPES`] for the check before.
+pub const LIBRARY_WRITE_SCOPES: &[&str] = &[
+    "user-library-modify",
+    "user-follow-modify",
+    LIBRARY_READ_SCOPES[0],
+    LIBRARY_READ_SCOPES[1],
+];
+
+/// The scopes a library write of a playlist URI (a follow or an unfollow)
+/// may need: [`LIBRARY_WRITE_SCOPES`] and [`PLAYLIST_WRITE_SCOPES`].
+/// Spotify names no scope for it, so all of them are required rather than
+/// letting a missing one reach the request as a 403.
+pub const PLAYLIST_FOLLOW_SCOPES: &[&str] = &[
+    LIBRARY_WRITE_SCOPES[0],
+    LIBRARY_WRITE_SCOPES[1],
+    LIBRARY_WRITE_SCOPES[2],
+    LIBRARY_WRITE_SCOPES[3],
+    PLAYLIST_WRITE_SCOPES[0],
+    PLAYLIST_WRITE_SCOPES[1],
+    PLAYLIST_WRITE_SCOPES[2],
+    PLAYLIST_WRITE_SCOPES[3],
+];
+
+/// The read half of [`PLAYLIST_FOLLOW_SCOPES`]: what a library check of a
+/// playlist URI may need, [`LIBRARY_READ_SCOPES`] and
+/// [`PLAYLIST_READ_SCOPES`].
+pub const PLAYLIST_FOLLOW_READ_SCOPES: &[&str] = &[
+    LIBRARY_READ_SCOPES[0],
+    LIBRARY_READ_SCOPES[1],
+    PLAYLIST_READ_SCOPES[0],
+    PLAYLIST_READ_SCOPES[1],
+];
+
 /// The public document that walks through registering the app.
 pub const SETUP_DOC: &str = "docs/spotify-app-setup.md";
 
@@ -626,6 +673,45 @@ mod tests {
         assert_eq!(scopes(), want);
         let unique: std::collections::BTreeSet<_> = SCOPES.iter().collect();
         assert_eq!(unique.len(), SCOPES.len());
+    }
+
+    #[test]
+    fn the_write_scope_lists_are_unions_of_their_parts_and_all_asked_for() {
+        use std::collections::BTreeSet;
+        let set = |l: &[&'static str]| l.iter().copied().collect::<BTreeSet<_>>();
+        let union = |a: &[&'static str], b: &[&'static str]| &set(a) | &set(b);
+        assert_eq!(
+            set(PLAYLIST_WRITE_SCOPES),
+            union(
+                &["playlist-modify-private", "playlist-modify-public"],
+                PLAYLIST_READ_SCOPES
+            )
+        );
+        assert_eq!(
+            set(LIBRARY_WRITE_SCOPES),
+            union(
+                &["user-library-modify", "user-follow-modify"],
+                LIBRARY_READ_SCOPES
+            )
+        );
+        assert_eq!(
+            set(PLAYLIST_FOLLOW_SCOPES),
+            union(LIBRARY_WRITE_SCOPES, PLAYLIST_WRITE_SCOPES)
+        );
+        assert_eq!(
+            set(PLAYLIST_FOLLOW_READ_SCOPES),
+            union(LIBRARY_READ_SCOPES, PLAYLIST_READ_SCOPES)
+        );
+        for list in [
+            PLAYLIST_WRITE_SCOPES,
+            LIBRARY_READ_SCOPES,
+            LIBRARY_WRITE_SCOPES,
+            PLAYLIST_FOLLOW_SCOPES,
+            PLAYLIST_FOLLOW_READ_SCOPES,
+        ] {
+            assert_eq!(set(list).len(), list.len(), "{list:?} repeats a scope");
+            assert!(set(list).is_subset(&set(SCOPES)), "{list:?}");
+        }
     }
 
     #[test]

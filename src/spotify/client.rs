@@ -149,9 +149,10 @@ pub struct SearchResults {
     pub albums: Vec<FoundAlbum>,
 }
 
-/// What [`Spotify::playlist_add_items`] calls after each chunk lands: its
-/// URIs and the playlist's new snapshot id.
-pub type ItemsAdded<'a> = dyn FnMut(&[String], Option<&str>) -> Result<()> + 'a;
+/// What a chunked playlist write ([`Spotify::playlist_add_items`],
+/// [`Spotify::playlist_remove_items`]) calls after each chunk lands: its URIs
+/// and the playlist's new snapshot id.
+pub type ItemsChanged<'a> = dyn FnMut(&[String], Option<&str>) -> Result<()> + 'a;
 
 /// A playlist [`Spotify::playlist_create`] made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,14 +232,27 @@ impl From<WireArtist> for FoundArtist {
     }
 }
 
+/// An album as search and the saved-albums read send it.
 #[derive(Deserialize)]
-struct WireAlbum {
+pub(super) struct WireAlbum {
     uri: String,
     name: String,
     #[serde(default)]
     artists: Vec<Named>,
     album_type: Option<String>,
     release_date: Option<String>,
+}
+
+impl From<WireAlbum> for FoundAlbum {
+    fn from(a: WireAlbum) -> Self {
+        FoundAlbum {
+            uri: a.uri,
+            name: a.name,
+            artists: names(a.artists),
+            album_type: a.album_type,
+            release_date: a.release_date,
+        }
+    }
 }
 
 /// One page of a list: its entries, and the address of the next page when
@@ -274,9 +288,10 @@ struct WireCreated {
     snapshot_id: Option<String>,
 }
 
+/// A playlist write's answer: the playlist's new snapshot id.
 #[derive(Deserialize)]
-struct WireSnapshot {
-    snapshot_id: Option<String>,
+pub(super) struct WireSnapshot {
+    pub(super) snapshot_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -373,15 +388,30 @@ pub(super) struct Call<'a> {
     /// A player endpoint: a 403 or other 4xx whose body carries
     /// `error.reason` is a [`PlayerRefused`].
     pub(super) player: bool,
+    /// Whether the request may be resent after no response or a 5xx.
+    pub(super) resend: bool,
 }
 
-impl Call<'_> {
+impl<'a> Call<'a> {
+    /// `method path` with no query, no body, not a player endpoint, and
+    /// resent after no response or a 5xx unless it is a `POST` (a playlist
+    /// create, an items add, a skip or a queue add): Spotify may have
+    /// applied it, and a second one would make a second playlist, add the
+    /// items twice, skip twice or queue twice.
+    pub(super) fn new(method: &'a str, path: &'a str) -> Self {
+        Call {
+            method,
+            path,
+            query: &[],
+            body: None,
+            player: false,
+            resend: method != "POST",
+        }
+    }
+
     /// Whether the request may be resent after no response or a 5xx.
-    /// A `POST` (a playlist create, an items add, a skip or a queue add)
-    /// is not: Spotify may have applied it, and a second one would make a
-    /// second playlist, add the items twice, skip twice or queue twice.
     fn resendable(&self) -> bool {
-        self.method != "POST"
+        self.resend
     }
 
     /// The end of the message for a request that got no answer, or a 5xx,
@@ -515,11 +545,8 @@ impl Spotify {
             query.push(("market", &market));
         }
         let wire: WireSearch = self.json(&Call {
-            method: "GET",
-            path: "search",
             query: &query,
-            body: None,
-            player: false,
+            ..Call::new("GET", "search")
         })?;
         Ok(SearchResults {
             tracks: parsed_items::<WireTrack>(wire.tracks)
@@ -532,31 +559,28 @@ impl Spotify {
                 .collect(),
             albums: parsed_items::<WireAlbum>(wire.albums)
                 .into_iter()
-                .map(|a| FoundAlbum {
-                    uri: a.uri,
-                    name: a.name,
-                    artists: names(a.artists),
-                    album_type: a.album_type,
-                    release_date: a.release_date,
-                })
+                .map(FoundAlbum::from)
                 .collect(),
         })
     }
 
-    /// `POST me/playlists`: a new playlist of the member's.
+    /// `POST me/playlists`: a new playlist of the member's. Spotify
+    /// requires a collaborative playlist to be private; `collaborative` is
+    /// sent only when set, Spotify's default being `false`.
     pub fn playlist_create(
         &mut self,
         name: &str,
         public: bool,
+        collaborative: bool,
         description: &str,
     ) -> Result<CreatedPlaylist> {
-        let body = json!({"name": name, "public": public, "description": description});
+        let mut body = json!({"name": name, "public": public, "description": description});
+        if collaborative {
+            body["collaborative"] = json!(true);
+        }
         let wire: WireCreated = self.json(&Call {
-            method: "POST",
-            path: "me/playlists",
-            query: &[],
             body: Some(&body),
-            player: false,
+            ..Call::new("POST", "me/playlists")
         })?;
         Ok(CreatedPlaylist {
             id: wire.id,
@@ -586,48 +610,63 @@ impl Spotify {
     }
 
     /// `POST playlists/{id}/items` in chunks of [`PLAYLIST_CHUNK`], in
-    /// order. `added` is called after each chunk lands with its URIs and
-    /// the playlist's new snapshot id; its error stops the writes.
+    /// order: appended, or inserted at the 0-based `position`, each chunk
+    /// after the ones before it. `added` is called after each chunk lands
+    /// with its URIs and the playlist's new snapshot id; its error stops
+    /// the writes.
     pub fn playlist_add_items(
         &mut self,
         playlist_id: &str,
         uris: &[String],
-        added: &mut ItemsAdded<'_>,
+        position: Option<u32>,
+        added: &mut ItemsChanged<'_>,
     ) -> Result<()> {
         let path = format!("playlists/{playlist_id}/items");
+        let mut at = position;
         for chunk in uris.chunks(PLAYLIST_CHUNK) {
-            let body = json!({ "uris": chunk });
+            let mut body = json!({ "uris": chunk });
+            if let Some(at) = at {
+                body["position"] = json!(at);
+            }
             let wire: WireSnapshot = self.json(&Call {
-                method: "POST",
-                path: &path,
-                query: &[],
                 body: Some(&body),
-                player: false,
+                ..Call::new("POST", &path)
             })?;
             added(chunk, wire.snapshot_id.as_deref())?;
+            at = at.map(|at| at + u32::try_from(chunk.len()).unwrap_or(u32::MAX));
         }
         Ok(())
     }
 
     /// `PUT me/library` in chunks of [`LIBRARY_CHUNK`]: saves tracks and
-    /// albums and follows artists. `saved` is called after each chunk
-    /// lands; its error stops the writes.
+    /// albums and follows artists and playlists. `saved` is called after
+    /// each chunk lands; its error stops the writes.
     pub fn library_add(
         &mut self,
         uris: &[String],
         saved: &mut dyn FnMut(&[String]) -> Result<()>,
     ) -> Result<()> {
+        self.library_write("PUT", uris, saved)
+    }
+
+    /// `method me/library?uris=…` in chunks of [`LIBRARY_CHUNK`], body
+    /// `{}`; `done` is called after each chunk lands, and its error stops
+    /// the writes.
+    pub(super) fn library_write(
+        &mut self,
+        method: &str,
+        uris: &[String],
+        done: &mut dyn FnMut(&[String]) -> Result<()>,
+    ) -> Result<()> {
         let body = json!({});
         for chunk in uris.chunks(LIBRARY_CHUNK) {
             let joined = chunk.join(",");
             self.call(&Call {
-                method: "PUT",
-                path: "me/library",
                 query: &[("uris", &joined)],
                 body: Some(&body),
-                player: false,
+                ..Call::new(method, "me/library")
             })?;
-            saved(chunk)?;
+            done(chunk)?;
         }
         Ok(())
     }
@@ -639,11 +678,8 @@ impl Spotify {
         for chunk in uris.chunks(LIBRARY_CHUNK) {
             let joined = chunk.join(",");
             let answer: Vec<bool> = self.json(&Call {
-                method: "GET",
-                path: "me/library/contains",
                 query: &[("uris", &joined)],
-                body: None,
-                player: false,
+                ..Call::new("GET", "me/library/contains")
             })?;
             if answer.len() != chunk.len() {
                 return Err(anyhow!(
@@ -664,11 +700,8 @@ impl Spotify {
         query: &[(&str, &str)],
     ) -> Result<T> {
         self.json(&Call {
-            method: "GET",
-            path,
             query,
-            body: None,
-            player: false,
+            ..Call::new("GET", path)
         })
     }
 
@@ -681,16 +714,32 @@ impl Spotify {
         query: &[(&str, &str)],
         chunk: usize,
     ) -> Result<Vec<Value>> {
-        let limit = chunk.to_string();
+        self.get_pages(path, query, chunk, None)
+    }
+
+    /// [`get_all`](Self::get_all), stopping once `limit` entries are in
+    /// hand: each page asks for at most `chunk` and no more than are still
+    /// wanted, and the result holds at most `limit` entries.
+    pub(super) fn get_pages(
+        &mut self,
+        path: &str,
+        query: &[(&str, &str)],
+        chunk: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
         let mut all = Vec::new();
         loop {
+            let size = limit
+                .map_or(chunk, |l| l.saturating_sub(all.len()).clamp(1, chunk))
+                .to_string();
             let offset = all.len().to_string();
             let mut paged = query.to_vec();
-            paged.extend([("limit", limit.as_str()), ("offset", offset.as_str())]);
+            paged.extend([("limit", size.as_str()), ("offset", offset.as_str())]);
             let page: WirePage = self.get(path, &paged)?;
             let got = page.items.len();
             all.extend(page.items);
-            if page.next.is_none() || got == 0 {
+            if limit.is_some_and(|l| all.len() >= l) || page.next.is_none() || got == 0 {
+                all.truncate(limit.unwrap_or(usize::MAX));
                 return Ok(all);
             }
         }
@@ -1406,7 +1455,7 @@ mod tests {
                 "message": "User not registered in the Developer Dashboard"}}));
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.playlist_create("n", false, "d").unwrap_err();
+        let err = c.playlist_create("n", false, false, "d").unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Config);
         let text = format!("{err:#}");
         assert!(
@@ -1462,7 +1511,7 @@ mod tests {
         });
         let mut c = fresh_client(tmp.path(), &server);
         assert_eq!(
-            c.playlist_create("Pandora: Rock", false, "d sss:ST:1")
+            c.playlist_create("Pandora: Rock", false, false, "d sss:ST:1")
                 .unwrap(),
             CreatedPlaylist {
                 id: "pl1".into(),
@@ -1470,6 +1519,72 @@ mod tests {
             }
         );
         mock.assert();
+        let collaborative = server.mock(|when, then| {
+            when.method(POST).path("/v1/me/playlists").json_body(
+                json!({"name": "Shared", "public": false, "collaborative": true,
+                                  "description": ""}),
+            );
+            then.status(201).json_body(json!({"id": "pl2"}));
+        });
+        assert_eq!(
+            c.playlist_create("Shared", false, true, "").unwrap().id,
+            "pl2"
+        );
+        collaborative.assert();
+    }
+
+    #[test]
+    fn playlist_items_inserted_at_a_position_advance_it_per_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        let all = uris(230);
+        let mut mocks = Vec::new();
+        for (n, chunk) in all.chunks(100).enumerate() {
+            let chunk = chunk.to_vec();
+            mocks.push(server.mock(move |when, then| {
+                when.method(POST)
+                    .path("/v1/playlists/pl1/items")
+                    .json_body(json!({"uris": chunk, "position": 4 + 100 * n}));
+                then.status(201).json_body(json!({"snapshot_id": "s"}));
+            }));
+        }
+        let mut c = fresh_client(tmp.path(), &server);
+        c.playlist_add_items("pl1", &all, Some(4), &mut |_, _| Ok(()))
+            .unwrap();
+        for m in &mocks {
+            m.assert();
+        }
+    }
+
+    #[test]
+    fn a_call_marked_not_resendable_is_sent_once_and_any_other_is_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start();
+        let busy = server.mock(|when, then| {
+            when.method(PUT).path("/v1/playlists/pl1/items");
+            then.status(503).body("busy");
+        });
+        let mut c = fresh_client(tmp.path(), &server);
+        c.warn = quiet;
+        let once = Call {
+            resend: false,
+            ..Call::new("PUT", "playlists/pl1/items")
+        };
+        let err = c.call(&once).unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Unavailable);
+        assert_eq!(
+            format!("{err:#}"),
+            "PUT playlists/pl1/items: HTTP 503: \"busy\"; not resent, since Spotify may have \
+             applied it; re-run"
+        );
+        busy.assert_calls(1);
+        let err = c
+            .call(&Call::new("PUT", "playlists/pl1/items"))
+            .unwrap_err();
+        assert_eq!(crate::error::kind(&err), Kind::Unavailable);
+        busy.assert_calls(1 + MAX_TRIES as usize);
+        assert!(Call::new("DELETE", "x").resend);
+        assert!(!Call::new("POST", "x").resend);
     }
 
     #[test]
@@ -1545,7 +1660,7 @@ mod tests {
         }
         let mut c = fresh_client(tmp.path(), &server);
         let mut seen = Vec::new();
-        c.playlist_add_items("pl1", &all, &mut |chunk, snap| {
+        c.playlist_add_items("pl1", &all, None, &mut |chunk, snap| {
             seen.push((chunk.len(), snap.map(str::to_owned)));
             Ok(())
         })
@@ -1562,7 +1677,9 @@ mod tests {
             ]
         );
         let err = c
-            .playlist_add_items("pl1", &all, &mut |_, _| Err(anyhow!("ledger write failed")))
+            .playlist_add_items("pl1", &all, None, &mut |_, _| {
+                Err(anyhow!("ledger write failed"))
+            })
             .unwrap_err();
         assert_eq!(err.to_string(), "ledger write failed");
         mocks[1].assert_calls(1);
@@ -1581,7 +1698,7 @@ mod tests {
             then.status(503).body("busy");
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let err = c.playlist_create("n", false, "d").unwrap_err();
+        let err = c.playlist_create("n", false, false, "d").unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Unavailable);
         assert_eq!(
             format!("{err:#}"),
@@ -1591,7 +1708,7 @@ mod tests {
         create.assert_calls(1);
         let mut chunks = 0;
         let err = c
-            .playlist_add_items("pl1", &uris(150), &mut |_, _| {
+            .playlist_add_items("pl1", &uris(150), None, &mut |_, _| {
                 chunks += 1;
                 Ok(())
             })
@@ -1604,7 +1721,7 @@ mod tests {
         let state = state_with(tmp.path(), &token("access-secret", 3600));
         let mut c = Spotify::new(state, "id", "", "http://127.0.0.1:1", "http://b", FAST).unwrap();
         c.warn = quiet;
-        let err = c.playlist_create("n", false, "d").unwrap_err();
+        let err = c.playlist_create("n", false, false, "d").unwrap_err();
         assert_eq!(crate::error::kind(&err), Kind::Unavailable);
         assert!(
             format!("{err:#}").starts_with(
@@ -1721,13 +1838,7 @@ mod tests {
             then.status(200).json_body(json!({"a": 1}));
         });
         let mut c = fresh_client(tmp.path(), &server);
-        let get = |path| Call {
-            method: "GET",
-            path,
-            query: &[],
-            body: None,
-            player: false,
-        };
+        let get = |path| Call::new("GET", path);
         assert_eq!(c.json_opt::<Doc>(&get("e204")).unwrap(), None);
         assert_eq!(c.json_opt::<Doc>(&get("e200")).unwrap(), None);
         assert_eq!(c.json_opt::<Doc>(&get("doc")).unwrap(), Some(Doc { a: 1 }));

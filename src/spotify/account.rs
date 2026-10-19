@@ -20,8 +20,8 @@ pub const PAGE_MAX: u32 = 50;
 pub const PLAYLISTS_CHUNK: usize = 50;
 
 /// The `fields` of a playlist's details read.
-const PLAYLIST_FIELDS: &str =
-    "uri,name,description,public,collaborative,owner(id,display_name),items(total)";
+const PLAYLIST_FIELDS: &str = "uri,name,description,public,collaborative,\
+                               owner(id,display_name),items(total),snapshot_id";
 
 /// The `fields` of a playlist's items read.
 const CONTENTS_FIELDS: &str = "items(item(type,uri,name,artists(name),\
@@ -117,6 +117,10 @@ pub struct Playlist {
     /// `None` when absent or empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The version Spotify gave with the details, which a removal or a
+    /// reorder sends back; not part of any document.
+    #[serde(skip)]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +158,7 @@ struct WirePlaylist {
     collaborative: bool,
     owner: WireUser,
     items: Option<WireCount>,
+    snapshot_id: Option<String>,
 }
 
 impl From<WirePlaylist> for Playlist {
@@ -169,6 +174,7 @@ impl From<WirePlaylist> for Playlist {
             collaborative: w.collaborative,
             total: w.items.and_then(|i| i.total),
             description: w.description.filter(|d| !d.is_empty()),
+            snapshot_id: w.snapshot_id,
         }
     }
 }
@@ -441,6 +447,7 @@ mod tests {
             then.status(200).json_body(json!({"items": [
                 {"uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Shared",
                  "description": "Songs from Bob", "public": null, "collaborative": true,
+                 "snapshot_id": "bob-snap",
                  "owner": {"id": "bob-spotify", "display_name": null},
                  "items": {"href": "https://api.spotify.com/v1/playlists/y/items", "total": 7}},
                 {"name": "no uri", "owner": {"id": "x"}},
@@ -467,6 +474,7 @@ mod tests {
                 collaborative: true,
                 total: Some(7),
                 description: Some("Songs from Bob".into()),
+                snapshot_id: Some("bob-snap".into()),
             }
         );
         assert_eq!(lists[51].name, "List 51");
@@ -485,7 +493,8 @@ mod tests {
                 "uri": format!("spotify:playlist:{PLAYLIST}"), "name": "Morning",
                 "description": "sss:alice/morning", "public": false, "collaborative": false,
                 "owner": {"id": "alice-spotify", "display_name": "Alice"},
-                "items": {"href": "https://api.spotify.com/v1/playlists/x/items", "total": 42}}));
+                "items": {"href": "https://api.spotify.com/v1/playlists/x/items", "total": 42},
+                "snapshot_id": "AAAAB"}));
         });
         let list = c.playlist(PLAYLIST).unwrap();
         owned.assert_calls(1);
@@ -493,7 +502,9 @@ mod tests {
         assert_eq!(list.public, Some(false));
         assert_eq!(list.owner.name, "Alice");
         assert_eq!(list.description.as_deref(), Some("sss:alice/morning"));
+        assert_eq!(list.snapshot_id.as_deref(), Some("AAAAB"));
         let doc = serde_json::to_value(&list).unwrap();
+        assert!(doc.get("snapshot_id").is_none(), "{doc}");
         assert_eq!(doc["id"], format!("spotify:playlist:{PLAYLIST}"));
         assert_eq!(
             doc["owner"],
@@ -510,6 +521,7 @@ mod tests {
         });
         let list = c.playlist(other).unwrap();
         assert_eq!(list.total, None);
+        assert_eq!(list.snapshot_id, None);
         let doc = serde_json::to_value(&list).unwrap();
         assert_eq!(doc["total"], Value::Null, "{doc}");
         assert!(doc.get("description").is_none(), "{doc}");

@@ -519,7 +519,7 @@ impl Document<'_> {
             out,
             format!(
                 "  - Now the {} most played: {top} music videos, {matched} matched, {held} of \
-                 them added by sss; the playlist only grows, so it also keeps earlier entrants",
+                 them added or found by sss; the playlist only grows, so it also keeps earlier entrants",
                 self.config.youtube.most_played
             ),
         );
@@ -567,8 +567,9 @@ impl Document<'_> {
                     line(
                         out,
                         format!(
-                            "- [{}]({}) `{key}`: {} added by sss; {rest} matched not added by \
-                             sss (already there, or for the next `sss push`)",
+                            "- [{}]({}) `{key}`: {} added or found by sss; {rest} matched and not \
+                             yet recorded (added by the next `sss push` unless already in the \
+                             playlist)",
                             md(name),
                             ids::playlist_url(spotify_id),
                             items.len()
@@ -1011,8 +1012,9 @@ mod tests {
         let pushed = section(&doc, "Push");
         assert!(
             pushed.contains(&format!(
-                "- [Morning](https://open.spotify.com/playlist/{}) `ST:9`: 0 added by sss; \
-                 1 matched not added by sss",
+                "- [Morning](https://open.spotify.com/playlist/{}) `ST:9`: 0 added or found by sss; \
+                 1 matched and not yet recorded (added by the next `sss push` unless already \
+                 in the playlist)",
                 sid('9')
             )),
             "{pushed}"
@@ -1233,9 +1235,10 @@ mod tests {
         let pushed = section(&doc, "Push");
         assert!(
             pushed.contains(
-                "`youtube:most-played`: 1 added by sss; 0 matched not added by sss (already \
-                 there, or for the next `sss push`)\n  - Now the 100 most played: 2 music \
-                 videos, 1 matched, 1 of them added by sss;"
+                "`youtube:most-played`: 1 added or found by sss; 0 matched and not yet \
+                 recorded (added by the next `sss push` unless already in the playlist)\n  - \
+                 Now the 100 most played: 2 music videos, 1 matched, 1 of them added or found \
+                 by sss;"
             ),
             "{pushed}"
         );

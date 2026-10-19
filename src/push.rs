@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, PushConfig};
@@ -15,8 +15,9 @@ use crate::matching::model::{self, ByKind, MatchEntry};
 use crate::pandora::model::{Normalized, Playlist, SeedKind, Station};
 use crate::repo::{self, ProfilePaths};
 use crate::source::Exports;
-use crate::spotify::auth::PLAYLIST_MODIFY_PUBLIC_SCOPE;
+use crate::spotify::auth::{PLAYLIST_FOLLOW_READ_SCOPES, PLAYLIST_MODIFY_PUBLIC_SCOPE};
 use crate::spotify::client::{Spotify, http_status};
+use crate::spotify::ids::ContextKind;
 use crate::youtube;
 
 /// Longest playlist name Spotify takes, in characters.
@@ -24,6 +25,9 @@ pub const NAME_MAX: usize = 100;
 
 /// Longest playlist description Spotify takes, in characters.
 pub const DESCRIPTION_MAX: usize = 300;
+
+/// Where Spotify keeps a deleted playlist recoverable for 90 days.
+pub const RECOVER_PLAYLISTS_URL: &str = "https://www.spotify.com/account/recover-playlists/";
 
 /// The ledger key and name of the thumbs-down reference playlist.
 pub const THUMBS_DOWN_KEY: &str = "thumbs-down";
@@ -43,7 +47,8 @@ pub enum PlaylistEntry {
         snapshot_id: Option<String>,
         #[serde(default)]
         name: Option<String>,
-        /// What this tool has added, in order.
+        /// URIs push has added or found present, in order; push adds a URI
+        /// to a playlist at most once.
         #[serde(default)]
         items: Vec<String>,
         #[serde(default)]
@@ -242,12 +247,17 @@ pub(crate) fn cut(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// The characters of a description that fit beside ` sss:<key>` in
+/// [`DESCRIPTION_MAX`].
+pub(crate) fn marker_room(key: &str) -> usize {
+    DESCRIPTION_MAX.saturating_sub(format!("sss:{key}").chars().count() + 1)
+}
+
 /// `text` cut so that it and ` sss:<key>` fit in [`DESCRIPTION_MAX`],
 /// followed by the marker.
 pub(crate) fn with_marker(text: &str, key: &str) -> String {
     let marker = format!("sss:{key}");
-    let room = DESCRIPTION_MAX.saturating_sub(marker.chars().count() + 1);
-    let text = cut(text.trim(), room);
+    let text = cut(text.trim(), marker_room(key));
     if text.is_empty() {
         cut(&marker, DESCRIPTION_MAX)
     } else {
@@ -427,6 +437,9 @@ pub enum Action {
     Skip,
     /// A `pending` ledger entry: left alone until the owner resolves it.
     Pending,
+    /// A `created` entry whose playlist is not on the account (deleted or
+    /// unfollowed): left alone until it is back.
+    Deleted,
 }
 
 /// One playlist of the plan or the push.
@@ -441,15 +454,11 @@ pub struct PlaylistReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
     /// Matched tracks the source playlist repeats; Spotify gets each once.
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "repo::is_zero")]
     pub repeats: usize,
     /// The created playlist's Spotify id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spotify_id: Option<String>,
-}
-
-fn is_zero(n: &usize) -> bool {
-    *n == 0
 }
 
 /// A playlist part: `enabled` is false when its `[push]` switch is off.
@@ -564,6 +573,16 @@ impl PushReport {
                     Action::Update => "update",
                     Action::Skip => "up to date",
                     Action::Pending => "pending",
+                    Action::Deleted => {
+                        writeln!(
+                            out,
+                            "  \"{}\" ({}): not on the account (deleted in Spotify); left alone \
+                             — recover it at {RECOVER_PLAYLISTS_URL} to have push maintain it \
+                             again, or remove its entry from state.json for a fresh one",
+                            pl.name, pl.key
+                        )?;
+                        continue;
+                    }
                 };
                 let added = if self.dry_run { pl.to_add } else { pl.added };
                 let repeats = if pl.repeats > 0 {
@@ -616,6 +635,9 @@ struct Pusher<'a> {
     public: bool,
     client: Lazy<Spotify, Connect<'a>>,
     progress: &'a mut dyn Write,
+    /// The `created` playlist ids of the current part that the account no
+    /// longer holds.
+    gone: HashSet<String>,
 }
 
 /// Plans the selected parts from the exports, the match entries and the
@@ -640,6 +662,7 @@ pub fn push<'a>(
         public: config.push.public_playlists,
         client: Lazy::new(connect),
         progress,
+        gone: HashSet::new(),
     };
     let mut parts = Parts::default();
     for part in Part::ALL {
@@ -764,6 +787,7 @@ impl Pusher<'_> {
             playlists: Vec::new(),
         };
         if enabled {
+            self.check_on_account(&wanted)?;
             for w in wanted {
                 part.playlists.push(self.playlist(w)?);
             }
@@ -771,9 +795,48 @@ impl Pusher<'_> {
         Ok(part)
     }
 
+    /// On a real run, asks the account in one batched `contains` whether
+    /// the `created` playlists of `wanted` are still on it, and keeps those
+    /// it is not holding in `gone`. No `created` entry, no request.
+    fn check_on_account(&mut self, wanted: &[Wanted]) -> Result<()> {
+        self.gone.clear();
+        if self.dry_run {
+            return Ok(());
+        }
+        let ids: Vec<String> = wanted
+            .iter()
+            .filter_map(|w| match self.ledger.playlists.get(&w.key) {
+                Some(PlaylistEntry::Created { spotify_id, .. }) => Some(spotify_id.clone()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.note(&format!(
+            "checking {} pushed playlists are on the account",
+            ids.len()
+        ));
+        let client = self.client.get()?;
+        client.require_scopes(&self.profile, PLAYLIST_FOLLOW_READ_SCOPES)?;
+        let uris: Vec<String> = ids.iter().map(|id| ContextKind::Playlist.uri(id)).collect();
+        let held = client.library_contains(&uris).context(
+            "checking that the pushed playlists recorded in state.json are on the account",
+        )?;
+        self.gone = ids
+            .into_iter()
+            .zip(held)
+            .filter(|(_, held)| !held)
+            .map(|(id, _)| id)
+            .collect();
+        Ok(())
+    }
+
     /// One playlist by its ledger entry: none → create and fill; `created`
-    /// → add the matched URIs it lacks (made again when Spotify answers 404
-    /// for its id); `pending` → left alone.
+    /// and not on the account → left alone; `created` → add the matched URIs
+    /// neither recorded in its `items` nor present live, recording the
+    /// present ones as found (made again when Spotify answers 404 for its
+    /// id); `pending` → left alone.
     fn playlist(&mut self, want: Wanted) -> Result<PlaylistReport> {
         let mut report = PlaylistReport {
             key: want.key.clone(),
@@ -796,8 +859,14 @@ impl Pusher<'_> {
                 spotify_id, items, ..
             }) => {
                 report.spotify_id = Some(spotify_id.clone());
-                let present: Vec<String> = if self.dry_run {
-                    items
+                if self.gone.contains(&spotify_id) {
+                    report.action = Action::Deleted;
+                    report.to_add = 0;
+                    return Ok(report);
+                }
+                let recorded: HashSet<&str> = items.iter().map(String::as_str).collect();
+                let live: Vec<String> = if self.dry_run {
+                    Vec::new()
                 } else {
                     match self.client.get()?.playlist_items(&spotify_id) {
                         Ok(uris) => uris.into_iter().flatten().collect(),
@@ -811,13 +880,21 @@ impl Pusher<'_> {
                         Err(e) => return Err(e),
                     }
                 };
-                let present: HashSet<&str> = present.iter().map(String::as_str).collect();
-                let missing: Vec<String> = want
+                let live: HashSet<&str> = live.iter().map(String::as_str).collect();
+                let (found, missing): (Vec<String>, Vec<String>) = want
                     .uris
                     .iter()
-                    .filter(|u| !present.contains(u.as_str()))
+                    .filter(|u| !recorded.contains(u.as_str()))
                     .cloned()
-                    .collect();
+                    .partition(|u| live.contains(u.as_str()));
+                if !found.is_empty() {
+                    if let Some(PlaylistEntry::Created { items, .. }) =
+                        self.ledger.playlists.get_mut(&want.key)
+                    {
+                        items.extend(found);
+                    }
+                    self.ledger.save(&self.state_file)?;
+                }
                 report.to_add = missing.len();
                 report.action = if missing.is_empty() {
                     Action::Skip
@@ -866,23 +943,23 @@ impl Pusher<'_> {
             },
         );
         self.ledger.save(&self.state_file)?;
-        let created =
-            match self
-                .client
-                .get()?
-                .playlist_create(&want.name, self.public, &want.description)
-            {
-                Ok(created) => created,
-                Err(e) if not_applied(&e) => {
-                    match prior {
-                        Some(entry) => self.ledger.playlists.insert(want.key.clone(), entry),
-                        None => self.ledger.playlists.remove(&want.key),
-                    };
-                    self.ledger.save(&self.state_file)?;
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
-            };
+        let created = match self.client.get()?.playlist_create(
+            &want.name,
+            self.public,
+            false,
+            &want.description,
+        ) {
+            Ok(created) => created,
+            Err(e) if not_applied(&e) => {
+                match prior {
+                    Some(entry) => self.ledger.playlists.insert(want.key.clone(), entry),
+                    None => self.ledger.playlists.remove(&want.key),
+                };
+                self.ledger.save(&self.state_file)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         self.ledger.playlists.insert(
             want.key.clone(),
             PlaylistEntry::Created {
@@ -903,6 +980,10 @@ impl Pusher<'_> {
 
     /// Adds `uris` to the playlist, recording each chunk in the ledger
     /// entry `key` as it lands. Returns how many were added.
+    ///
+    /// Callers pass URIs absent from the entry's `items`; the ledger write
+    /// records only URIs not already there regardless, so `items` holds each
+    /// URI once.
     fn add_items(&mut self, key: &str, spotify_id: &str, uris: &[String]) -> Result<usize> {
         let Pusher {
             ledger,
@@ -910,15 +991,24 @@ impl Pusher<'_> {
             client,
             ..
         } = self;
+        let mut recorded: HashSet<String> = match ledger.playlists.get(key) {
+            Some(PlaylistEntry::Created { items, .. }) => items.iter().cloned().collect(),
+            _ => HashSet::new(),
+        };
         let mut added = 0;
         client
             .get()?
-            .playlist_add_items(spotify_id, uris, &mut |chunk, snapshot| {
+            .playlist_add_items(spotify_id, uris, None, &mut |chunk, snapshot| {
                 if let Some(PlaylistEntry::Created {
                     items, snapshot_id, ..
                 }) = ledger.playlists.get_mut(key)
                 {
-                    items.extend_from_slice(chunk);
+                    items.extend(
+                        chunk
+                            .iter()
+                            .filter(|u| recorded.insert((*u).clone()))
+                            .cloned(),
+                    );
                     if let Some(s) = snapshot {
                         *snapshot_id = Some(s.to_owned());
                     }
@@ -1110,8 +1200,9 @@ mod tests {
         server: MockServer,
     }
 
+    /// A fixture whose stored token was granted every scope `sss` asks for.
     fn fixture() -> Fixture {
-        fixture_with(&[])
+        fixture_with(crate::spotify::auth::SCOPES)
     }
 
     /// A fixture whose stored token was granted `scopes`.
@@ -1182,6 +1273,41 @@ mod tests {
                     .json_body(json!({ "uris": uris }));
                 then.status(201).json_body(json!({"snapshot_id": "snap1"}));
             })
+        }
+
+        /// The account check of `created` playlist ids: `held[i]` answers
+        /// for `ids[i]`, all in one request.
+        fn on_account_mock(&self, ids: &[&str], held: &[bool]) -> httpmock::Mock<'_> {
+            let joined = ids
+                .iter()
+                .map(|id| format!("spotify:playlist:{id}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let held = held.to_vec();
+            self.server.mock(move |when, then| {
+                when.method(GET)
+                    .path("/v1/me/library/contains")
+                    .query_param("uris", joined);
+                then.status(200).json_body(json!(held));
+            })
+        }
+
+        /// Writes a `created` entry per `(key, spotify_id, items)`.
+        fn created(&self, entries: &[(&str, &str, &[&str])]) {
+            let mut ledger = Ledger::default();
+            for (key, id, items) in entries {
+                ledger.playlists.insert(
+                    (*key).to_owned(),
+                    PlaylistEntry::Created {
+                        spotify_id: (*id).to_owned(),
+                        snapshot_id: None,
+                        name: Some(format!("Name of {key}")),
+                        items: items.iter().map(|u| (*u).to_owned()).collect(),
+                        at: None,
+                    },
+                );
+            }
+            ledger.save(&self.paths.spotify_state()).unwrap();
         }
 
         fn items_mock(&self, id: &str, uris: &[&str]) -> httpmock::Mock<'_> {
@@ -1569,6 +1695,21 @@ mod tests {
     }
 
     #[test]
+    fn every_key_push_writes_is_taken_as_a_playlist_target_key() {
+        let keys = [
+            station_key(&station("41", Some("ST:9"), "S")),
+            station_key(&station("41", None, "S")),
+            "PL:1".to_owned(),
+            crate::youtube::select::playlist_key("PLx_y-z"),
+            THUMBS_DOWN_KEY.to_owned(),
+            crate::youtube::select::MOST_PLAYED_KEY.to_owned(),
+        ];
+        for key in keys {
+            assert!(crate::playlists::is_ledger_key(&key), "{key}");
+        }
+    }
+
+    #[test]
     fn a_description_is_cut_before_the_marker() {
         assert_eq!(with_marker("", "PL:1"), "sss:PL:1");
         assert_eq!(with_marker(" hi ", "PL:1"), "hi sss:PL:1");
@@ -1644,7 +1785,9 @@ mod tests {
             &["spotify:track:s", "spotify:track:a", "spotify:track:b"],
         );
         let contains = f.server.mock(|when, then| {
-            when.method(GET).path("/v1/me/library/contains");
+            when.method(GET)
+                .path("/v1/me/library/contains")
+                .query_param("uris", "spotify:artist:1,spotify:artist:2");
             then.status(200).json_body(json!([false, true]));
         });
         let save = f.server.mock(|when, then| {
@@ -1671,11 +1814,13 @@ mod tests {
             "pl9",
             &["spotify:track:s", "spotify:track:a", "spotify:track:b"],
         );
+        let on_account = f.on_account_mock(&["pl9"], &[true]);
         let a = f.only(Part::Artists).unwrap().parts.artists.unwrap();
         assert_eq!((a.to_follow, a.followed, a.skipped), (0, 0, 2));
         let s = f.only(Part::Stations).unwrap().parts.stations.unwrap();
         assert_eq!(s.playlists[0].action, Action::Skip);
         items.assert();
+        on_account.assert();
         create.assert_calls(1);
         add.assert_calls(1);
         contains.assert_calls(1);
@@ -1845,9 +1990,11 @@ mod tests {
         )
         .unwrap();
         let items = f.items_mock("mine", &["spotify:track:a", "spotify:track:zz"]);
+        let on_account = f.on_account_mock(&["mine"], &[true]);
         let add = f.add_mock("mine", &["spotify:track:s", "spotify:track:b"]);
         let report = f.only(Part::Stations).unwrap();
         items.assert();
+        on_account.assert();
         add.assert();
         let pl = &report.parts.stations.unwrap().playlists[0];
         assert_eq!((pl.action, pl.to_add, pl.added), (Action::Update, 2, 2));
@@ -1855,7 +2002,11 @@ mod tests {
         else {
             panic!("not created")
         };
-        assert_eq!(items, ["spotify:track:s", "spotify:track:b"]);
+        assert_eq!(
+            items,
+            ["spotify:track:a", "spotify:track:s", "spotify:track:b"],
+            "the track found present is recorded before those added"
+        );
     }
 
     #[test]
@@ -1873,6 +2024,7 @@ mod tests {
             },
         );
         ledger.save(&f.paths.spotify_state()).unwrap();
+        f.on_account_mock(&["gone"], &[true]);
         let gone = f.server.mock(|when, then| {
             when.method(GET).path("/v1/playlists/gone/items");
             then.status(404)
@@ -1899,6 +2051,218 @@ mod tests {
             f.ledger().playlists.get("ST:9"),
             Some(PlaylistEntry::Created { spotify_id, .. }) if spotify_id == "new"
         ));
+    }
+
+    /// Every pushed playlist, the member's and the linked one: `PL:1`
+    /// wants tracks `a` and `c`, `PL:2` wants `c`.
+    fn linked() -> PushConfig {
+        PushConfig {
+            linked_playlists: true,
+            ..PushConfig::default()
+        }
+    }
+
+    fn real(part: Part) -> Options {
+        Options {
+            only: Some(part),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn a_pushed_playlist_off_the_account_is_left_alone_until_it_is_back() {
+        let f = fixture();
+        f.created(&[
+            ("PL:1", "keep", &["spotify:track:a"]),
+            ("PL:2", "gone", &[]),
+        ]);
+        let before = std::fs::read(f.paths.spotify_state()).unwrap();
+        let mut check = f.on_account_mock(&["keep", "gone"], &[true, false]);
+        let keep_items = f.items_mock("keep", &["spotify:track:a"]);
+        let keep_add = f.add_mock("keep", &["spotify:track:c"]);
+        let gone_items = f.items_mock("gone", &[]);
+        let gone_add = f.add_mock("gone", &["spotify:track:c"]);
+
+        let report = f.run(&linked(), real(Part::Playlists)).unwrap();
+        check.assert_calls(1);
+        keep_items.assert_calls(1);
+        keep_add.assert_calls(1);
+        gone_items.assert_calls(0);
+        gone_add.assert_calls(0);
+        let lists = &report.parts.playlists.as_ref().unwrap().playlists;
+        assert_eq!(
+            (lists[0].key.as_str(), lists[0].action, lists[0].added),
+            ("PL:1", Action::Update, 1)
+        );
+        assert_eq!(
+            (lists[1].key.as_str(), lists[1].action, lists[1].to_add),
+            ("PL:2", Action::Deleted, 0)
+        );
+        assert_eq!(lists[1].spotify_id.as_deref(), Some("gone"));
+        let doc = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            doc["parts"]["playlists"]["playlists"][1]["action"],
+            "deleted"
+        );
+        let mut text = Vec::new();
+        report.write_text(&mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.contains(
+                "  \"List PL:2\" (PL:2): not on the account (deleted in Spotify); left alone — \
+                 recover it at https://www.spotify.com/account/recover-playlists/ to have push \
+                 maintain it again, or remove its entry from state.json for a fresh one\n"
+            ),
+            "{text}"
+        );
+        let ledger = f.ledger();
+        let earlier: Ledger = serde_json::from_slice(&before).unwrap();
+        assert_eq!(ledger.playlists.get("PL:2"), earlier.playlists.get("PL:2"));
+
+        check.delete();
+        let back = f.on_account_mock(&["keep", "gone"], &[true, true]);
+        let report = f.run(&linked(), real(Part::Playlists)).unwrap();
+        back.assert_calls(1);
+        keep_items.assert_calls(2);
+        keep_add.assert_calls(1);
+        gone_items.assert_calls(1);
+        gone_add.assert_calls(1);
+        let lists = &report.parts.playlists.unwrap().playlists;
+        assert_eq!((lists[1].action, lists[1].added), (Action::Update, 1));
+    }
+
+    #[test]
+    fn a_part_without_a_created_entry_makes_no_account_check() {
+        let f = fixture();
+        let check = f.server.mock(|when, then| {
+            when.method(GET).path("/v1/me/library/contains");
+            then.status(500);
+        });
+        f.create_mock("Morning", "pl9");
+        f.add_mock(
+            "pl9",
+            &["spotify:track:s", "spotify:track:a", "spotify:track:b"],
+        );
+        f.only(Part::Stations).unwrap();
+        check.assert_calls(0);
+    }
+
+    #[test]
+    fn a_failed_account_check_stops_the_part_before_any_playlist_is_touched() {
+        let f = fixture();
+        f.created(&[("ST:9", "pl9", &[])]);
+        let before = std::fs::read(f.paths.spotify_state()).unwrap();
+        let check = f.server.mock(|when, then| {
+            when.method(GET).path("/v1/me/library/contains");
+            then.status(503);
+        });
+        let items = f.items_mock("pl9", &[]);
+        let add = f.server.mock(|when, then| {
+            when.method(POST);
+            then.status(201).json_body(json!({"snapshot_id": "snap1"}));
+        });
+        let err = f.only(Part::Stations).unwrap_err();
+        assert!(check.calls() > 0);
+        items.assert_calls(0);
+        add.assert_calls(0);
+        assert_eq!(error::kind(&err), Kind::Unavailable);
+        assert!(
+            format!("{err:#}").starts_with(
+                "checking that the pushed playlists recorded in state.json are on the account: "
+            ),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(f.paths.spotify_state()).unwrap(), before);
+    }
+
+    #[test]
+    fn the_account_check_needs_the_follow_read_scopes() {
+        let f = fixture_with(&[
+            "user-library-read",
+            "user-follow-read",
+            "playlist-read-collaborative",
+        ]);
+        f.created(&[("ST:9", "pl9", &[])]);
+        let check = f.on_account_mock(&["pl9"], &[true]);
+        let err = f.only(Part::Stations).unwrap_err();
+        assert_eq!(error::kind(&err), Kind::Auth);
+        assert!(
+            format!("{err:#}").contains("without playlist-read-private"),
+            "{err:#}"
+        );
+        check.assert_calls(0);
+    }
+
+    #[test]
+    fn a_track_push_added_is_never_added_again_and_one_found_is_recorded() {
+        let f = fixture();
+        f.created(&[("ST:9", "pl9", &["spotify:track:s"])]);
+        let check = f.on_account_mock(&["pl9"], &[true]);
+        // `s` was removed by hand; `a` was added by hand.
+        let mut items = f.items_mock("pl9", &["spotify:track:a"]);
+        let add = f.add_mock("pl9", &["spotify:track:b"]);
+        let pl = f
+            .only(Part::Stations)
+            .unwrap()
+            .parts
+            .stations
+            .unwrap()
+            .playlists[0]
+            .clone();
+        add.assert_calls(1);
+        assert_eq!((pl.action, pl.to_add, pl.added), (Action::Update, 1, 1));
+        let recorded = |f: &Fixture| match f.ledger().playlists.get("ST:9").cloned() {
+            Some(PlaylistEntry::Created { items, .. }) => items,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            recorded(&f),
+            ["spotify:track:s", "spotify:track:a", "spotify:track:b"]
+        );
+
+        items.delete();
+        f.items_mock("pl9", &["spotify:track:a", "spotify:track:b"]);
+        let pl = f
+            .only(Part::Stations)
+            .unwrap()
+            .parts
+            .stations
+            .unwrap()
+            .playlists[0]
+            .clone();
+        assert_eq!((pl.action, pl.to_add), (Action::Skip, 0));
+        add.assert_calls(1);
+        check.assert_calls(2);
+        assert_eq!(
+            recorded(&f),
+            ["spotify:track:s", "spotify:track:a", "spotify:track:b"],
+            "no URI recorded twice"
+        );
+    }
+
+    #[test]
+    fn the_dry_run_and_the_live_run_agree_on_what_items_records() {
+        let f = fixture();
+        f.created(&[("ST:9", "pl9", &["spotify:track:s"])]);
+        let dry = f
+            .run(
+                &PushConfig::default(),
+                Options {
+                    only: Some(Part::Stations),
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+        f.on_account_mock(&["pl9"], &[true]);
+        f.items_mock("pl9", &["spotify:track:s"]);
+        f.add_mock("pl9", &["spotify:track:a", "spotify:track:b"]);
+        let live = f.only(Part::Stations).unwrap();
+        let to_add = |r: &PushReport| {
+            let pl = &r.parts.stations.as_ref().unwrap().playlists[0];
+            (pl.action, pl.to_add)
+        };
+        assert_eq!(to_add(&dry), (Action::Update, 2));
+        assert_eq!(to_add(&live), to_add(&dry));
     }
 
     #[test]
@@ -2029,6 +2393,7 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.playlists.insert("ST:9".into(), prior.clone());
         ledger.save(&f.paths.spotify_state()).unwrap();
+        f.on_account_mock(&["gone"], &[true]);
         f.server.mock(|when, then| {
             when.method(GET).path("/v1/playlists/gone/items");
             then.status(404).body("");

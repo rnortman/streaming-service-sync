@@ -46,7 +46,7 @@ matching protocol, so refresh any copy you keep from the binary you run.
   state directory, `~/.local/state/streaming-service-sync/NAME/`, mode
   0600, never in the data repository.
 - Every command takes `--json` and then prints one JSON document on stdout
-  (section 13). Start every session with:
+  (section 14). Start every session with:
 
 ```sh
 sss status --json
@@ -288,13 +288,168 @@ default), or several years; `--limit N` is 1 to 50 (default 50).
 on it, the member's own and the ones they follow, each with its `owner`
 and item count `total`. A playlist whose `owner.id` differs from `user.id`
 is one shared with the member: its `id` goes to `sss play`. `sss playlist`
-takes one or more playlist URIs or open.spotify.com playlist links (not
-bare ids) and shows each one's contents in order. Spotify shows a
+takes one or more playlists and shows each one's contents in order. A
+playlist is given as its URI or open.spotify.com link (not a bare id), as
+the key the export shows for something `sss push` made a playlist of
+(`ST:…` for a station, `PL:…`, `YP:…`, `thumbs-down`,
+`youtube:most-played`) — `pushed_as` in the document names it — or by its
+name on the account (`sss playlist "Kids Songs"`), which must match exactly
+one playlist, ignoring case; several or none is kind `input` with the
+candidates listed, and then you give the URI. `unavailable` counts entries
+Spotify holds but cannot show (removed or unreadable items); when it is
+above zero, the numbering of `items` is not Spotify's. Spotify shows a
 playlist's items only to its owner and its collaborators, so a shared
 playlist shows its contents only if it is collaborative; any other comes
 back with `items: null` and the command still succeeds.
 
-## 10. The report
+## 10. Changing playlists and the library
+
+```sh
+sss playlist create "Kids Songs" --dry-run --profile NAME --json
+sss playlist create "Kids Songs" --description "For the car" --profile NAME --json
+sss playlist edit "Kids Songs" --name "Car songs" --public --profile NAME --json
+sss playlist add "Kids Songs" spotify:track:4uLU6hMCjMI75M1A2tKUQC TR:123 --profile NAME --json
+sss playlist add "Kids Songs" --from-file - --at 1 --dry-run --profile NAME --json
+sss playlist remove ST:123 spotify:track:4uLU6hMCjMI75M1A2tKUQC --dry-run --profile NAME --json
+sss playlist move "Kids Songs" --from 3 --count 2 --before 1 --dry-run --profile NAME --json
+sss playlist move "Kids Songs" --from 1 --to-end --profile NAME --json
+sss playlist replace "Kids Songs" --from-file - --dry-run --profile NAME --json
+sss playlist delete ST:123 --dry-run --profile NAME --json
+sss library tracks --limit 20 --profile NAME --json
+sss library albums --profile NAME --json
+sss library artists --profile NAME --json
+sss library add spotify:track:4uLU6hMCjMI75M1A2tKUQC TR:123 --dry-run --profile NAME --json
+sss library add spotify:track:4uLU6hMCjMI75M1A2tKUQC TR:123 --profile NAME --json
+sss library remove --from-file - --dry-run --profile NAME --json
+```
+
+The `sss playlist` writes name their playlist as `sss playlist` does: by
+URI or link, by the key `sss push` recorded (`ST:…`, `PL:…`, `YP:…`,
+`thumbs-down`, `youtube:most-played`), or by its name on the account,
+which must match exactly one playlist. `sss playlist create NAME` makes a
+private playlist (`--public`, `--collaborative`, `--description TEXT`);
+it refuses a name the member already owns, so running it twice does not
+make two — `--duplicate` makes another all the same. `sss playlist edit`
+changes the name, description, visibility or collaboration of a playlist
+the member owns. `sss playlist add` appends tracks (or inserts them before
+position `--at N`, numbered as `sss playlist` shows them) and skips the
+ones already there (`--duplicates` adds them again); `sss playlist remove`
+takes every occurrence of each track out. `sss playlist move` moves
+`--count K` items (default 1) from position `--from N` to before position
+`--before M` or to the end (`--to-end`), positions as `sss playlist`
+numbers them. `sss playlist replace` sets the contents to exactly the
+tracks given, in that order, a track given twice held twice; with no
+tracks it empties the playlist. Its dry run lists under `removed` what
+leaves, under `added` what arrives, and `reordered` says whether what
+stays changes order. Anything a move cannot express — sorting,
+deduplicating — is a `replace`. These four change only a playlist the
+member owns or one that is collaborative. When `sss playlist` reports
+`unavailable` above zero, the numbering is not Spotify's and `--at` and
+`move` are refused; `replace` still works, and erases those entries too. `sss playlist delete` removes the playlist from the account —
+deleted when it is the member's, unfollowed when it is someone else's;
+Spotify keeps a deleted playlist recoverable for 90 days at
+https://www.spotify.com/account/recover-playlists/. The document's
+`to_add`, `already_present`, `to_remove`, `not_present`, `to_move`,
+`removed`, `added` and `action` say what the command changes.
+
+`sss library tracks|albums|artists` lists the saved tracks, the saved
+albums or the followed artists, most recently saved first, each with
+`added_at` (`null` for an artist: Spotify gives no date for a follow) and
+the `item`. Without `--limit N` it reads the whole library, one request
+per 50 entries; pass `--limit` when the most recent ones are enough.
+
+`sss library add` saves tracks and albums and follows artists and
+playlists; `sss library remove` removes and unfollows them. Each takes
+items as Spotify URIs, open.spotify.com links, bare track ids or the
+source item ids the export shows (`TR:…`, `YV:…`, `AR:…`, `AL:…`), which
+resolve to their recorded match; an item id without a `matched` match is
+kind `input` and nothing is sent. `--from-file FILE` (`-` for stdin, read
+to the end) adds items one per line, skipping blank lines and lines
+starting with `#`; it may be combined with items on the command line. The
+document lists what changes (`to_save`, `to_remove`) and what was left
+(`already_saved`, `not_saved`), and under `resolved` what each item id
+stood for. Names are not accepted: find the `id` with `sss search`,
+`sss library`, `sss history` or `sss top` first.
+
+Tracks for a playlist and items for the library take the same forms.
+Every write takes `--dry-run`, which makes the reads and none of the
+writes and says `dry_run: true`. Run the dry run first, read what it will
+change, and then run the same command without it. A playlist changed in
+the Spotify app between the dry run and the live run is written as it is
+at the live run, so read the live run's document too. When a write fails
+after part of it landed, `details.done` in the failure document lists
+the URIs that did: do not send them again.
+
+**The Kids Songs merge.** The person wants the small station playlists
+`sss push` made merged into one. Read them by the station ids the export
+shows, in one call:
+
+```sh
+sss playlist ST:1 ST:2 ST:3 --profile NAME --json
+```
+
+Collect each one's `items[].id` in order, then make the playlist and fill
+it with one `add` (it skips what is already there, so running it twice
+does no harm):
+
+```sh
+sss playlist create "Kids Songs" --dry-run --profile NAME --json
+sss playlist create "Kids Songs" --profile NAME --json
+printf '%s\n' spotify:track:4uLU6hMCjMI75M1A2tKUQC spotify:track:6rqhFgbbKwnb9MLmUQDhG6 |
+  sss playlist add "Kids Songs" --from-file - --dry-run --profile NAME --json
+```
+
+Read `to_add`, run the `add` again without `--dry-run`, and then, with the
+person's agreement, delete each small one:
+
+```sh
+sss playlist delete ST:1 --dry-run --profile NAME --json
+sss playlist delete ST:1 --profile NAME --json
+```
+
+`sss push` leaves a deleted playlist alone while it is off the account. A
+delete made by mistake is undone in Spotify: recover the playlist at
+https://www.spotify.com/account/recover-playlists/ and the next push
+maintains it again; there is nothing to run in `sss`.
+
+**A playlist of what I played this week.** Read `sss history --profile
+NAME --json`, keep the `track.id` of each entry whose `played_at` is in
+the week (the history holds the last 50 plays only), and add them to a
+new playlist:
+
+```sh
+sss playlist create "This week" --profile NAME --json
+printf '%s\n' spotify:track:4uLU6hMCjMI75M1A2tKUQC |
+  sss playlist add "This week" --from-file - --dry-run --profile NAME --json
+```
+
+`add` keeps the first of a track played twice and reports the rest under
+`duplicates_dropped`; read `to_add`, then run it without `--dry-run`.
+
+**A dedupe.** Read `sss playlist "Kids Songs" --profile NAME --json`, keep
+the first of each `items[].id` in order, and pipe that list to `replace`:
+
+```sh
+printf '%s\n' spotify:track:4uLU6hMCjMI75M1A2tKUQC spotify:track:6rqhFgbbKwnb9MLmUQDhG6 |
+  sss playlist replace "Kids Songs" --from-file - --dry-run --profile NAME --json
+```
+
+The dry run's `removed` is empty and `after` is below `before` by the
+duplicates dropped; check `reordered` is `false`, then run it again
+without `--dry-run`.
+
+**Unfollowing artists.** Read `sss library artists --profile NAME --json`,
+show the person the names, and pipe the `item.id` of each artist they
+want to drop:
+
+```sh
+printf '%s\n' spotify:artist:0OdUWJ0sBjDrqHygGUXeCF |
+  sss library remove --from-file - --dry-run --profile NAME --json
+```
+
+Read `to_remove`, then run it again without `--dry-run`.
+
+## 11. The report
 
 ```sh
 sss report --profile NAME --json
@@ -307,7 +462,7 @@ videos sss could not classify and the playlists it will not push, with
 the reason; a playlist the person does not want on Spotify goes into
 `[youtube] skip_playlists` by the id the report prints.
 
-## 11. Push
+## 12. Push
 
 ```sh
 sss push --dry-run --profile NAME --json
@@ -320,7 +475,13 @@ artists|stations|playlists|collection|liked|most-played|thumbs-down`
 pushes one part; `--source pandora|youtube` pushes only what one source
 contributes.
 A second push adds only what is missing; push never removes anything from
-Spotify. A playlist with action `pending` may already have been made by an
+Spotify, and it adds each matched track to a playlist once: a track removed
+from a pushed playlist — by the person in Spotify or with `sss playlist
+remove` — is never added back. A pushed playlist deleted in Spotify or with
+`sss playlist delete` is reported with action `deleted` and left alone
+until it is back on the account. `push --dry-run` makes no request, so it
+cannot see a deletion: it reports such a playlist as the real push would
+without it. A playlist with action `pending` may already have been made by an
 earlier push that stopped before recording it: `sss` leaves it alone and
 says what to look for in Spotify and which `spotify/state.json` entry to
 edit. That edit is the owner's to make by hand; tell them.
@@ -331,7 +492,7 @@ repository, not a per-member setting, so do not ask each member about it;
 if a member does not want it, tell the repository's owner (the person who
 ran `sss init`), whose call it is.
 
-## 12. Re-runs and resuming
+## 13. Re-runs and resuming
 
 Every command can be stopped and run again: what was done is recorded as it
 happens, and the next run continues. Kinds `quota` and `unavailable` mean
@@ -339,7 +500,7 @@ try the same command later. A new `sss pandora export` replaces the
 normalized files; the next `sss match` searches only the items it has not
 seen, and the next push adds what is new.
 
-## 13. Reading `--json`
+## 14. Reading `--json`
 
 On success stdout is one document that starts with `"ok": true` and
 `"command"`, followed by the command's report:
@@ -389,17 +550,24 @@ about each `kind`:
 Every field of every document is in
 [the JSON output reference](https://github.com/rnortman/streaming-service-sync/blob/main/docs/json-output.md).
 
-## 14. Check with the person; never do
+## 15. Check with the person; never do
 
 Ask the person before:
 
 - a push that is not a dry run;
+- `sss playlist delete`, `sss playlist remove`, `sss playlist replace` or
+  `sss library remove` of anything the person did not name themselves;
 - recording a Spotify choice the matching rules do not settle;
 - `sss pandora auth` with a token for a different listener than the
   profile's stored session (it replaces that session).
 
+Run every write as a dry run first and read it; when a failure carries
+`details.done`, those landed.
+
 Never:
 
+- guess a URI for a write: take it from `sss search`, `sss playlist`,
+  `sss history`, `sss top`, `sss library` or a match document;
 - put a token or the callback address in a command-line argument: pipe it
   on stdin or use `--from-file`;
 - edit `matches/*.jsonl`, `spotify/state.json` or the state directory by

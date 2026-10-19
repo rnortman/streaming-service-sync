@@ -416,11 +416,8 @@ impl Spotify {
     pub fn playlist_track_count(&mut self, playlist_id: &str) -> Result<u32> {
         let path = format!("playlists/{playlist_id}/items");
         let wire: WireTotal = self.json(&Call {
-            method: "GET",
-            path: &path,
             query: &[("fields", "total"), ("limit", "1")],
-            body: None,
-            player: false,
+            ..Call::new("GET", &path)
         })?;
         Ok(wire.total)
     }
@@ -429,13 +426,7 @@ impl Spotify {
     /// its refusals route as any other request's.
     pub fn album_track_count(&mut self, album_id: &str) -> Result<u32> {
         let path = format!("albums/{album_id}");
-        let wire: WireTotalTracks = self.json(&Call {
-            method: "GET",
-            path: &path,
-            query: &[],
-            body: None,
-            player: false,
-        })?;
+        let wire: WireTotalTracks = self.json(&Call::new("GET", &path))?;
         Ok(wire.total_tracks)
     }
 
@@ -466,11 +457,10 @@ fn player_call<'a>(
     body: Option<&'a Value>,
 ) -> Call<'a> {
     Call {
-        method,
-        path,
         query,
         body,
         player: true,
+        ..Call::new(method, path)
     }
 }
 

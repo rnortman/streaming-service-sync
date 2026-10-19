@@ -134,7 +134,7 @@ pub fn targets_source(targets: &[String]) -> Result<PlaySource> {
 }
 
 /// Lowercased and trimmed, for comparing names.
-fn folded(name: &str) -> String {
+pub(crate) fn folded(name: &str) -> String {
     name.trim().to_lowercase()
 }
 

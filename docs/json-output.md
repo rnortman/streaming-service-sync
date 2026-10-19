@@ -28,7 +28,10 @@ as typed (`"init"`, `"pandora auth"`, `"pandora export"`, `"pandora
 normalize"`, `"spotify auth"`, `"match"`, `"match review"`, `"match
 questions"`, `"match answer"`, `"match set"`, `"match reject"`, `"push"`,
 `"status"`, `"report"`, `"guide"`, `"search"`, `"history"`, `"top"`,
-`"playlists"`, `"playlist"`, `"devices"`, `"player"`,
+`"playlists"`, `"playlist"`, `"playlist create"`, `"playlist edit"`,
+`"playlist add"`, `"playlist remove"`, `"playlist move"`, `"playlist replace"`,
+`"playlist delete"`, `"library tracks"`, `"library albums"`,
+`"library artists"`, `"library add"`, `"library remove"`, `"devices"`, `"player"`,
 `"play"`, `"pause"`, `"next"`, `"previous"`, `"queue"`, `"shuffle"`,
 `"repeat"`, `"volume"`, `"seek"`). The rest is the command's report.
 
@@ -78,6 +81,13 @@ A **Played** is one finished play from the member's history:
 | `played_at` | string | when the play finished, RFC 3339, as Spotify gives it |
 | `track` | Offered | what was played |
 | `context` | Context, optional | the playlist, album or artist it was played from; `null` when none |
+
+A **Saved** is one entry of the member's library:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `added_at` | string, optional | when it was saved, RFC 3339, as Spotify gives it; `null` for a followed artist (Spotify gives no date for a follow) |
+| `item` | Offered | the track, album or artist |
 
 A **User** is the signed-in Spotify account, an **Owner** a playlist's
 owner; both are `{ id, name }`: the Spotify user id, and the display name,
@@ -711,9 +721,21 @@ YouTube "most played" playlist, the thumbs-down reference playlist.
 `--only artists|stations|playlists|collection|liked|most-played|thumbs-down`
 runs that one part and nothing else; `--source pandora|youtube` plans only
 what that source contributes. `--dry-run` computes the same plan and makes no
-Spotify request at all; it needs no token. Every write is recorded in
+Spotify request at all, so it reports a pushed playlist that was deleted in
+Spotify as the live run would without the deletion; the live run checks and
+leaves it alone. It needs no token. Every write is recorded in
 `profiles/<name>/spotify/state.json` as it lands, so a second push adds
-only what is missing. Progress lines go to stderr.
+only what is missing. A track push added or found in a playlist is
+recorded there and never added again, so a track removed from a pushed
+playlist — in Spotify or with `sss playlist remove` — stays removed; a
+playlist deleted in Spotify or with `sss playlist delete` is left alone
+until it is back on the account (Spotify keeps it recoverable for 90 days),
+and removing its entry from `state.json` has push make it again from
+scratch. Before it reads any playlist it made, a live push asks the
+account, in one request per 40, whether those playlists are still on it;
+that needs `user-library-read`, `user-follow-read`, `playlist-read-private`
+and `playlist-read-collaborative` (kind `auth` before any request when the
+token lacks one). Progress lines go to stderr.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -743,8 +765,8 @@ A **Playlist** is:
 |---|---|---|
 | `key` | string | its key in `state.json`: `ST:…` (or `station:<id>`) for a station, `PL:…` for a Pandora playlist, `YP:PL…` for a YouTube playlist, `youtube:most-played`, `thumbs-down` |
 | `name` | string | the Spotify playlist's name |
-| `action` | `"create"` \| `"update"` \| `"skip"` \| `"pending"` | made now; items missing from one made earlier; nothing to add; left alone (below) |
-| `to_add` | number | matched tracks to add |
+| `action` | `"create"` \| `"update"` \| `"skip"` \| `"pending"` \| `"deleted"` | made now; matched tracks never recorded and not in one made earlier; nothing to add; left alone (below); not on the account: deleted or unfollowed in Spotify or with `sss playlist delete`; left alone until it is back |
+| `to_add` | number | matched tracks to add (0 for `deleted`) |
 | `added` | number | added this run (0 in a dry run) |
 | `at` | string, optional | a `pending` entry's time |
 | `repeats` | number, optional | tracks the source playlist repeats; Spotify gets each once |
@@ -1017,25 +1039,48 @@ either is kind `auth` before any request.
 ### `playlist`
 
 `sss playlist TARGET...` reads each playlist named, in the order given:
-its details, then its contents. A target is a playlist URI
-(`spotify:playlist:<id>`) or an `https://open.spotify.com/playlist/<id>`
-address; anything else — another kind, a bare id, a malformed address — is
-kind `input` before any request. Spotify shows a playlist's items only to
-its owner and collaborators, so a playlist the member only follows is
-reported with `items: null` and the command goes on. A playlist Spotify
-does not know ends the command with kind `other`, quoting Spotify. Needs
-the same scopes as `playlists`.
+its details, then its contents. A target is, trimmed:
+
+- a playlist URI (`spotify:playlist:<id>`) or an
+  `https://open.spotify.com/playlist/<id>` address — recognised by the
+  `spotify:`, `http://` or `https://` prefix; another kind or a malformed
+  address is kind `input`;
+- never a bare 22-character id: kind `input`;
+- the key of a playlist `sss push` made — `ST:…`, `station:…`, `PL:…`,
+  `YP:…` (no whitespace), `thumbs-down` or `youtube:most-played` — looked up
+  in the profile's `spotify/state.json`: a created entry gives its
+  playlist; a pending one, or none, is kind `input` ("… has no Spotify
+  playlist yet; run `sss push --only …`", "… has no Spotify playlist; run
+  `sss push`") with no request made. A key-shaped text is never taken as a
+  name; a playlist literally named `ST:1` is reachable by URI;
+- otherwise the name of a playlist on the account, own or followed,
+  compared trimmed and case-insensitively against one listing of the
+  account's playlists (shared by every name in the call). None of that
+  name, or several, is kind `input`, the message listing up to 20 names,
+  or each match's URI and owner.
+
+Every target is parsed before any request. Spotify shows a playlist's
+items only to its owner and collaborators, so a playlist the member only
+follows is reported with `items: null` and the command goes on. A playlist
+Spotify does not know ends the command with kind `other`, quoting Spotify.
+Needs the same scopes as `playlists`.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `profile` | string | |
 | `playlists` | [Contents] | one per target, in the order given |
 
-A **Contents** is `{ playlist, items }`: the Playlist (*Shapes*), and
-`items`, its tracks and episodes as Offered in playlist order, or `null`
-for a playlist whose `total` is `null` — one the member neither owns nor
-collaborates on. A local file is an Offered whose `id` is
-`spotify:local:…`; a removed item is left out.
+A **Contents** is `{ playlist, pushed_as, items, unavailable }`: the
+Playlist (*Shapes*); `pushed_as`, the `state.json` key of the push that
+made the playlist (`"ST:123"`), or `null`; `items`, its tracks and
+episodes as Offered in playlist order, or `null` for a playlist whose
+`total` is `null` — one the member neither owns nor collaborates on; and
+`unavailable`, the entries `items` leaves out — removed items and ones
+that read as neither track nor episode — that is `total` minus the length
+of `items`, or `null` when `items` is. A local file is an Offered whose
+`id` is `spotify:local:…` and counts as shown. When `unavailable` is
+above zero, item `n` of `items` is not Spotify's position `n`; the text
+ends the list with `(n unavailable items not shown)`.
 
 ```json
 {
@@ -1046,15 +1091,239 @@ collaborates on. A local file is an Offered whose `id` is
     { "playlist": { "id": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Morning",
                     "owner": { "id": "alice-spotify", "name": "Alice" }, "public": false,
                     "collaborative": false, "total": 1 },
+      "pushed_as": "ST:123",
       "items": [
         { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
           "artists": ["Artist"], "album": "Album", "duration_ms": 215000 }
-      ] },
+      ],
+      "unavailable": 0 },
     { "playlist": { "id": "spotify:playlist:4uLU6hMCjMI75M1A2tKUQC", "name": "Road trip",
                     "owner": { "id": "bob-spotify", "name": "Bob" }, "public": true,
                     "collaborative": false, "total": null },
-      "items": null }
+      "pushed_as": null,
+      "items": null,
+      "unavailable": null }
   ]
+}
+```
+
+### `playlist create`
+
+`sss playlist create NAME [--description TEXT] [--public]
+[--collaborative] [--duplicate] [--dry-run]` makes a playlist of the
+member's, private unless `--public`. `NAME` is trimmed and must be 1 to
+100 characters, else kind `input`; a description over 300 characters is
+cut, with a warning on stderr. `--collaborative` cannot be combined with
+`--public` (Spotify keeps a collaborative playlist private). The command
+reads the account and its playlists first: when the member already owns a
+playlist of that name (compared trimmed and case-insensitively) it is
+kind `input`, naming the URIs, unless `--duplicate`; a followed playlist
+of that name does not count. Needs `playlist-modify-private`,
+`playlist-modify-public`, `playlist-read-private` and
+`playlist-read-collaborative`, as every `playlist` write does; a token
+without one is kind `auth` before any request.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `dry_run` | boolean | `true`: nothing was written |
+| `to_create` | object | `{ name, public, collaborative, description }`, what is sent (`description` is `""` when none was given) |
+| `created` | Playlist, optional | the new playlist; `null` in a dry run |
+| `existing` | [Playlist] | the member's own playlists of that name; empty unless `--duplicate` let the create through |
+| `snapshot_id` | string, optional | after a live run, the version Spotify gave the playlist; absent in a dry run |
+
+```json
+{
+  "ok": true,
+  "command": "playlist create",
+  "profile": "alice",
+  "dry_run": false,
+  "to_create": { "name": "Kids Songs", "public": false, "collaborative": false, "description": "" },
+  "created": { "id": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Kids Songs",
+               "owner": { "id": "alice-spotify", "name": "Alice" }, "public": false,
+               "collaborative": false, "total": 0 },
+  "existing": [],
+  "snapshot_id": "AAAAAQ"
+}
+```
+
+### `playlist edit`, `playlist add`, `playlist remove`, `playlist move`, `playlist replace`, `playlist delete`
+
+Each takes one playlist, in the grammar of `playlist` (URI, address,
+ledger key or name), then reads the account and the playlist's details,
+and checks what Spotify would refuse before any write. Items are given as
+for `library add` (*`library add`, `library remove`*) but must be tracks:
+another kind, an episode or a local file is kind `input`. Items and the
+ledger key are resolved before any request, so a bad item or an unknown
+key makes none. Every one takes `--dry-run`: every read, no write. Every
+report has `profile`, `dry_run`, `playlist` (the Playlist, *Shapes*) and
+`pushed_as` (the `state.json` key of the push that made it, or `null`);
+those given items have `resolved` and `duplicates_dropped` as `library
+add` does; those that read the contents have `unavailable` (as in
+`playlist`); after a live run `snapshot_id` is the last version Spotify
+returned (`null` when it returned none), absent in a dry run.
+
+- **`playlist edit PLAYLIST [--name N] [--description T]
+  [--public|--private] [--collaborative|--no-collaborative]`** — at least
+  one flag. Only the playlist's owner can change its details (else kind
+  `input`); a change that would leave the playlist both public and
+  collaborative (`--collaborative` on a public playlist without
+  `--private`, or `--public` on a collaborative one without
+  `--no-collaborative`) is kind `input`. A pushed playlist's description
+  keeps one `sss:<key>` marker (a description read back from the
+  playlist, marker included, is sent with the marker once), and `--name`
+  renames its `state.json` entry once Spotify has the change. Adds `changes` (what is sent: only
+  the details asked for) and `before` (the Playlist as read); `playlist`
+  is the details with the changes applied. Requests: `me`, the details,
+  `PUT playlists/{id}`.
+- **`playlist add PLAYLIST [ITEM...] [--from-file F] [--at N]
+  [--duplicates]`** — appends the tracks, or inserts them before position
+  `N` (1-based, as `sss playlist` numbers them; 1 to the item count plus
+  one, else kind `input`), skipping the ones the playlist already holds
+  unless `--duplicates`. The account must own the playlist or the
+  playlist must be collaborative, else kind `input`. `--at` on a playlist
+  with `unavailable` above zero is kind `input`: positions there are not
+  Spotify's. Adds `to_add` (the URIs added, or that would be, in order),
+  `already_present` and `position` (`N`, or `null`). One request per 100
+  tracks; a failure after one landed carries `details.done`.
+- **`playlist remove PLAYLIST [ITEM...] [--from-file F]`** — every
+  occurrence of each track leaves the playlist, under the same ownership
+  rule. Adds `to_remove` (`[{ item: Offered, occurrences }]`, the tracks
+  the playlist holds, as its contents show them) and `not_present` (the
+  URIs it does not). Nothing to remove is a success. The removal carries
+  the version the details read gave; Spotify applies it to the playlist
+  as it is when the request arrives. One request per 100 tracks; a
+  failure after one landed carries `details.done`.
+- **`playlist move PLAYLIST --from N [--count K] (--before M |
+  --to-end)`** — the `K` items (default 1) from position `N` move before
+  the item at position `M`, or to the end; positions are 1-based, as `sss
+  playlist` numbers them. The range must lie within the playlist, `M`
+  within 1 to the item count plus one and outside the range, else kind
+  `input`; on a playlist with `unavailable` above zero it is kind `input`
+  before any other check (positions there are not Spotify's; reorder it
+  with `replace`). Same ownership rule. Adds `from` (`N`), `count` (`K`),
+  `to_move` (`[Offered]`, the items of the range) and `before` (the
+  Offered they land before, `null` for the end). One request, carrying the
+  version the details read gave; it is never sent twice, so one that got
+  no answer is kind `unavailable` and may have applied: read the playlist
+  before running it again.
+- **`playlist replace PLAYLIST [ITEM...] [--from-file F]`** — the
+  playlist's contents become exactly the tracks given, in order; a track
+  given twice is held twice, and no tracks empties the playlist. Same
+  ownership rule. Adds `before` (the item count now), `after` (the
+  count after), `removed` (`[Offered]`, every current item whose URI is
+  not in the list), `added` (the URIs of the list the playlist does not
+  hold, each once) and `reordered` (whether the items kept change their
+  relative order); `unavailable` entries are erased too. It has no
+  `duplicates_dropped`. A local file in the playlist cannot be given back
+  through the API, so it is in `removed`. One request for the first 100
+  tracks, then one per further 100; a failure after one landed carries
+  `details.done`.
+- **`playlist delete PLAYLIST`** — removes the playlist from the account:
+  Spotify has no other delete, so the member's own playlist is deleted
+  (`action: "deleted"`; Spotify keeps it recoverable for 90 days at
+  https://www.spotify.com/account/recover-playlists/) and another's is
+  unfollowed (`action: "unfollowed"`). A playlist the account does not
+  hold is kind `input`. Adds `action` and `items` (the item count, or
+  `null`). `state.json` is not changed. Needs the `library add` scopes of
+  a playlist (*`library add`, `library remove`*).
+
+```json
+{
+  "ok": true,
+  "command": "playlist add",
+  "profile": "alice",
+  "dry_run": true,
+  "playlist": { "id": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "name": "Kids Songs",
+                "owner": { "id": "alice-spotify", "name": "Alice" }, "public": false,
+                "collaborative": false, "total": 1 },
+  "pushed_as": null,
+  "resolved": { "TR:123": "spotify:track:6rqhFgbbKwnb9MLmUQDhG6" },
+  "unavailable": 0,
+  "to_add": ["spotify:track:6rqhFgbbKwnb9MLmUQDhG6"],
+  "already_present": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC"],
+  "position": null
+}
+```
+
+### `library tracks`, `library albums`, `library artists`
+
+`sss library tracks|albums|artists [--limit N]` lists the saved tracks,
+the saved albums or the followed artists in Spotify's order (most
+recently saved first), one request per 50 entries; `--limit N` (1 or
+more) stops after the first `N`. Needs `user-library-read` and
+`user-follow-read`; a token without either is kind `auth` before any
+request.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `kind` | `"tracks"` \| `"albums"` \| `"artists"` | which list |
+| `items` | [Saved] | `[]` is a success |
+
+```json
+{
+  "ok": true,
+  "command": "library tracks",
+  "profile": "alice",
+  "kind": "tracks",
+  "items": [
+    { "added_at": "2026-10-16T13:02:11Z",
+      "item": { "id": "spotify:track:4uLU6hMCjMI75M1A2tKUQC", "name": "Song",
+                "artists": ["Artist"], "album": "Album", "duration_ms": 225000 } }
+  ]
+}
+```
+
+### `library add`, `library remove`
+
+`sss library add [ITEM...] [--from-file FILE] [--dry-run]` saves tracks
+and albums and follows artists and playlists; `sss library remove` with
+the same arguments removes and unfollows them. An item is a Spotify URI
+(`spotify:track:…`, `spotify:album:…`, `spotify:artist:…`,
+`spotify:playlist:…`), an open.spotify.com address, a bare 22-character
+track id, or a source item id (`TR:…`, `YV:…`, `AR:…`, `AL:…`, …) whose
+latest match is `matched`, which stands for the matched URI. `--from-file
+FILE` (`-` for stdin, read to its end) adds one item per line after those
+on the command line; lines are trimmed, and blank lines and lines starting
+with `#` skipped. Every item is resolved before any request: the first one
+that does not resolve — an item id whose match is not `matched` or that
+has none, a kind the command does not take (an episode, a show, a local
+file), a malformed value — is kind `input` and nothing is sent; a missing
+file is kind `other`. No items at all is kind `input`. An item given more
+than once is kept at its first occurrence.
+
+The command then asks Spotify which items the library holds (one request
+per 40) and writes only what changes: `add` the ones not held, `remove`
+the ones held, one request per 40. `--dry-run` makes the check and no
+write. Needs `user-library-modify`, `user-follow-modify`,
+`user-library-read` and `user-follow-read`, and, when an item is a
+playlist, `playlist-modify-private`, `playlist-modify-public`,
+`playlist-read-private` and `playlist-read-collaborative` as well; a
+token without one is kind `auth` before any request. Neither command
+reads or writes `spotify/state.json`. A write that fails after an
+earlier chunk landed carries `details.done` (*Details*).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `profile` | string | |
+| `dry_run` | boolean | `true`: nothing was written |
+| `resolved` | object, optional | each source item id given and the URI it stood for; absent when none was given |
+| `duplicates_dropped` | number, optional | items given more than once; absent when none was |
+| `to_save` (`add`) | [string] | the URIs not in the library, in the order given: what was saved, or would be |
+| `already_saved` (`add`) | [string] | the URIs already in it, left as they are |
+| `to_remove` (`remove`) | [string] | the URIs in the library, in the order given: what was removed, or would be |
+| `not_saved` (`remove`) | [string] | the URIs that were not in it |
+
+```json
+{
+  "ok": true,
+  "command": "library add",
+  "profile": "alice",
+  "dry_run": false,
+  "resolved": { "TR:123": "spotify:track:4uLU6hMCjMI75M1A2tKUQC" },
+  "to_save": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC"],
+  "already_saved": ["spotify:album:6akEvsycLGftJxYudPjmqK"]
 }
 ```
 
@@ -1199,7 +1468,7 @@ queued as well.
 | `unavailable` | Pandora or Spotify did not answer, after every retry | wait and run the command again; a playback command whose `error` says Spotify may have applied it: run `sss player` first |
 | `quota` | Spotify's rate or quota limit, or `ccc`'s usage limit, was reached; everything done so far is recorded | run the command again later; it continues where it stopped |
 | `incomplete` | an export run ended with failed steps, or a `youtube import` run with failed steps or without the history | look at `details.failed_steps` and `details.manifest`; the run is kept |
-| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, a `playlist` target that is not a playlist URI or link, an unknown device, station or item), a `youtube import` directory that is not one, holds no Takeout files, holds the history only as HTML or one file twice, or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
+| `input` | what was pasted or piped is unusable (empty, or not a token), or an argument is (a Pandora or Spotify id of the wrong form or type, a target of the wrong type, a `playlist` target of the wrong form or type, a playlist name that matches none or several, a ledger key whose playlist is pending or absent, a playlist whose contents or details the account may not change or that is not on the account, a playlist name already owned, a position outside the playlist or on a playlist with unavailable items, an item id without a recorded match, an unknown device, station or item, an empty item list), a `youtube import` directory that is not one, holds no Takeout files, holds the history only as HTML or one file twice, or a decisions document `sss match answer` refused | supply the value again; for `match answer`, fix the items in `details.problems` and resubmit the whole document |
 | `config` | the data repository is not initialized, `config.toml` is invalid, a profile name is invalid or `--profile` is needed, the profile has no export (`match`, `push`, `report`) or no Pandora export (`play --station`), or neither `$XDG_STATE_HOME`/`$XDG_DATA_HOME` nor `$HOME` is set, or Spotify refused access (HTTP 403: the member is not on the app's user allowlist, a scope is missing, or the app owner's Premium lapsed), or `ccc` cannot be run or refuses the matcher agent | fix the setup the message names |
 | `player` | the Spotify player cannot take the command: no player open, several open and none active, Premium missing, or Spotify refused the control | relay the message, then run again |
 | `other` | anything else: a file that cannot be read or written, unparseable data | read `error` |
@@ -1207,7 +1476,8 @@ queued as well.
 ### Details
 
 `pandora export` gives `details` in two cases, `youtube import` and `match
-answer` in one each, and the playback commands in one.
+answer` in one each, the playback commands in one, and every write of
+several requests in one.
 
 - **The run ended with failed steps** (`kind` `incomplete`):
   `{ run_id, run_dir, failed_steps: [step name], manifest }`.
@@ -1296,6 +1566,26 @@ answer` in one each, and the playback commands in one.
           "volume_percent": 40 }
       ]
     }
+  }
+  ```
+
+- **A write of several requests failed after some landed** (`playlist
+  add`, `playlist remove`, `playlist replace`, `library add`, `library
+  remove`; the `kind` is
+  the failure's — `quota`, `unavailable`, `other`, …): `{ done: [string]
+  }`, the URIs the landed requests covered, in order. They are written: do
+  not send them again. `error` begins `<added|removed|wrote|saved> <n> of
+  <total> (<the URIs>), then:` and
+  goes on with the failure. A write that fails on its first request has
+  no `details`.
+
+  ```json
+  {
+    "ok": false,
+    "command": "library add",
+    "kind": "other",
+    "error": "saved 40 of 90 (spotify:track:4uLU6hMCjMI75M1A2tKUQC, …), then: PUT me/library: HTTP 400: Invalid id",
+    "details": { "done": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC", "…"] }
   }
   ```
 
