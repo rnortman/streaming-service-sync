@@ -6,6 +6,8 @@ Notable changes to streaming-service-sync. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-19
+
 YouTube Music joins Pandora as a source. Existing data repositories keep
 their `README.md`: `sss init` never rewrites it, so it does not describe
 the new `youtube/` directory; the layout is in `docs/json-output.md` and
